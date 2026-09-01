@@ -1,4 +1,76 @@
-## v1.50.1
+## v1.50.1-sami.2
+
+`release/v1.49.2` after the `v1.50.1-sami.1` tag (433bb33e): everything in
+v1.50.1-sami.1 below, plus two more fixes, each an open upstream pull request;
+nothing here is fork-only.
+
+| Fix | Upstream pull request | Commit carried |
+|---|---|---|
+| Rooms only Apply or the relay touched are swept when idle | reearth/ygo#269 | f1f8bdb7 |
+| The bundled persistence stores keep large incremental updates | reearth/ygo#268 | 4a3cfce8 |
+
+### Idle sweep reclaims rooms only Apply or the relay touched (reearth/ygo#269)
+
+**Who is affected: servers that set `RoomIdleTimeout` and write to rooms with
+`Apply`, or run a cluster relay.** With `RoomIdleTimeout` at zero (the
+default), nothing changes.
+
+With `RoomIdleTimeout` set, the background sweeper evicts an empty room once it
+has been idle that long, but it only considers rooms carrying an idle stamp,
+and only the last peer leaving set one. `Apply` and the relay's `Inject` clear
+the stamp while they run and never set it again. So a room that only `Apply`
+wrote to, or that a relay delivery created on a node where no peer had joined
+it, stayed in memory until the process exited, and `MaxResidentRooms` did not
+count it. Worse, a single `Apply` on a room whose last peer had already left
+wiped that room's stamp, so a server that answers reads or writes through
+`Apply` kept every room it ever touched.
+
+`Apply` and `Inject` now stamp the room idle when they return — on success, on
+`ErrNoChanges`, on any other error and when `fn` panics — if no peer is
+connected. The sweeper then evicts the room `RoomIdleTimeout` after the last
+call, flushing it durably first as it does for any idle room, and
+`MaxResidentRooms` counts it. A room is never evicted while a call on it is
+still running, and a peer that joins clears the stamp as before. No API or
+wire format changes.
+
+### Bundled persistence stores keep large incremental updates (reearth/ygo#268)
+
+**Who is affected: anyone who stores a room with `persistence.MemoryPersistence`,
+`persistence.FilePersistence` or `persistence/sqlite`, for example through
+`NewServerWithPersistence(persistence.NewLegacyAdapter(...))`.** Custom
+adapters are not changed.
+
+Each of these stores checks an update before writing it by decoding it on its
+own into a throwaway document. That document had the crdt default pending cap
+of 100,000. Decoded without the room's stored state, an incremental update
+parks every item that depends on that state, so an edit touching more than
+100,000 existing items — 100,001 keys set on a map that already exists, for
+instance — was refused with `crdt: invalid update`, although the room had
+applied it. The server logged the failed write; the edit never reached
+storage, and once the room closed, its next load came back without it.
+
+The throwaway document now has no pending cap: it lives for one decode, and the
+decoder's own per-update item limit already bounds what one update can park.
+Updates that do not decode are still refused. `RunConformance` gains a subtest
+that appends such an update, so an external adapter that validates the same
+way finds out from its conformance run. No API or wire format changes.
+
+## v1.50.1-sami.1
+
+A fork release of `github.com/reearth/ygo`, built on upstream `main` 4d6865dc
+(v1.50.0 and two CI-only commits). It carries six fixes, each an open upstream
+pull request; nothing here is fork-only.
+
+| Fix | Upstream pull request | Commit carried |
+|---|---|---|
+| Transactional GC finds deleted ranges by binary search | reearth/ygo#262 | 3dc75a11 |
+| No stack overflow on deeply nested types | reearth/ygo#263 | 93c03573 |
+| Skip structs park the structs after them; V1/V2 converters work on any update | reearth/ygo#257 | 167a4338 |
+| A complete update resolves its own dependencies before the pending cap | reearth/ygo#260 | f436167d |
+| Items merge only when their right origins match | reearth/ygo#266 | f8a405ac |
+| BroadcastUpdate validates under the server's MaxPendingItems | reearth/ygo#267 | f98afda8 |
+
+### Transactional GC (reearth/ygo#262)
 
 **Who is affected: applications that replace or remove many independently stored
 CRDT items in one transaction.** Small edits and documents with contiguous
@@ -11,6 +83,104 @@ unrelated items. It now uses the store's clock ordering to find each range's
 first overlapping item with a binary search, then garbage-collects only that
 range. The document's visible result and its tombstones are unchanged; the
 transaction no longer has quadratic garbage-collection work.
+
+### Deeply nested types (reearth/ygo#263)
+
+**Who is affected: applications that accept collaborative updates or render
+documents containing deeply nested shared types.** A document can grow that
+shape over many small, valid updates. Deleting the outer container, or reading
+the document as JSON or XML, recursed once per nesting level; at sufficient
+depth that exhausted the Go stack and ended the whole process with a fatal
+error that `recover` cannot catch.
+
+- **Deep nested-type operations no longer consume the Go call stack.** Deletion
+  keeps its existing depth-first CRDT effects, in the same order, with an
+  explicit heap stack. JSON and XML reads also traverse nested shared types
+  iteratively, so a document that arrives over the network cannot crash the
+  process by being deleted or read.
+
+### Skip structs and format converters (reearth/ygo#257)
+
+**Who is affected:** anyone who applies *merged* updates one at a time with
+`ApplyUpdateV1` or `ApplyUpdateV2` — for example a custom persistence adapter
+that replays its stored log on load, or a peer that receives the output of
+`MergeUpdatesV1` / yjs `mergeUpdates`. If your adapter rebuilds documents by
+merging its whole log first (every adapter bundled with ygo does), you were not
+affected on load.
+
+**What went wrong.** Merging two updates from the same client that are not
+consecutive — say its 1st and 3rd edits — produces an update with a marker
+saying "clocks withheld here". ygo read that marker the wrong way round, as
+"the receiver already has these". So when the 2nd edit arrived, ygo believed it
+already had it and threw it away. Nothing reported an error; the document was
+just missing that edit, permanently.
+
+The websocket server can produce these merges itself: it batches persistence
+writes, and when several goroutines commit to one room concurrently their
+updates can reach the batcher out of order.
+
+**What changed.** Edits after the marker now wait until the missing range
+arrives, then apply — the same outcome as yjs, in either arrival order.
+
+**Upgrading.** No API change. Documents already rebuilt with an edit missing
+are not repaired by upgrading; if the original update log is still stored,
+reloading from it with this version restores the edit.
+
+**Also fixed: the V1/V2 format converters.** `UpdateV1ToV2` and
+`UpdateV2ToV1` only worked on a document's *first* update. Anything later — an
+ordinary incremental edit, or an update that only deletes — came back as an
+empty update, with no error. If you convert updates between formats at an edge
+(for example to talk to a V2 client), those edits never reached the other side.
+Both now produce exactly the bytes yjs's own converters do.
+
+### Pending budget for complete updates (reearth/ygo#260)
+
+Resolve dependencies contained in the same complete V1/V2 update before charging its unresolved items to the cross-update pending limit. At that limit, a wire-only dependency preflight rejects oversized incomplete updates before materializing the remaining content. The configured pending limit is unchanged. This release also adds `encoding.Decoder.SkipAny`; it uses the same validation and depth/element limits as `ReadAny`.
+
+### Right origins of merged items (reearth/ygo#266)
+
+**Who is affected: anyone who loads a document from updates and encodes it
+again** — a server answering a joining peer's sync step 1, a persistence layer
+that compacts a log into one state, an application that calls `RunGC` and then
+encodes. Documents that are only edited and never re-encoded are unchanged.
+
+Applying an update merged adjacent items from one client into a single item
+whenever their clocks were contiguous and nothing sat between them. Yjs merges
+two items only when the right one was inserted directly after the left one and
+both were inserted toward the same right neighbour (its right origin), because
+the merged item is written to the wire with the left item's origins. ygo did
+not check the right origins, so a document with concurrent inserts could read
+correctly in memory and still encode a right origin that one of its items
+never had: a peer decoding that state — ygo or Yjs — put that item's
+characters elsewhere. `RunGC`'s tombstone merge had the same gap and could
+move live text whose origin was inside the second tombstone.
+
+Both merges now require the right item's origin to be the left item's last
+character and the two right origins to be equal, as `Item.mergeWith` does.
+Items that do not qualify stay separate, so such a document keeps a few more
+items than before; no wire format or API changes.
+
+### BroadcastUpdate honours MaxPendingItems (reearth/ygo#267)
+
+**Who is affected: anyone who sets `provider/websocket.Server.MaxPendingItems`
+and calls `Server.BroadcastUpdate` or runs the server in a cluster.** A server
+left at the default cap behaves exactly as before.
+
+`BroadcastUpdate` validates an update by decoding it alone into a throwaway
+document. That document was built with the crdt default pending cap of
+100,000, not the server's `MaxPendingItems`. Decoded without the room's
+existing state, an incremental update parks every item that is parented on
+that state — a key set on an existing nested map, an attribute set on an
+existing element — so on a server that raised the cap, an update touching
+more than 100,000 existing items was refused with `ErrInvalidUpdate` although
+the room itself accepts it, and on a server that lowered the cap the check
+admitted more parked items than the server allows. The same check runs when a
+clustered node receives an update from another node, after the node has
+already applied it to its room, so such an update reached the room but not
+the node's own peers.
+
+The throwaway document now takes the server's own document options, the same
+ones its rooms are built with. No API or wire format changes.
 
 ## v1.50.0
 
