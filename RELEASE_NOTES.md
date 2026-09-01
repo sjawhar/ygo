@@ -1,4 +1,454 @@
-## v1.50.1
+## v1.51.3-sami.1
+
+A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
+(07bd8f62) from the `v1.50.1-sami.3` tag (5d42a5b1). It carries seven fixes,
+each an upstream pull request; nothing here is fork-only.
+
+| Fix | Upstream pull request | Commit carried |
+|---|---|---|
+| A complete update resolves its own dependencies before the pending cap | reearth/ygo#260 | 2cbc892e |
+| Transactional GC finds deleted ranges by binary search (unchanged; described under v1.50.1-sami.1) | reearth/ygo#262, closed as a duplicate of reearth/ygo#258 | 3dc75a11 |
+| No stack overflow on deeply nested types | reearth/ygo#263 | b0558b1c |
+| Items merge only when their right origins match | reearth/ygo#266 | 9dd6ef4f |
+| The bundled persistence stores and BroadcastUpdate keep large incremental updates | reearth/ygo#268 | 7c787a8b |
+| Rooms only Apply or the relay touched are swept when idle | reearth/ygo#269 | 5a035e51 |
+| Hocuspocus-framed connections are answered a SyncStatus for every sync frame | reearth/ygo#291 | 96333155 |
+
+**Changes from v1.50.1-sami.3.**
+
+- **The base is upstream v1.51.2.** Every member except reearth/ygo#262 merges
+  it, so this release has every upstream fix through v1.51.2.
+- **reearth/ygo#257 is no longer a fork member.** Upstream merged it in
+  v1.51.0, so the skip-struct and V1/V2 converter fixes come from the base.
+- **reearth/ygo#267 is withdrawn.** From v1.50.1-sami.1 to v1.50.1-sami.3,
+  `BroadcastUpdate` checked an update under the server's `MaxPendingItems`. It
+  now uses the bundled stores' check, which has no pending cap
+  (reearth/ygo#268, below). `MaxPendingItems` still caps each room's document.
+- **reearth/ygo#260 resolves pending dependencies with a worklist.** The
+  version in v1.50.1-sami.1 to v1.50.1-sami.3 re-scanned the whole update once
+  per dependency step, so a chain-shaped update near the pending cap took time
+  quadratic in its size.
+- **The other members move to their pull requests' current heads.** Their
+  sections below are the pull requests' current text.
+
+### Pending budget for complete updates (reearth/ygo#260)
+
+Complete V1/V2 checkpoints resolve dependencies within the update before the
+cross-update pending limit is applied. Preflight retains the current blocked
+struct and a resumable decoder cursor per wire group, rather than metadata for
+every struct in a blocked tail. V2 cursors share immutable columns and the
+string pool. Single-group updates stop once the number of permanently blocked
+structs exceeds the remaining budget. A rejected preflight update adds none of
+its deferred items to the persistent pending queue; previously queued items
+remain. Changes already integrated before rejection are not rolled back.
+The configured pending limit, wire format and public API are unchanged.
+
+### Deeply nested types (reearth/ygo#263)
+
+**Who is affected:** servers that apply updates from peers they do not trust,
+and code that deletes nested shared types or reads documents with `ToJSON`,
+`ToSlice`, `Entries` or `ToXML`.
+
+**A very deep document can no longer crash the process.** Deleting a nested
+shared type, or reading a document as JSON or XML, used one goroutine stack
+frame per nesting level. A peer could build a document millions of levels deep
+through many small updates, and deleting or reading it then ended the whole
+process, every room on a server included, with a fatal stack overflow that
+`recover` cannot catch. Building such a document takes tens of megabytes of
+updates and gigabytes of heap at Go's default stack limit. These operations no
+longer grow the goroutine stack with depth, and give the same results in the
+same order.
+
+**`ToJSON` uses less memory.** `YArray.ToJSON` and `YMap.ToJSON` write JSON
+directly instead of building intermediate slices and maps. The output bytes are
+unchanged.
+
+**Upgrading.** No API change.
+
+### Right origins of merged items (reearth/ygo#266)
+
+**Who is affected:** anyone whose documents get concurrent text inserts, once
+a peer receives several of one client's inserts in a single apply: a late
+joiner's sync step 2, an offline client catching up, a server loading a stored
+state. Any state that peer then encodes (a sync step 2 it answers, a compacted
+log, `RunGC` followed by an encode) passes the problem to every peer that
+loads it.
+
+**Concurrent inserts could end up in different places on different peers.**
+Applying an update merged adjacent items from one client into a single item
+whenever their clocks were contiguous and nothing sat between them. Yjs merges
+two items only when the right one was inserted directly after the left one and
+both were inserted toward the same right neighbour (their right origin),
+because the merged item keeps only the left item's origins. ygo did not check
+the right origins. The peer that merged them then placed the next concurrent
+insert inside that run differently from the peers that had received the items
+one at a time, and any state it encoded gave the right item's characters a
+right origin they never had, so ygo and Yjs alike decoded them elsewhere.
+`RunGC`'s tombstone merge had the same gap and could move live text whose
+origin was inside the second tombstone.
+
+Both merges now require the right item's origin to be the left item's last
+character and the two right origins to be equal, as `Item.mergeWith` does.
+Items that do not qualify stay separate, so such a document keeps a few more
+items than before.
+
+**Upgrading.** No API or wire format change. A state that an earlier version
+already encoded or compacted keeps its merged items and their wrong right
+origins: this release stops new ones from being written but does not repair
+stored ones.
+
+### Large incremental updates in the bundled stores and BroadcastUpdate (reearth/ygo#268)
+
+**Who is affected: anyone who stores rooms with `persistence.MemoryPersistence`,
+`persistence.FilePersistence` or `persistence/sqlite` (for example through
+`NewServerWithPersistence(persistence.NewLegacyAdapter(...))`), and anyone who
+calls `Server.BroadcastUpdate` or runs a cluster relay.** Custom persistence
+adapters are not changed.
+
+**Large edits are stored, and so is everything after them.** These
+stores check each update before writing it by decoding it on its own, and that
+check held at most 100,000 structs waiting for state it did not have. Decoded
+on its own, an update from a client whose earlier edits are already stored is
+missing everything it builds on, so all of its structs wait. Any such update
+of more than 100,000 structs, or a batch of smaller ones the server coalesced
+past that count, was refused with `crdt: invalid update` although the room had
+applied it. With the default write coalescing, the refused batch stayed queued
+and each later edit joined it, so nothing more in that room was stored: the
+room stayed in memory after its last peer left, and every edit since the
+refused one was lost when it closed. The check now has no such limit. Updates
+that do not decode are still refused.
+
+**Large relayed updates reach every peer.** `BroadcastUpdate` ran the same
+check, so it refused such an update with `ErrInvalidUpdate` after the room had
+applied it, and a clustered node that received one from another node applied
+it to its room but never sent it to its own peers. It now uses the stores'
+check. `MaxPendingItems` still caps each room's document.
+
+**Custom adapters.** A `VersionedPersistence` that checks updates by applying
+them to a bare `crdt.New()` refuses the same updates; the `AppendUpdate` godoc
+shows how to build the scratch document instead. No API or wire format
+changes.
+
+### Idle sweep reclaims rooms only Apply or the relay touched (reearth/ygo#269)
+
+**Who is affected: servers that set `RoomIdleTimeout` and write to rooms with
+`Apply`, or run a cluster relay.** With `RoomIdleTimeout` at zero (the
+default), nothing changes.
+
+With `RoomIdleTimeout` set, the background sweeper evicts an empty room once it
+has been idle that long, but it only considers rooms carrying an idle stamp,
+and only the last peer leaving set one. `Apply` and the relay's `Inject` clear
+the stamp while they run and never set it again. So a room that only `Apply`
+wrote to, or that a relay delivery created on a node where no peer had joined
+it, stayed in memory until the process exited, and `MaxResidentRooms` did not
+count it. Worse, a single `Apply` on a room whose last peer had already left
+wiped that room's stamp, so a server that answers reads or writes through
+`Apply` kept every room it ever touched.
+
+`Apply` and `Inject` now stamp the room idle when they return — on success, on
+`ErrNoChanges`, on any other error and when `fn` panics — if no peer is
+connected. The sweeper then evicts the room `RoomIdleTimeout` after the last
+call, flushing it durably first as it does for any idle room, and
+`MaxResidentRooms` counts it. A room is never evicted while a call on it is
+still running, and a peer that joins clears the stamp as before. No API or
+wire format changes.
+
+### SyncStatus for every Hocuspocus sync frame (reearth/ygo#291)
+
+**Who is affected: servers that set `HocuspocusFraming` for
+`@hocuspocus/provider` clients.** Connections on plain y-websocket framing are
+unchanged.
+
+`@hocuspocus/provider` counts the edits it has sent and lowers the count only
+when the server answers one with a `SyncStatus` (tag 8) message, which
+`@hocuspocus/server` sends after every SyncStep2 or Update. ygo defined the tag
+but never sent it, so against ygo the provider's `hasUnsyncedChanges` stayed
+true for as long as the connection lived, and an editor could never tell its
+edits had reached the server.
+
+With `HocuspocusFraming` set, ygo now answers every SyncStep2 or Update, under
+Sync (tag 0) or SyncReply (tag 4), with exactly one `SyncStatus`, in the order
+the frames arrived, so a client can pair each answer with the frame it sent:
+
+| The client sends | The room | `SyncStatus` |
+|---|---|---|
+| a SyncStep2 or Update | applies it | 1 |
+| a SyncStep2 or Update | refuses it (it overflows `MaxPendingItems`, say) | 0 |
+| an Update, read-only | does not take it | 0 |
+| a SyncStep2, read-only | already holds everything in it | 1 |
+| a SyncStep2, read-only | lacks something in it, and does not take it | 0 |
+| a sync frame that does not decode | closes the connection with 1002 | none |
+
+Three answers differ from `@hocuspocus/server` 2.15.3, on purpose:
+
+- **An update the room refuses.** `@hocuspocus/server` answers 1 there: Yjs has
+  no cap on pending structs, so it parks an update that overflows
+  `MaxPendingItems`, and y-protocols swallows any error from an update that does
+  not decode. An answer of 1 tells the client the room holds an edit it does
+  not. ygo answers 0 and keeps the connection, so the client keeps the edit and
+  the next good update on the same connection is answered 1.
+- **A sync message that does not decode** (its sub-type is unknown or
+  missing, or its payload is cut short). On a read-write connection,
+  `@hocuspocus/server` answers a SyncStep2 or Update whose payload is cut short
+  with 1 and keeps the connection, because y-protocols' `readSyncStep2` catches
+  the read error along with the apply error. Other such messages get 0 (a
+  read-only Update) or a 4403 close (an unknown or missing sub-type, a SyncStep1,
+  a read-only SyncStep2). ygo sends no `SyncStatus` for any of them and closes
+  with 1002 (protocol error): an answer of 1 would acknowledge an edit the room
+  never saw, and 4403 would strand the provider.
+- **A read-only SyncStep2 whose update does not decode.** `@hocuspocus/server`
+  closes the connection with 4403, because its `snapshotContainsUpdate` check
+  throws. ygo answers 0 and keeps the connection: the room does not hold the
+  update, and 4403 would strand the provider.
+
+`crdt.SnapshotContainsUpdateV1` is new: it reports whether a snapshot already
+holds everything a V1 update carries, as Yjs `snapshotContainsUpdate` does. The
+read-only SyncStep2 answer uses it.
+
+## v1.51.2
+
+**Who is affected:** servers and clients that call `GetText`, `GetArray`,
+`GetMap` or `GetXmlFragment` only after applying updates, for example after a
+sync step.
+
+**Edits that arrived out of order could vanish.** If an update for a document
+root arrived before an edit it depends on, and the code then accessed that root
+for the first time before the missing edit arrived, the waiting update was
+attached to a placeholder and never showed up. That peer stayed different from
+everyone else for good. Accessing a root now picks up waiting updates too.
+
+**Upgrading.** No API change.
+
+## v1.51.1
+
+**Who is affected:** anyone using `UndoManager` or `YArray.Move`, and anyone
+exchanging V1 updates with yjs peers that carry legacy JSON content.
+
+**Undo no longer touches other people's edits.** Undo groups edits made close
+together into one step. That step used to cover every change in its time
+span, including a collaborator's insert that arrived in between, so pressing
+undo could delete their work. It could also overwrite a map entry a
+collaborator had changed since. Undo now tracks exactly which edits it
+recorded, as yjs does, and leaves everything else alone. Every transaction
+also claimed to be local, so a default `UndoManager` recorded remote updates
+as your own; `Transaction.Local` is now `false` for applied updates.
+
+**Undo restores nested content.** Deleting an entry that held a nested text,
+map or array and pressing undo brought it back empty. It now comes back with
+its contents. Edits inside nested types are now recorded for undo too, and
+undoing two quick edits on a fresh document no longer leaves the first behind.
+
+**`YArray.Get` no longer panics after undo, redo or a move.** Reads could
+crash with an index out of range, or return the wrong element. Undoing a move
+could also make the element disappear from reads while still counting in
+`Len`.
+
+**V1 legacy JSON content is readable both ways.** Older yjs content stored as
+JSON failed to decode in the V1 format, in either direction. It now matches
+yjs, and data an older ygo stored in its previous format still loads.
+
+**Staging a type into itself panics instead of crashing later.**
+
+**`YArray.Move` fixes.** Moving an element you already moved now takes effect,
+undoing the delete of a moved element puts it back where you moved it, and
+array change events now report undone moves, so an editor bound to the events
+stays in step.
+
+**`RunGC` no longer makes maps diverge.** Garbage collection could merge
+deleted entries belonging to different keys, after which peers disagreed on a
+key's value.
+
+**A map write could vanish on other peers.** Setting a key whose previous
+value arrived from yjs as a merged run could keep the new value locally while
+every other peer dropped it. Copying text with `ApplyDelta` also lost embeds;
+both now behave as in yjs.
+
+**Undo matches yjs more closely**, including which value wins when two
+collaborators' restored values compete for one key.
+
+**XML and JSON edge cases.** An XML node can no longer be put into two parents
+at once, legacy JSON attributes read correctly, and Go values that JSON cannot
+represent (functions, channels) are rejected instead of silently replacing the
+whole value with `null`.
+
+**Upgrading.** No API change, but check these behaviour changes:
+
+- Observers reading `Transaction.Local` now see `false` for remote changes.
+- `Undo`/`Redo` skip steps that would no longer change anything, so one call
+  may undo an older step, and they return `false` when nothing changed.
+- Something inserted and deleted within one undo step stays deleted on undo.
+  Call `StopCapturing` between the two if you want separate steps.
+- XML `Insert` panics on a node that is already attached or staged elsewhere
+  (including a child of a detached node you never attached: delete it from that
+  node first), and text inserts panic on functions, channels or shared types
+  passed as values. Both used to be
+  accepted and corrupted the document.
+- **Rolling upgrades:** ygo 1.51.0 and older cannot read V1 updates carrying
+  legacy JSON content written by this version. Upgrade all nodes before
+  relaying such documents in V1, or use V2.
+
+## v1.51.0
+
+**Who is affected:** anyone who applies *merged* updates one at a time with
+`ApplyUpdateV1` or `ApplyUpdateV2` — for example a custom persistence adapter
+that replays its stored log on load, or a peer that receives the output of
+`MergeUpdatesV1` / yjs `mergeUpdates`. If your adapter rebuilds documents by
+merging its whole log first (every adapter bundled with ygo does), you were not
+affected on load. Applications that compact a stored log by merging rows were
+affected, and so were yjs clients loading a snapshot such a document produced.
+
+**What went wrong.** Merging two updates from the same client that are not
+consecutive — say its 1st and 3rd edits — produces an update with a marker
+saying "clocks withheld here". ygo read that marker the wrong way round, as
+"the receiver already has these". So when the 2nd edit arrived, ygo believed it
+already had it and threw it away. Nothing reported an error; the document was
+just missing that edit, permanently. Worse, a snapshot of that document
+(`EncodeStateAsUpdateV1`) was malformed, and yjs threw a `TypeError` loading it.
+
+The websocket server can produce these merges itself: it batches persistence
+writes, and when several goroutines commit to one room concurrently their
+updates can reach the batcher out of order.
+
+**What changed.** Edits after the marker now wait until the missing range
+arrives, then apply — the same outcome as yjs, in either arrival order.
+
+**Upgrading.** No API change. Documents already rebuilt with an edit missing
+are not repaired by upgrading; if the original update log is still stored,
+reloading from it with this version restores the edit.
+
+**Also fixed: the V1/V2 format converters.** `UpdateV1ToV2` and
+`UpdateV2ToV1` only worked on a document's *first* update. Anything later — an
+ordinary incremental edit, or an update that only deletes — came back as an
+empty update, with no error. If you convert updates between formats at an edge
+(for example to talk to a V2 client), those edits never reached the other side.
+Both now produce exactly the bytes yjs's own converters do.
+
+**Also fixed: snapshots taken while an update is waiting.** When an update
+arrives before one it depends on, ygo holds it until the missing one shows up.
+`EncodeStateAsUpdateV1`/`V2` used to leave held updates out, so a snapshot
+taken in that window — a compaction, or a sync reply to a new peer — lost them
+for good. Snapshots now include them, byte for byte as yjs does. Thanks to
+@sjawhar for the report and reproduction.
+
+## v1.50.1-sami.3
+
+`release/v1.49.2` after the `v1.50.1-sami.2` tag (e792b8c7): everything in
+v1.50.1-sami.2 below, plus one more fix, an open upstream pull request; nothing
+here is fork-only.
+
+| Fix | Upstream pull request | Commit carried |
+|---|---|---|
+| Hocuspocus-framed connections are answered a SyncStatus for every sync frame | reearth/ygo#291 | 213f1156 |
+
+### SyncStatus for every Hocuspocus sync frame (reearth/ygo#291)
+
+**Who is affected: servers that set `HocuspocusFraming` for
+`@hocuspocus/provider` clients.** Connections on plain y-websocket framing are
+unchanged.
+
+`@hocuspocus/provider` counts the edits it has sent and lowers the count only
+when the server answers one with a `SyncStatus` (tag 8) message, which
+`@hocuspocus/server` sends after every SyncStep2 or Update. ygo defined the tag
+but never sent it, so against ygo the provider's `hasUnsyncedChanges` stayed
+true for as long as the connection lived, and an editor could never tell its
+edits had reached the server.
+
+With `HocuspocusFraming` set, ygo now answers every SyncStep2 or Update, under
+Sync (tag 0) or SyncReply (tag 4), with exactly one `SyncStatus`, in the order
+the frames arrived, so a client can pair each answer with the frame it sent:
+
+| The client sends | The room | `SyncStatus` |
+|---|---|---|
+| a SyncStep2 or Update | applies it | 1 |
+| a SyncStep2 or Update | refuses it (it overflows `MaxPendingItems`, say) | 0 |
+| an Update, read-only | does not take it | 0 |
+| a SyncStep2, read-only | already holds everything in it | 1 |
+| a SyncStep2, read-only | lacks something in it, and does not take it | 0 |
+| a sync frame that does not decode | closes the connection with 1002 | none |
+
+One answer differs from `@hocuspocus/server`: it answers an update the room
+refuses with 1, because y-protocols swallows the apply error, which tells the
+client the room holds an edit it does not. ygo answers 0 and keeps the
+connection, so the client keeps the edit and the next good update on the same
+connection is answered 1.
+
+`crdt.SnapshotContainsUpdateV1` is new: it reports whether a snapshot already
+holds everything a V1 update carries, as Yjs `snapshotContainsUpdate` does. The
+read-only SyncStep2 answer uses it.
+
+## v1.50.1-sami.2
+
+`release/v1.49.2` after the `v1.50.1-sami.1` tag (433bb33e): everything in
+v1.50.1-sami.1 below, plus two more fixes, each an open upstream pull request;
+nothing here is fork-only.
+
+| Fix | Upstream pull request | Commit carried |
+|---|---|---|
+| Rooms only Apply or the relay touched are swept when idle | reearth/ygo#269 | f1f8bdb7 |
+| The bundled persistence stores keep large incremental updates | reearth/ygo#268 | 4a3cfce8 |
+
+### Idle sweep reclaims rooms only Apply or the relay touched (reearth/ygo#269)
+
+**Who is affected: servers that set `RoomIdleTimeout` and write to rooms with
+`Apply`, or run a cluster relay.** With `RoomIdleTimeout` at zero (the
+default), nothing changes.
+
+With `RoomIdleTimeout` set, the background sweeper evicts an empty room once it
+has been idle that long, but it only considers rooms carrying an idle stamp,
+and only the last peer leaving set one. `Apply` and the relay's `Inject` clear
+the stamp while they run and never set it again. So a room that only `Apply`
+wrote to, or that a relay delivery created on a node where no peer had joined
+it, stayed in memory until the process exited, and `MaxResidentRooms` did not
+count it. Worse, a single `Apply` on a room whose last peer had already left
+wiped that room's stamp, so a server that answers reads or writes through
+`Apply` kept every room it ever touched.
+
+`Apply` and `Inject` now stamp the room idle when they return — on success, on
+`ErrNoChanges`, on any other error and when `fn` panics — if no peer is
+connected. The sweeper then evicts the room `RoomIdleTimeout` after the last
+call, flushing it durably first as it does for any idle room, and
+`MaxResidentRooms` counts it. A room is never evicted while a call on it is
+still running, and a peer that joins clears the stamp as before. No API or
+wire format changes.
+
+### Bundled persistence stores keep large incremental updates (reearth/ygo#268)
+
+**Who is affected: anyone who stores a room with `persistence.MemoryPersistence`,
+`persistence.FilePersistence` or `persistence/sqlite`, for example through
+`NewServerWithPersistence(persistence.NewLegacyAdapter(...))`.** Custom
+adapters are not changed.
+
+Each of these stores checks an update before writing it by decoding it on its
+own into a throwaway document. That document had the crdt default pending cap
+of 100,000. Decoded without the room's stored state, an incremental update
+parks every item that depends on that state, so an edit touching more than
+100,000 existing items — 100,001 keys set on a map that already exists, for
+instance — was refused with `crdt: invalid update`, although the room had
+applied it. The server logged the failed write; the edit never reached
+storage, and once the room closed, its next load came back without it.
+
+The throwaway document now has no pending cap: it lives for one decode, and the
+decoder's own per-update item limit already bounds what one update can park.
+Updates that do not decode are still refused. `RunConformance` gains a subtest
+that appends such an update, so an external adapter that validates the same
+way finds out from its conformance run. No API or wire format changes.
+
+## v1.50.1-sami.1
+
+A fork release of `github.com/reearth/ygo`, built on upstream `main` 4d6865dc
+(v1.50.0 and two CI-only commits). It carries six fixes, each an open upstream
+pull request; nothing here is fork-only.
+
+| Fix | Upstream pull request | Commit carried |
+|---|---|---|
+| Transactional GC finds deleted ranges by binary search | reearth/ygo#262 | 3dc75a11 |
+| No stack overflow on deeply nested types | reearth/ygo#263 | 93c03573 |
+| Skip structs park the structs after them; V1/V2 converters work on any update | reearth/ygo#257 | 167a4338 |
+| A complete update resolves its own dependencies before the pending cap | reearth/ygo#260 | f436167d |
+| Items merge only when their right origins match | reearth/ygo#266 | f8a405ac |
+| BroadcastUpdate validates under the server's MaxPendingItems | reearth/ygo#267 | f98afda8 |
+
+### Transactional GC (reearth/ygo#262)
 
 **Who is affected: applications that replace or remove many independently stored
 CRDT items in one transaction.** Small edits and documents with contiguous
@@ -11,6 +461,104 @@ unrelated items. It now uses the store's clock ordering to find each range's
 first overlapping item with a binary search, then garbage-collects only that
 range. The document's visible result and its tombstones are unchanged; the
 transaction no longer has quadratic garbage-collection work.
+
+### Deeply nested types (reearth/ygo#263)
+
+**Who is affected: applications that accept collaborative updates or render
+documents containing deeply nested shared types.** A document can grow that
+shape over many small, valid updates. Deleting the outer container, or reading
+the document as JSON or XML, recursed once per nesting level; at sufficient
+depth that exhausted the Go stack and ended the whole process with a fatal
+error that `recover` cannot catch.
+
+- **Deep nested-type operations no longer consume the Go call stack.** Deletion
+  keeps its existing depth-first CRDT effects, in the same order, with an
+  explicit heap stack. JSON and XML reads also traverse nested shared types
+  iteratively, so a document that arrives over the network cannot crash the
+  process by being deleted or read.
+
+### Skip structs and format converters (reearth/ygo#257)
+
+**Who is affected:** anyone who applies *merged* updates one at a time with
+`ApplyUpdateV1` or `ApplyUpdateV2` — for example a custom persistence adapter
+that replays its stored log on load, or a peer that receives the output of
+`MergeUpdatesV1` / yjs `mergeUpdates`. If your adapter rebuilds documents by
+merging its whole log first (every adapter bundled with ygo does), you were not
+affected on load.
+
+**What went wrong.** Merging two updates from the same client that are not
+consecutive — say its 1st and 3rd edits — produces an update with a marker
+saying "clocks withheld here". ygo read that marker the wrong way round, as
+"the receiver already has these". So when the 2nd edit arrived, ygo believed it
+already had it and threw it away. Nothing reported an error; the document was
+just missing that edit, permanently.
+
+The websocket server can produce these merges itself: it batches persistence
+writes, and when several goroutines commit to one room concurrently their
+updates can reach the batcher out of order.
+
+**What changed.** Edits after the marker now wait until the missing range
+arrives, then apply — the same outcome as yjs, in either arrival order.
+
+**Upgrading.** No API change. Documents already rebuilt with an edit missing
+are not repaired by upgrading; if the original update log is still stored,
+reloading from it with this version restores the edit.
+
+**Also fixed: the V1/V2 format converters.** `UpdateV1ToV2` and
+`UpdateV2ToV1` only worked on a document's *first* update. Anything later — an
+ordinary incremental edit, or an update that only deletes — came back as an
+empty update, with no error. If you convert updates between formats at an edge
+(for example to talk to a V2 client), those edits never reached the other side.
+Both now produce exactly the bytes yjs's own converters do.
+
+### Pending budget for complete updates (reearth/ygo#260)
+
+Resolve dependencies contained in the same complete V1/V2 update before charging its unresolved items to the cross-update pending limit. At that limit, a wire-only dependency preflight rejects oversized incomplete updates before materializing the remaining content. The configured pending limit is unchanged. This release also adds `encoding.Decoder.SkipAny`; it uses the same validation and depth/element limits as `ReadAny`.
+
+### Right origins of merged items (reearth/ygo#266)
+
+**Who is affected: anyone who loads a document from updates and encodes it
+again** — a server answering a joining peer's sync step 1, a persistence layer
+that compacts a log into one state, an application that calls `RunGC` and then
+encodes. Documents that are only edited and never re-encoded are unchanged.
+
+Applying an update merged adjacent items from one client into a single item
+whenever their clocks were contiguous and nothing sat between them. Yjs merges
+two items only when the right one was inserted directly after the left one and
+both were inserted toward the same right neighbour (its right origin), because
+the merged item is written to the wire with the left item's origins. ygo did
+not check the right origins, so a document with concurrent inserts could read
+correctly in memory and still encode a right origin that one of its items
+never had: a peer decoding that state — ygo or Yjs — put that item's
+characters elsewhere. `RunGC`'s tombstone merge had the same gap and could
+move live text whose origin was inside the second tombstone.
+
+Both merges now require the right item's origin to be the left item's last
+character and the two right origins to be equal, as `Item.mergeWith` does.
+Items that do not qualify stay separate, so such a document keeps a few more
+items than before; no wire format or API changes.
+
+### BroadcastUpdate honours MaxPendingItems (reearth/ygo#267)
+
+**Who is affected: anyone who sets `provider/websocket.Server.MaxPendingItems`
+and calls `Server.BroadcastUpdate` or runs the server in a cluster.** A server
+left at the default cap behaves exactly as before.
+
+`BroadcastUpdate` validates an update by decoding it alone into a throwaway
+document. That document was built with the crdt default pending cap of
+100,000, not the server's `MaxPendingItems`. Decoded without the room's
+existing state, an incremental update parks every item that is parented on
+that state — a key set on an existing nested map, an attribute set on an
+existing element — so on a server that raised the cap, an update touching
+more than 100,000 existing items was refused with `ErrInvalidUpdate` although
+the room itself accepts it, and on a server that lowered the cap the check
+admitted more parked items than the server allows. The same check runs when a
+clustered node receives an update from another node, after the node has
+already applied it to its room, so such an update reached the room but not
+the node's own peers.
+
+The throwaway document now takes the server's own document options, the same
+ones its rooms are built with. No API or wire format changes.
 
 ## v1.50.0
 
