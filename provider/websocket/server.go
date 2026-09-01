@@ -74,7 +74,7 @@ const (
 	msgStateless          = uint64(5)  // arbitrary VarString payload, surfaced via Server.OnStateless
 	msgBroadcastStateless = uint64(6)  // VarString payload, fanned out to other peers as msgStateless
 	msgClose              = uint64(7)  // peer-requested graceful close (optional VarString reason)
-	msgSyncStatus         = uint64(8)  // server→client update-applied ack; if a client sends it, no-op consume
+	msgSyncStatus         = uint64(8)  // server→client ack of each SyncStep2/Update, sent with HocuspocusFraming; a client's is consumed
 	msgPing               = uint64(9)  // liveness check; replies with msgPong
 	msgPong               = uint64(10) // liveness reply to a server-sent Ping; no-op
 )
@@ -681,9 +681,11 @@ type room struct {
 	// the room has peers, or RoomIdleTimeout is 0 (eager-evict mode, in which
 	// case an empty room is deleted from s.rooms rather than stamped). Set by
 	// handleDisconnect's teardown path when the room goes empty and the
-	// durable flush succeeds; cleared at peer REGISTRATION (ServeHTTP) — not at
-	// room lookup — so it tracks true occupancy, and by the immediate-mutation
-	// relay/admin callers via clearIdle. Guarded by mu. Rooms stamped idle here
+	// durable flush succeeds, and by markIdleIfEmpty when an immediate-mutation
+	// caller (relay Inject, admin Apply) returns to a room with no peers;
+	// cleared at peer REGISTRATION (ServeHTTP) — not at room lookup — so it
+	// tracks true occupancy, and by those immediate-mutation callers via
+	// clearIdle while they run. Guarded by mu. Rooms stamped idle here
 	// are reclaimed by the background sweeper (idle_sweep.go, started lazily via
 	// ensureIdleSweeper when RoomIdleTimeout > 0): it evicts any room idle longer
 	// than RoomIdleTimeout and, when MaxResidentRooms > 0, the least-recently-idle
@@ -705,13 +707,36 @@ type room struct {
 
 // clearIdle marks the room as non-idle. Used by the immediate-mutation callers
 // (relay Inject, admin Apply) that make the room active without registering a
-// peer, so there is no lookup→registration window to worry about. Takes rm.mu
-// itself; must NOT be called while already holding rm.mu. The WS join path does
-// NOT use this — it clears idleSince inside the same rm.mu section that adds the
-// peer (see ServeHTTP) so the clear is ordered against handleDisconnect's stamp.
+// peer, so there is no lookup→registration window to worry about; each pairs it
+// with a deferred markIdleIfEmpty. Takes rm.mu itself; must NOT be called while
+// already holding rm.mu. The WS join path does NOT use this — it clears
+// idleSince inside the same rm.mu section that adds the peer (see ServeHTTP) so
+// the clear is ordered against handleDisconnect's stamp.
 func (r *room) clearIdle() {
 	r.mu.Lock()
 	r.idleSince = time.Time{}
+	r.mu.Unlock()
+}
+
+// markIdleIfEmpty stamps the room idle when RoomIdleTimeout > 0 and the room has
+// no peers. The immediate-mutation callers (relay Inject, admin Apply) defer it
+// right after clearIdle, so it runs on every return path, panics included. No
+// peer ever leaves a room only they touched, so no disconnect would stamp it, and
+// a clearIdle on an idle room would otherwise wipe the stamp its last peer left:
+// either way the sweeper would never reclaim the room or count it toward
+// MaxResidentRooms. The deferred call runs before the caller's releaseInflight,
+// so the room cannot be evicted until the caller is done with it; a peer that
+// registers later clears the stamp under the same rm.mu, and evictIdleRoom
+// flushes before it evicts. In eager-evict mode (RoomIdleTimeout == 0) it does
+// nothing: such rooms stay resident until CloseRoom, as documented there.
+func (s *Server) markIdleIfEmpty(r *room) {
+	if s.RoomIdleTimeout <= 0 {
+		return
+	}
+	r.mu.Lock()
+	if len(r.peers) == 0 {
+		r.idleSince = time.Now()
+	}
 	r.mu.Unlock()
 }
 
@@ -839,6 +864,10 @@ type Server struct {
 	// VarString(docName) + <y-websocket frame>. Enables real @hocuspocus/provider
 	// interop. One room per connection is still enforced (no multi-document
 	// multiplexing); the inbound docName is read and used only for logging.
+	// Such a connection is also answered one SyncStatus (tag 8) frame for every
+	// SyncStep2 or Update it sends, in order, and closed with 1002 when it sends
+	// a sync frame that does not decode (see the package documentation for the
+	// answers).
 	// Leave false (default) for native y-websocket clients — the two framings
 	// cannot be auto-detected on one endpoint.
 	HocuspocusFraming bool
@@ -898,6 +927,19 @@ type Server struct {
 	// (Tiptap comments, custom presence metadata, application heartbeats)
 	// to the embedding application.
 	OnStateless StatelessHook
+
+	// OnPeerUpdate, if non-nil, runs in place of the room's own apply of a
+	// SyncStep2 or Update a read-write peer sent, under Sync (tag 0) or
+	// SyncReply (tag 4), so the embedder can refuse it before it reaches the
+	// room or any other peer, or hold a lock of its own across the apply.
+	// apply applies the update exactly as the room does without a hook. An
+	// update apply did not apply is not broadcast and is answered
+	// SyncStatus(0) on a Hocuspocus-framed connection; when the hook's error is
+	// or wraps a *PeerClose, the peer is closed with its code after that
+	// answer. An update apply applied is broadcast and answered SyncStatus(1)
+	// whatever the hook returns. A read-only peer's update never reaches the
+	// hook. Nil keeps the behaviour without a hook. See PeerUpdateHook.
+	OnPeerUpdate PeerUpdateHook
 
 	// OnTokenAuth, if non-nil, validates the token from a Hocuspocus in-band
 	// Auth message (tag 2). A nil error accepts the connection and replies
@@ -1029,7 +1071,10 @@ type Server struct {
 	// this timeout is done by a separate background sweeper; setting this
 	// field alone only stops eager eviction and marks rooms idle — without a
 	// sweeper an idle room simply stays resident indefinitely, which is safe
-	// (just extra memory) but never reclaims it on its own.
+	// (just extra memory) but never reclaims it on its own. A room that Apply
+	// or a relay delivery (Inject) touched is stamped idle when that call
+	// returns if no peer is connected, so rooms only server-side writers touch
+	// are reclaimed the same way.
 	//
 	// Zero (the default) preserves the original eager-evict behaviour: the
 	// room is deleted from the server map and OnUnloadDocument fires the
@@ -1620,7 +1665,8 @@ func (s *Server) getOrCreateRoom(ctx context.Context, name string) (*room, bool,
 	// So the JOIN path clears idleSince in the SAME rm.mu section that mutates
 	// rm.peers (see ServeHTTP), tying "not idle" to "a peer is present." The
 	// immediate-mutation callers (relay Inject, admin Apply) that mutate the doc
-	// with no registration delay clear it themselves right after this returns.
+	// with no registration delay clear it themselves right after this returns,
+	// and restamp it on return when no peer is present (markIdleIfEmpty).
 	return r, created, nil
 }
 
