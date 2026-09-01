@@ -13,6 +13,7 @@ import (
 
 	"github.com/reearth/ygo/crdt"
 	"github.com/reearth/ygo/encoding"
+	"github.com/reearth/ygo/internal/updatecheck"
 	ygsync "github.com/reearth/ygo/sync"
 )
 
@@ -164,6 +165,12 @@ func (s *Server) effectiveMaxUpdateBytes() int {
 // peers joining after the broadcast receive the server's stale state
 // via sync step 2.
 //
+// The update is checked first by decoding it into a scratch document; bytes
+// that do not decode return ErrInvalidUpdate. The check does not apply
+// MaxPendingItems: decoded without the room's state, an incremental update
+// parks every item that depends on that state, and the room's document, which
+// holds that state, enforces MaxPendingItems when it applies the update.
+//
 // Peer write failures during fan-out do not produce an error: writes
 // are dispatched in goroutines with a per-write deadline (writeTimeout),
 // matching the existing peer-broadcast path. A slow peer cannot block
@@ -195,10 +202,13 @@ func (s *Server) broadcastUpdate(ctx context.Context, room string, update []byte
 	if len(update) > s.effectiveMaxUpdateBytes() {
 		return ErrUpdateTooLarge
 	}
-	// Validate by applying to a throwaway doc. If the bytes are
+	// Validate by decoding into a throwaway doc. If the bytes are
 	// malformed, peers would reject them anyway; catching at the
-	// server boundary surfaces caller bugs eagerly.
-	if err := crdt.ApplyUpdateV1(crdt.New(), update, nil); err != nil {
+	// server boundary surfaces caller bugs eagerly. This is the bundled
+	// stores' check, with no pending cap: the room's document has already
+	// applied the update (callers apply first, and Inject applies before it
+	// rebroadcasts), so refusing here would only keep it from the peers.
+	if err := updatecheck.ValidateV1(update); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidUpdate, err)
 	}
 	if fireHook && s.OnInject != nil {
@@ -326,6 +336,10 @@ func (s *Server) Apply(
 	// (#193 review). Also protects rm from a concurrent eviction while in use.
 	defer s.releaseInflight(rm)
 	rm.clearIdle() // #183: Apply mutates the doc immediately; no registration delay.
+	// Stamp the room idle again on every return path if no peer is connected,
+	// so the sweeper reclaims a room only Apply touched (runs before the
+	// releaseInflight above, so the room stays safe until Apply is done).
+	defer s.markIdleIfEmpty(rm)
 
 	origin := &applyOriginSentinel{}
 	var (
@@ -465,13 +479,19 @@ func encodeBroadcastWire(update []byte) []byte {
 // that subsequent GetDoc / BroadcastUpdate / Apply calls do not see it.
 //
 // If peers are connected:
-//   - force=false: returns ErrRoomHasPeers without modifying state.
-//   - force=true:  closes each peer connection, waits for disconnect
-//     handlers to run, then deletes the room.
+//   - force=false: returns ErrRoomHasPeers without modifying state. A peer
+//     that joins while CloseRoom runs counts too.
+//   - force=true:  closes each peer connection and waits for its read loop
+//     to exit, then deletes the room. A peer that joins while CloseRoom runs
+//     is closed the same way before the CloseRoom call that deletes the room
+//     returns. A closed peer's disconnect handler, and so OnLastPeer, can
+//     still be running when CloseRoom returns.
 //
 // CloseRoom is primarily intended for releasing rooms created by Apply
-// that never accumulated peer connections — without it, such rooms
-// linger until process exit.
+// that never accumulated peer connections. In eager-evict mode
+// (RoomIdleTimeout == 0) such rooms linger until process exit without
+// it; with RoomIdleTimeout > 0 the idle sweeper reclaims them once they
+// have been idle that long.
 func (s *Server) CloseRoom(name string, force bool) error {
 	select {
 	case <-s.shutdownCh:
@@ -519,28 +539,14 @@ func (s *Server) CloseRoom(name string, force bool) error {
 	}
 
 	// Collect connection handles and done channels for force-close.
-	var conns []*gws.Conn
-	var dones []chan struct{}
-	if peerCount > 0 {
-		conns = make([]*gws.Conn, 0, peerCount)
-		dones = make([]chan struct{}, 0, peerCount)
-		for p := range rm.peers {
-			conns = append(conns, p.conn)
-			dones = append(dones, p.done)
-		}
-	}
+	conns, dones := peerHandles(rm)
 	rm.mu.Unlock()
 	s.rmu.Unlock()
 
 	// Close each connection outside the locks. handleDisconnect reacquires
 	// s.rmu and rm.mu, so we MUST have released both before entering this
 	// block to avoid deadlock.
-	for _, c := range conns {
-		_ = c.Close()
-	}
-	for _, d := range dones {
-		<-d
-	}
+	closePeerConns(conns, dones)
 
 	// FLUSH-BEFORE-EVICT (#175 follow-up). Make the pending coalesced batch
 	// durable while rm is still in s.rooms — before re-acquiring s.rmu to
@@ -556,14 +562,14 @@ func (s *Server) CloseRoom(name string, force bool) error {
 	// Unlike handleDisconnect, CloseRoom is a FORCED admin removal: it proceeds to
 	// evict regardless of flush success. The close(persistStop) below drives the
 	// worker's exit-flush as the retry, so a false result here is not fatal — we
-	// only log it (best effort) and do not abort.
+	// only log it (best effort) and do not abort. Without force, a peer that
+	// joined meanwhile keeps the room open below, and its worker keeps running.
 	if rm.flushReq != nil {
 		ack := make(chan bool, 1)
 		select {
 		case rm.flushReq <- ack:
 			if !<-ack {
-				s.log().Warn("CloseRoom flush did not fully persist; relying on exit-flush retry",
-					"room", name)
+				s.log().Warn("CloseRoom flush did not fully persist", "room", name)
 			}
 		case <-rm.persistDone:
 		}
@@ -585,6 +591,23 @@ func (s *Server) CloseRoom(name string, force bool) error {
 		// OnUnloadDocument; nothing more for CloseRoom to do here.
 		return nil
 	}
+	// A peer can join rm after the peer list above was taken: ServeHTTP
+	// admits a peer while s.rooms[name] is still rm, and rm stayed in
+	// s.rooms through the wait and the flush above. Such a peer is in
+	// rm.peers now. rm.peers may also still hold a peer closed above whose
+	// disconnect handler has not removed it yet. Without force, a room with a
+	// peer stays open. With force, rm leaves s.rooms here, under s.rmu, which
+	// a join holds while it checks s.rooms and adds itself: no join reaches rm
+	// after this, so the peers taken here are the last. Closing a peer closed
+	// above again is harmless.
+	rm.mu.Lock()
+	if len(rm.peers) > 0 && !force {
+		rm.mu.Unlock()
+		s.rmu.Unlock()
+		return ErrRoomHasPeers
+	}
+	lateConns, lateDones := peerHandles(rm)
+	rm.mu.Unlock()
 	delete(s.rooms, name)
 	if rm.persistStop != nil {
 		select {
@@ -595,6 +618,8 @@ func (s *Server) CloseRoom(name string, force bool) error {
 		}
 	}
 	s.rmu.Unlock()
+
+	closePeerConns(lateConns, lateDones)
 
 	if rm.persistDone != nil {
 		<-rm.persistDone
@@ -618,4 +643,31 @@ func (s *Server) CloseRoom(name string, force bool) error {
 		})
 	}
 	return nil
+}
+
+// peerHandles returns the connection and the done channel of each peer in rm.
+// The caller holds rm.mu.
+func peerHandles(rm *room) ([]*gws.Conn, []chan struct{}) {
+	if len(rm.peers) == 0 {
+		return nil, nil
+	}
+	conns := make([]*gws.Conn, 0, len(rm.peers))
+	dones := make([]chan struct{}, 0, len(rm.peers))
+	for p := range rm.peers {
+		conns = append(conns, p.conn)
+		dones = append(dones, p.done)
+	}
+	return conns, dones
+}
+
+// closePeerConns closes each connection, then waits for each done channel,
+// which a peer's read loop closes when it exits. The caller holds neither
+// s.rmu nor rm.mu: each peer's handleDisconnect takes both.
+func closePeerConns(conns []*gws.Conn, dones []chan struct{}) {
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	for _, d := range dones {
+		<-d
+	}
 }
