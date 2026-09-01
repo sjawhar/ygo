@@ -1,3 +1,164 @@
+## v1.49.6-sami.2
+
+**Who is affected:** applications that accept collaborative updates, render
+documents containing deeply nested shared types, or replace many independently
+stored CRDT items in one transaction.
+
+- **Deep nested-type operations no longer consume the Go call stack.** A
+  document can grow deeply nested over many small, valid updates; deleting its
+  outer container used to terminate the process. Deletion keeps its existing
+  depth-first CRDT effects with an explicit stack. JSON and XML reads also
+  traverse nested shared types iteratively.
+
+- **Many disjoint deletions no longer make transaction-local garbage collection
+  quadratic.** The garbage collector uses the store's clock ordering to find
+  each deleted range's first overlapping item with a binary search, then
+  garbage-collects only that range. Visible results and tombstones are
+  unchanged.
+
+## v1.49.5
+
+**Who is affected: anyone using `provider/client` with `Options.Token` against
+a server that can reject it.** If you do not set `Token`, nothing here changes
+for you.
+
+v1.49.3 fixed a rejected authentication token being sent twice. It fixed most
+of it. The client announces its token and sends its opening sync message
+without waiting, and v1.49.3 taught both of those writes to notice a rejection
+that had already arrived. But the client also *answers* the server: when the
+server asks what the client has, the client replies — and that reply is sent in
+the same instant the rejection may be arriving. When it was, the reply failed to
+send, the failure looked like an ordinary network glitch, and the client
+reconnected with the same refused token.
+
+So the symptom is the same as before, through a different door: **two failed
+authentication attempts instead of one**. As before there was no infinite
+retry, no hang, and no data loss — `Connect` still returned `ErrAuthRejected`
+and stopped. It matters if your server counts failed authentications toward
+rate-limiting or account lockout.
+
+**What changed.** The check now lives in one place that every send goes
+through, instead of being attached to two of them. There turned out to be five
+such sends, not the two the previous fix hardened — a test that simply counts
+them now fails if a new one is added without the check, which is how this
+problem reached a release twice.
+
+The same change removes a subtler problem in the previous fix: it read the
+connection directly while the client's own reader was already reading it, which
+the WebSocket library does not allow. That is also why it worked only
+sometimes — the two readers competed for the very message the check needed. It
+now asks the existing reader instead.
+
+**Present since v1.48.0**, and only narrowed by v1.49.3. It kept failing our
+own test suite intermittently after that release, which is how it was caught.
+## v1.49.4
+
+**Who is affected: anyone using the built-in `websocket.MemoryPersistence` whose
+compaction can fail.** In practice that means a corrupt stored record the merge
+cannot fold. If your folds succeed, nothing here changes for you — the healthy
+path is byte-for-byte the same cadence it always was.
+
+`MemoryPersistence` batches its housekeeping: every so many writes it folds a
+room's accumulated update records back into one. When that fold failed, it was
+retried on *every* subsequent write instead of waiting for the next batch. Each
+retry re-read and re-merged the whole log — work the previous failure had
+already shown would not succeed, over a log that only grew.
+
+The result was quadratic: with the fold failing, 800 writes cost 791 compaction
+attempts and merged 320,355 records. It is now 7 attempts and 1,270 records. The
+saving grows with the workload — 33× less merge work at 100 writes, 252× at 800.
+
+**No data was ever at risk.** A fold that fails leaves the records exactly where
+they were, and an un-folded record is still a stored record that still loads.
+This was a cost problem — wasted CPU on a store that was already unhealthy —
+not a correctness one.
+
+**What changed.** Each consecutive failure now doubles the number of writes
+before the next attempt, up to 64× the normal interval, and the first success
+puts it straight back to normal. It stays capped rather than backing off
+forever, because a fold that never runs is a log that never shrinks: a store
+that recovers has to be noticed, and the un-folded backlog has to stay bounded.
+Counting in writes rather than seconds means an idle room does not retry at all,
+and a recovered one is retried as soon as it is being used again.
+
+Explicit `Compact` calls, `LoadDoc`, and `Server.CompactEvery` are unchanged —
+they always fold on demand, and `Server.CompactEvery` already had its own
+spacing.
+
+**Present since v1.49.0.** Closes #239.
+
+Also in this release: the pure-Go SQLite driver behind `persistence/sqlite` and
+the offline client's local store moves from `modernc.org/sqlite` v1.34.5 to
+v1.39.0, picking up five minor versions of upstream fixes. That is as far as it
+can go for now — the next release requires Go 1.24 and the current one requires
+Go 1.25, against this module's Go 1.23 floor. Raising the floor would break
+consumers still on 1.23, so it stays where it is.
+
+## v1.49.3
+
+**Who is affected: anyone using `provider/client` with `Options.Token` against a
+server that can reject it.** If you do not set `Token`, nothing here changes for
+you.
+
+A rejected authentication token could be sent to the server twice instead of
+once. The client still gave up correctly after that — `Connect` returned
+`ErrAuthRejected` and stopped — so there was never an infinite retry loop, a
+hang, or any data loss. The practical impact is that a client with a bad
+credential made two failed authentication attempts, which matters if your server
+counts those toward rate-limiting or account lockout.
+
+**Why it happened.** The client announces its token and then immediately sends
+its opening sync message, without waiting for a reply. Both of the ways a
+rejection is recognised arrive on the *receiving* side. When the server rejected
+the token and closed fast enough, the client's second message failed to send, it
+never got as far as reading, and a refused credential looked like an ordinary
+network glitch — so it reconnected and tried the same token again.
+
+The rejection was not lost; it was sitting unread. A failed send does not mean
+the other side has stopped talking. The client now checks for it before deciding
+a failure was retryable.
+
+**Present since v1.48.0**, and in every release since. It surfaced as an
+intermittent CI failure that the existing test could not reproduce on demand;
+the new test forces the exact timing every run.
+
+**Upgrade notes:** none. No API change, no behaviour change for anyone not using
+`Token`.
+
+## v1.49.2
+
+**Who is affected: nobody's running code.** This release changes no library
+source — `crdt`, `provider`, `cluster`, `persistence` and `mobile` are
+byte-identical to v1.49.1. It ships one corrected benchmark file. If you are
+upgrading for a fix, you already have it.
+
+It is tagged so the corrected measurements have a version to cite.
+
+**What changed.** The benchmark suite added in #180 could not see the cost it
+was pointed at, in three separate ways, and that mattered: it agreed with the
+performance claims in #189 rather than testing them, so one proposed
+optimisation was implemented and reviewed clean before measurement showed it
+made the common path slower.
+
+- The suite's original observed-transaction benchmark is blind by construction.
+  A single client appending merges into a handful of items, so its walk is
+  effectively O(1) regardless of document size.
+- Its replacement measured a document that grew while being measured, so the
+  result described `b.N` rather than the document size it named. One figure was
+  16x artifact.
+- Its fixture was quadratic, which put realistic document sizes out of reach.
+- The delete-set benchmark sampled 1/10/100/1000 ranges and skipped 0/2/4/8/16,
+  which is where every real workload sits.
+
+**What it produced.** With a benchmark that measures the right shape, the
+performance epic went from nine asserted findings to one large measured one —
+building an observer's delta costs roughly 1000x the edit itself on a
+100k-item document — plus two rejections and three claims recorded as
+unverified. #189 now carries all of it, and #181, #184, #185 and #188 are
+closed into it.
+
+**Upgrade notes:** none. There is nothing to migrate and no behaviour change.
+
 ## v1.49.1
 
 **Who is affected: anyone whose documents have deletion history and who loads
@@ -386,10 +547,10 @@ release only adds packages.
 Until now, ygo's networked sync story was server-only: `provider/websocket`
 answers peers, but embedding a *client* that dials it meant hand-rolling the
 WebSocket connection, the sync handshake, reconnect-with-backoff, and local
-durability yourself. `provider/client` closes that gap — this is the same
-project's own competitive comparison against Deln0r/ygo naming
-"embeddable offline-first client" as a gap the rival covered and we didn't;
-it no longer is.
+durability yourself. `provider/client` closes that gap — it was the largest
+remaining hole in the library's own coverage, named in this project's
+competitive review as the one thing a Go consumer still could not do without
+writing the client themselves.
 
 **The offline model, concretely — because "offline-first" gets read as
 vaguer than it is.** There is no offline-op queue anywhere in this package,
