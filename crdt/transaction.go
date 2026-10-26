@@ -377,7 +377,7 @@ func tryMergeWithLefts(txn *Transaction) {
 	store := txn.doc.store
 	merging := &mergeRuns{}
 	for _, item := range txn.mergeStructs {
-		tryMergeWithLeft(item, store, merging)
+		tryMergeWithLeft(item, merging)
 	}
 	merging.finish(store)
 }
@@ -444,7 +444,7 @@ func (m *mergeRuns) finish(store *StructStore) {
 //
 // On success: left's content is extended in place, the linked list is spliced
 // past item, and item is removed from the store.
-func tryMergeWithLeft(item *Item, store *StructStore, merging *mergeRuns) bool {
+func tryMergeWithLeft(item *Item, merging *mergeRuns) bool {
 	left := item.Left
 	if left == nil {
 		return false
