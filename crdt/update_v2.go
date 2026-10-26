@@ -795,7 +795,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 	unresolvableDs := ds.applyToPartial(txn)
 	if len(unresolvableDs.clients) > 0 {
-		txn.doc.store.pendingDs.Merge(unresolvableDs)
+		parkDeletes(txn, unresolvableDs)
 	}
 
 	drainParked(txn, func() {

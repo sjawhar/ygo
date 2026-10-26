@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.3-sami.6] — 2026-10-26
+
+Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.5
+tag (e0a2f4ff) and one new member, the entry directly below. Everything under
+1.51.3-sami.5 is unchanged.
+
+### Fixed
+
+- **`crdt`: a bounded document's remote apply no longer copies what earlier
+  updates parked.** To restore them when it refuses an update, the apply of a
+  document with a scan bound (`WithMaxIntegrateScan`) copied the pending queue's
+  items, the clocks it waits on and the pending deletes as it began, and the
+  drain copied the pending deletes again, so every remote apply cost time and
+  memory in proportion to what sat parked: one keystroke allocated 2,806,176
+  bytes on a bounded document holding 349,517 parked structs (2,880 unbounded)
+  and 25,171,104 bytes on one holding 524,280 parked delete ranges (8,391,872
+  unbounded) on 1.51.3-sami.5. The apply now keeps them by reference: it only
+  appends to the parked items past the length it keeps, copies the map of
+  clocks the queue waits on at its first write to it, and merges a delete range
+  it parks into copies of the clients that range names, so a refused update
+  still leaves the parked items, the clocks they wait on and the pending deletes
+  exactly as they were. With 100,000 parked items a keystroke now allocates
+  3,176 bytes on a bounded document against 1,608 unbounded (806,264 on
+  1.51.3-sami.5), and with 100,000 parked delete ranges 1,609,192 against
+  1,607,624 (4,821,112 on 1.51.3-sami.5).
+
 ## [1.51.3-sami.5] — 2026-10-26
 
 Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.4
