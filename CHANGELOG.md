@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.3-sami.5] — 2026-10-26
+
+Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.4
+tag (a371effc), the 1.51.3-sami.2 tag's member that sami.3 and sami.4 did not
+carry, and one new member. Everything under 1.51.3-sami.4 is unchanged.
+reearth/ygo#304 (`Server.OnPeerUpdate`) is carried again because a consumer
+now pins it: sjawhar/legion's Dispatch refuses a browser's update in that hook
+before the room applies it.
+
+### Added
+
+- **`provider/websocket`: `Server.OnPeerUpdate`, a hook that runs in place of
+  the room's own apply of a read-write peer's SyncStep2 or Update.** The hook is
+  handed the room, its document, the update's V1 bytes and the origin, and an
+  `apply` function that applies the update as the room does without a hook (a
+  second call returns `ErrPeerUpdateApplied`), so an embedder can refuse an
+  update before it reaches the room or any other peer - a per-document size
+  bound, schema validation, write moderation - or hold a lock of its own across
+  the apply. An update `apply` did not apply is not broadcast and is answered
+  `SyncStatus(0)` on a Hocuspocus-framed connection; a hook error that is or
+  wraps a `*PeerClose` also closes the peer with its code and reason (cut to a
+  close frame's 123 bytes). An update `apply` applied is broadcast and answered
+  `SyncStatus(1)` whatever the hook returns. Read-only peers never reach the
+  hook. The hook is the counterpart of `@hocuspocus/server`'s
+  `beforeHandleMessage`. Nil, the default, leaves the behaviour unchanged.
+- **`crdt`: `WithMaxIntegrateScan`, `Doc.SetMaxIntegrateScan` and
+  `ErrIntegrateScanBudget`: a document can bound the conflict scans of a remote
+  update, and then applies every remote update whole or not at all.** YATA
+  places an item by scanning right from its left origin past every item whose
+  own origin lies in what the scan has passed, so an item naming an early left
+  origin and no right origin scans to the end of a list, and an update of n of
+  them scans n times the list: 2,000 such items (about 12 KB) into a list of
+  20,000 unmerged items took 20.8 s and allocated 2,365,640,192 bytes on
+  1.51.3-sami.4. With a bound, the scans of one remote update together pass at
+  most that many items; past it, ApplyUpdate (V1 and V2) returns
+  `ErrIntegrateScanBudget` (which wraps `ErrInvalidUpdate`). A bounded document
+  takes out what such an update, or any remote update whose apply fails,
+  integrated before it failed, so the document is left as it was and the
+  transaction fires no observer: nothing of the update is persisted or relayed.
+  A bounded document refuses a remote update carrying a subdocument or a move.
+  Local transactions are never bounded. No bound is set by default. The two
+  sets a scan keeps are made once per transaction and cleared for each scan,
+  bounded or not.
+
+### Fixed
+
+- **`crdt`: merging split runs back at commit is linear in the run.** An update
+  that splits one run n times and leaves each half where it merges back at
+  commit made each merge append the half to the run's whole text and search and
+  shift the client's store slice: 20,000 halves of a 40,000-character run
+  allocated 440,968,992 bytes in one apply on 1.51.3-sami.4, 11,384,168 now.
+  The halves merge in clock order, each run's text is joined once, and the
+  merged halves leave their store slices in one pass per client.
+
 ## [1.51.3-sami.4] — 2026-10-26
 
 Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.3
@@ -73,20 +127,6 @@ merges upstream 1.51.2.
   already holds everything a V1 update carries (every struct below its state
   vector, every deletion in its delete set), without integrating the update.
   Matches Yjs `snapshotContainsUpdate`. (reearth/ygo#291)
-- **`provider/websocket`: `Server.OnPeerUpdate`, a hook that runs in place of
-  the room's own apply of a read-write peer's SyncStep2 or Update.** The hook is
-  handed the room, its document, the update's V1 bytes and the origin, and an
-  `apply` function that applies the update as the room does without a hook (a
-  second call returns `ErrPeerUpdateApplied`), so an embedder can refuse an
-  update before it reaches the room or any other peer - a per-document size
-  bound, schema validation, write moderation - or hold a lock of its own across
-  the apply. An update `apply` did not apply is not broadcast and is answered
-  `SyncStatus(0)` on a Hocuspocus-framed connection; a hook error that is or
-  wraps a `*PeerClose` also closes the peer with its code and reason (cut to a
-  close frame's 123 bytes). An update `apply` applied is broadcast and answered
-  `SyncStatus(1)` whatever the hook returns. Read-only peers never reach the
-  hook. The hook is the counterpart of `@hocuspocus/server`'s
-  `beforeHandleMessage`. Nil, the default, leaves the behaviour unchanged.
 
 ### Fixed
 
