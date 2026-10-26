@@ -1,3 +1,85 @@
+## v1.51.3-sami.5
+
+A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
+(07bd8f62) from the `v1.51.3-sami.4` tag (a371effc). It carries the nine
+changes of v1.51.3-sami.4, the v1.51.3-sami.2 tag's member that sami.3 and
+sami.4 left out, and one new fix, each bound for upstream; nothing here is
+fork-only.
+
+| Change | Upstream pull request | Commit carried |
+|---|---|---|
+| A complete update resolves its own dependencies before the pending cap | reearth/ygo#260 | 2cbc892e |
+| Transactional GC finds deleted ranges by binary search (unchanged; described under v1.50.1-sami.1) | reearth/ygo#262, closed as a duplicate of reearth/ygo#258 | 3dc75a11 |
+| No stack overflow on deeply nested types | reearth/ygo#263 | b0558b1c |
+| Items merge only when their right origins match | reearth/ygo#266 | 9dd6ef4f |
+| The bundled persistence stores and BroadcastUpdate keep large incremental updates | reearth/ygo#268 | 7c787a8b |
+| Rooms only Apply or the relay touched are swept when idle | reearth/ygo#269 | 5a035e51 |
+| Hocuspocus-framed connections are answered a SyncStatus for every sync frame | reearth/ygo#291 | 96333155 |
+| CloseRoom closes a peer that joins while it runs | reearth/ygo#331 | ccb8f22c |
+| `Doc.OpenUpdateLog` records committed updates in commit order | reearth/ygo#332 | 8d697bca |
+| `Server.OnPeerUpdate`, a hook in place of the room's apply of a peer update | reearth/ygo#304, merged upstream in 1.54.0 | 7030d34a, a4308a3b |
+| A remote update's conflict scans can be bounded, and split runs merge back in linear time | from sjawhar/ygo `fix/integrate-scan-bound` | f908da3e |
+
+**Changes from v1.51.3-sami.4.** `Server.OnPeerUpdate` is carried again,
+because a consumer now refuses peer updates in it, and the crdt fix below is
+new. Unlike the other members, both sit on top of the v1.51.3-sami.4 tag
+rather than on the shared base. The other nine members are unchanged.
+
+### `Server.OnPeerUpdate` (reearth/ygo#304)
+
+**Who is affected: servers that want to look at a read-write peer's update
+before it applies** — a per-document size bound, schema validation, write
+moderation — or that want a lock of their own held across the apply.
+
+`Server.OnPeerUpdate`, if set, runs in place of the room's own apply of a
+read-write peer's SyncStep2 or Update (Sync/SyncReply, tags 0/4). It is handed
+the room name, its document, the update's V1 bytes and the transaction origin,
+and an `apply` function that applies the update exactly as the room does
+without a hook; a second call to `apply` returns `ErrPeerUpdateApplied`. An
+update `apply` did not apply is refused: not broadcast, and answered
+`SyncStatus(0)` on a Hocuspocus-framed connection. A hook error that is or
+wraps a `*PeerClose{Code, Reason}` closes the peer with that code after the
+`SyncStatus`, its reason cut to a close frame's 123 bytes at a rune boundary.
+An update `apply` applied is broadcast and answered `SyncStatus(1)` whatever
+the hook returns afterward. Read-only peers never reach the hook, as before.
+Nil, the default, leaves every peer's update applied exactly as it was.
+
+This is the counterpart of `@hocuspocus/server`'s `beforeHandleMessage`
+(`packages/server/src/Connection.ts`), which runs before the message
+handler's own apply and lets a rejection close the connection with its own
+code and reason.
+
+### A remote update's conflict scans can be bounded; split runs merge back in linear time
+
+**Who is affected: servers that apply updates from peers they do not fully
+trust.** Nothing changes for a document that sets no bound, except that the
+commit-time merge below is faster.
+
+Two parts of applying a remote update cost time and memory that grow with the
+square of the update, so one small update could hold a document's lock for
+many seconds and allocate gigabytes:
+
+- **The conflict scan.** YATA places an item by scanning right from its left
+  origin past every item whose own origin lies in what the scan has passed. An
+  item naming an early left origin and no right origin scans to the end of a
+  list, so an update of n of them scans n times the list: 2,000 such items
+  (about 12 KB) into a list of 20,000 unmerged items took 20.8 s and allocated
+  2,365,640,192 bytes on v1.51.3-sami.4. A document can now set a bound with
+  `WithMaxIntegrateScan` or `Doc.SetMaxIntegrateScan`: the scans of one remote
+  update together pass at most that many items, and past it `ApplyUpdateV1` and
+  `ApplyUpdateV2` return `ErrIntegrateScanBudget`, which wraps
+  `ErrInvalidUpdate`. A bounded document applies every remote update whole or
+  not at all: an update whose apply fails leaves the document as it was, and
+  its transaction fires no observer, so nothing of it is persisted or relayed.
+  A bounded document refuses a remote update that carries a subdocument or a
+  move. Local transactions are never bounded, and no bound is set by default.
+- **The merge at commit.** An update that splits one run many times, leaving
+  each half where it merges back at commit, made each merge copy the run's
+  whole text and shift the client's store slice: 20,000 halves of a
+  40,000-character run allocated 440,968,992 bytes in one apply on
+  v1.51.3-sami.4, and 11,384,168 bytes now. The text and the merged run are as
+  before.
+
 ## v1.51.3-sami.4
 
 A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
@@ -291,28 +373,6 @@ Three answers differ from `@hocuspocus/server` 2.15.3, on purpose:
 `crdt.SnapshotContainsUpdateV1` is new: it reports whether a snapshot already
 holds everything a V1 update carries, as Yjs `snapshotContainsUpdate` does. The
 read-only SyncStep2 answer uses it.
-
-**Who is affected: servers that want to look at a read-write peer's update
-before it applies** — a per-document size bound, schema validation, write
-moderation — or that want a lock of their own held across the apply.
-
-`Server.OnPeerUpdate`, if set, runs in place of the room's own apply of a
-read-write peer's SyncStep2 or Update (Sync/SyncReply, tags 0/4). It is handed
-the room name, its document, the update's V1 bytes and the transaction origin,
-and an `apply` function that applies the update exactly as the room does
-without a hook; a second call to `apply` returns `ErrPeerUpdateApplied`. An
-update `apply` did not apply is refused: not broadcast, and answered
-`SyncStatus(0)` on a Hocuspocus-framed connection. A hook error that is or
-wraps a `*PeerClose{Code, Reason}` closes the peer with that code after the
-`SyncStatus`, its reason cut to a close frame's 123 bytes at a rune boundary.
-An update `apply` applied is broadcast and answered `SyncStatus(1)` whatever
-the hook returns afterward. Read-only peers never reach the hook, as before.
-Nil, the default, leaves every peer's update applied exactly as it was.
-
-This is the counterpart of `@hocuspocus/server`'s `beforeHandleMessage`
-(`packages/server/src/Connection.ts`), which runs before the message
-handler's own apply and lets a rejection close the connection with its own
-code and reason.
 
 ## v1.51.2
 
