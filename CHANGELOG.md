@@ -45,9 +45,11 @@ before the room applies it.
   integrated before it failed, so the document is left as it was and the
   transaction fires no observer: nothing of the update is persisted or relayed.
   A bounded document refuses a remote update carrying a subdocument or a move.
-  Local transactions are never bounded. No bound is set by default. The two
-  sets a scan keeps are made once per transaction and cleared for each scan,
-  bounded or not.
+  Local transactions are never bounded. No bound is set by default. Bounded or
+  not, a transaction's conflict scans share one map of marks, made by the first
+  scan that needs it and kept until the transaction commits: each mark records
+  which scan, and which step of it, passed the item, so a new scan reuses the
+  map without clearing it.
 
 ### Fixed
 
