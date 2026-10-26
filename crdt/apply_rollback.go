@@ -155,6 +155,10 @@ func parkedMissing(txn *Transaction) StateVector {
 // ranges and sorts them in place, so on a document with a scan bound, whose
 // journal shares the pending deletes as the apply found them, it writes into a
 // set whose map is a copy and whose ranges are copies for the clients ds names.
+// Today no rollback of the whole apply can follow this merge: it is the last
+// step before drainParked, which takes back on its own what it does. The copy
+// guards only a step that can fail being added after it; keep it for that, and
+// do not count on it as more.
 func parkDeletes(txn *Transaction, ds DeleteSet) {
 	s := txn.doc.store
 	if txn.journal != nil {

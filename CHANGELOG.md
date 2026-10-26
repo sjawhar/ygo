@@ -8,8 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.51.3-sami.6] — 2026-10-26
 
 Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.5
-tag (e0a2f4ff) and one new member, the entry directly below. Everything under
-1.51.3-sami.5 is unchanged.
+tag (e0a2f4ff) and the commits on top of it that the entries below describe.
+Everything under 1.51.3-sami.5 is unchanged.
 
 ### Fixed
 
@@ -30,6 +30,44 @@ tag (e0a2f4ff) and one new member, the entry directly below. Everything under
   3,176 bytes on a bounded document against 1,608 unbounded (806,264 on
   1.51.3-sami.5), and with 100,000 parked delete ranges 1,609,192 against
   1,607,624 (4,821,112 on 1.51.3-sami.5).
+- **`crdt`: a remote apply no longer pays for every parked delete range.**
+  Every remote apply, bounded or not, handed all the parked delete ranges to
+  the retry, which copied each range of a client the store does not hold into
+  a new set, so one keystroke allocated about 1.6 MB with 100,000 ranges
+  parked. A client's parked ranges are now retried only once the store's next
+  clock for it has passed the first of them, since until then none of them can
+  apply: an apply that brings nothing for a client costs nothing for its parked
+  ranges, and a parked range still applies, part by part, as the structs it
+  names arrive.
+
+### Changed
+
+- **`crdt`: parked delete ranges are capped as parked items are.** Nothing
+  bounded the delete ranges parked waiting for their structs, so a peer could
+  grow them without limit with delete sets naming clocks of a client nobody
+  holds. `WithMaxPendingItems` (and `Server.MaxPendingItems`) now also caps
+  them, counted separately from parked items with the same default of 100,000:
+  an update whose delete set would grow the parked ranges past the cap returns
+  `ErrInvalidUpdate` before it parks anything, at the point and in the way an
+  update that would park too many items is refused, and a bounded document is
+  left as it was. The count is taken after the merge, and an update that adds
+  no range is never refused, so a delete set sent again, or ranges that join
+  parked ones, pass. An honest peer deletes only what it holds and sends a
+  struct before or with any delete of it, so its deletes park only while its
+  updates arrive out of order, and only until the structs they name do.
+- **`crdt`: `Doc.SetMaxPendingItems`, and `provider/websocket` loads a room's
+  stored state with the pending cap lifted.** A stored state carries what was
+  parked when it was written, which can be more than the cap: the cap was
+  lowered since, or the state was written before parked delete ranges were
+  capped. A document capped before such a state arrives refuses it, so the
+  room never loads. The server now makes each room's document with the cap
+  lifted and sets `MaxPendingItems` with `SetMaxPendingItems` once the stored
+  state is in, before the `OnLoadDocument` hook and before any peer's update:
+  what arrives after the load is capped as before. This also lets a stored
+  state with more parked items than the cap load, which it did not before, and
+  such a document still applies an update whose items wait on each other within
+  it and all resolve: as for delete ranges, only growth of what is parked is
+  refused.
 
 ## [1.51.3-sami.5] — 2026-10-26
 

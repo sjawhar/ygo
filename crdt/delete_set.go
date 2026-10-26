@@ -1,6 +1,7 @@
 package crdt
 
 import (
+	"cmp"
 	"slices"
 	"sort"
 )
@@ -215,4 +216,85 @@ func (ds *DeleteSet) applyToPartial(txn *Transaction) DeleteSet {
 		}
 	}
 	return unresolvable
+}
+
+// retryParkedDeletes applies the parked delete ranges (StructStore.pendingDs)
+// whose structs have arrived since they were parked, and keeps the others as
+// they are. A client's ranges are retried only once the store's next clock for
+// it has passed its first parked range: a retry tries every range below the
+// store's next clock and parks only what lies at or past it, so until that
+// clock moves nothing of the client's ranges can apply, and an apply that
+// brings nothing new for a client costs nothing for its parked ranges, however
+// many there are. A client's parked ranges are sorted, since Merge sorts them
+// and a retry keeps their order, so its first range is its lowest.
+//
+// The pending deletes are replaced, never written into, so a journal that
+// keeps them by reference (drainParked) still holds them as the apply found
+// them.
+func retryParkedDeletes(txn *Transaction) {
+	s := txn.doc.store
+	var ready DeleteSet
+	for client, ranges := range s.pendingDs.clients {
+		if len(ranges) > 0 && s.NextClock(client) > ranges[0].Clock {
+			if ready.clients == nil {
+				ready = newDeleteSet()
+			}
+			ready.clients[client] = ranges
+		}
+	}
+	if ready.clients == nil {
+		return
+	}
+	kept := s.pendingDs
+	s.pendingDs = newDeleteSet()
+	still := ready.applyToPartial(txn)
+	for client, ranges := range kept.clients {
+		if _, retried := ready.clients[client]; !retried && len(ranges) > 0 {
+			still.clients[client] = ranges
+		}
+	}
+	s.pendingDs = still
+}
+
+// parkedDeleteRangesAfter is how many delete ranges pending would hold once ds
+// is merged into it: Merge sorts each client's ranges and joins those that
+// overlap or touch, so ranges ds names again, or that fill the gap between two
+// parked ranges, add nothing or take ranges away.
+func parkedDeleteRangesAfter(pending, ds DeleteSet) int {
+	n := 0
+	for client, ranges := range pending.clients {
+		if _, merged := ds.clients[client]; !merged {
+			n += len(ranges)
+		}
+	}
+	for client, add := range ds.clients {
+		n += mergedRangeCount(pending.clients[client], add)
+	}
+	return n
+}
+
+// mergedRangeCount is how many ranges sortAndCompact leaves of have and add
+// together. have is sorted by clock, as a parked client's ranges are; add is
+// sorted here, on a copy, so the count costs what add holds and no more.
+func mergedRangeCount(have, add []DeleteRange) int {
+	add = slices.Clone(add)
+	slices.SortFunc(add, func(a, b DeleteRange) int { return cmp.Compare(a.Clock, b.Clock) })
+	count, end := 0, uint64(0)
+	for i, j := 0, 0; i < len(have) || j < len(add); {
+		var r DeleteRange
+		if j == len(add) || (i < len(have) && have[i].Clock <= add[j].Clock) {
+			r = have[i]
+			i++
+		} else {
+			r = add[j]
+			j++
+		}
+		if count > 0 && end >= r.Clock {
+			end = max(end, r.Clock+r.Len)
+			continue
+		}
+		count++
+		end = r.Clock + r.Len
+	}
+	return count
 }
