@@ -1,3 +1,111 @@
+## v1.51.3-sami.7
+
+A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
+(07bd8f62) from the `v1.51.3-sami.6` tag (32e09873). It carries the fifteen
+changes of v1.51.3-sami.6 and two new ones, bound for upstream like the rest;
+nothing here is fork-only. Everything under v1.51.3-sami.6 is unchanged.
+
+| Change | Upstream pull request | Commit carried |
+|---|---|---|
+| A complete update resolves its own dependencies before the pending cap | reearth/ygo#260 | 2cbc892e |
+| Transactional GC finds deleted ranges by binary search (unchanged; described under v1.50.1-sami.1) | reearth/ygo#262, closed as a duplicate of reearth/ygo#258 | 3dc75a11 |
+| No stack overflow on deeply nested types | reearth/ygo#263 | b0558b1c |
+| Items merge only when their right origins match | reearth/ygo#266 | 9dd6ef4f |
+| The bundled persistence stores and BroadcastUpdate keep large incremental updates | reearth/ygo#268 | 7c787a8b |
+| Rooms only Apply or the relay touched are swept when idle | reearth/ygo#269 | 5a035e51 |
+| Hocuspocus-framed connections are answered a SyncStatus for every sync frame | reearth/ygo#291 | 96333155 |
+| CloseRoom closes a peer that joins while it runs | reearth/ygo#331 | ccb8f22c |
+| `Doc.OpenUpdateLog` records committed updates in commit order | reearth/ygo#332 | 8d697bca |
+| `Server.OnPeerUpdate`, a hook in place of the room's apply of a peer update | reearth/ygo#304, merged upstream in 1.54.0 | 7030d34a, a4308a3b |
+| A remote update's conflict scans can be bounded, and split runs merge back in linear time | reearth/ygo#333 | f908da3e |
+| A bounded document's remote apply keeps what earlier updates parked | reearth/ygo#333 | 0dd407d6 |
+| A remote update's deferred items integrate in dependency order | to be opened | 04ce186e |
+| Parked delete ranges are retried only when they can apply, and are capped | to be opened | 7482a541 |
+| One place parks an item a remote update deferred | to be opened | 5ccfa0cc |
+| A scan allowance for each remote update, and the scans each apply passed | to be opened | 8aca836f |
+| A drain a bounded document takes back keeps the parked items | to be opened | 8160d4e5 |
+| A budget callback's panic is reported as the callback's, and a zero `RefusedUpdateError` is safe | to be opened | 145a54cd |
+
+**Changes from v1.51.3-sami.6.** The fixed scan bound becomes an allowance the
+document asks for per remote update, every apply now reports what its conflict
+scans passed, and a drain a bounded document takes back no longer drops what
+earlier updates parked. The fifteen members above are unchanged.
+
+### A scan allowance for each remote update, and the scans each apply passed
+
+**Who is affected: servers that bound a document's conflict scans**
+(`WithMaxIntegrateScan`, from v1.51.3-sami.5), and any server that wants to
+measure what an apply cost.
+
+One fixed bound has to hold the largest honest update, and so lets every update
+scan that much. `WithIntegrateScanBudget(func(origin any) int)` and
+`Doc.SetIntegrateScanBudget` give a document an allowance it asks for, under
+its own lock, as each remote apply begins, with that apply's origin. The
+apply's conflict scans, including the drain of the pending queue it ends with,
+may pass at most the number returned; zero or less leaves that one apply
+unbounded. So an owner can size each update's allowance from what it knows
+before applying it: the structs the update carries, who sent it, or what is
+left of an allowance it keeps for the whole document.
+
+An update whose scans would pass its allowance is refused with
+`ErrIntegrateScanBudget`. A drain that would pass what the update left is taken
+back, and the parked queue dropped, while the update stands, so one apply never
+scans more than its budget. Under a fixed bound the drain keeps an allowance of
+its own, the bound again, as before. A document with a budget is bounded
+whatever the budget returns: it applies every remote update whole or not at
+all, and refuses subdocuments and moves from remote updates, as a document with
+a bound does. The budget takes the bound's place while it is set.
+
+`(*Transaction).IntegrateScanned()` is the number of items the transaction's
+conflict scans passed, a drain taken back included. It is counted on every
+document, bounded or not, and read from `OnAfterTransaction`, which runs after
+the document's lock is released and before `ApplyUpdate` returns. Because a
+refused update commits no transaction an observer can see, `ApplyUpdateV1` and
+`ApplyUpdateV2` now return a `*RefusedUpdateError{Err, Scanned}`: `Scanned` is
+what that refused apply's scans passed, exactly its limit when the scans
+reached it, and `Unwrap` returns `Err`, so `errors.Is` matches
+`ErrIntegrateScanBudget` and `ErrInvalidUpdate` as before and the message is
+unchanged. A caller that reads these errors with `errors.Is` or `errors.As`
+needs no change; one that type-asserts the concrete error does.
+
+The count is exactly what the bound measures: a document bounded at the count
+takes the update, and one bounded a single item under it refuses the update.
+Decoding a document's whole state into a fresh document scans those items
+again: on a document fed 64 updates whose scans passed 1,754,872 items in all,
+the copy's own transaction passed 1,754,876. So an owner can keep a document's
+running total of what every later copy of it will pay.
+
+### A drain a bounded document takes back keeps the parked items
+
+**Who is affected: servers that bound a document's conflict scans**, whether
+by the fixed bound or by an allowance.
+
+When the drain of the pending queue that ends a remote apply would pass its
+allowance, the document takes the drain back and keeps the update that filled
+the gap. It also dropped every parked item, of every peer. A parked item is an
+edit whose sender was told it was delivered and which the document's state
+vector does not show, so a dropped one came back only when its sender next
+connected. Under the fixed bound this needed a drain heavier than the whole
+bound; under an allowance, any apply that used its allowance dropped the queue
+at the drain's first scan.
+
+The take-back now parks the queue again as the drain found it: the same items
+in the same order, a parked item the drain integrated and then split, or
+trimmed, given its clock and content back, and the pending deletes and pending
+moves as they were. `PendingStats` and the document's encoded state, which
+carries parked items, are what they were before the drain.
+
+Each clock the queue waits on is raised to the document's own, so the queue is
+drained again only once an apply brings a client it waits on further, which is
+the rule every drain runs under, and an apply that brings none pays for no
+drain. Left as they were, those clocks would have every later apply pay again
+for a drain that integrates nothing. The parked items integrate once such an
+apply's allowance holds the drain, or when their sender sends them again,
+whose update integrates them under its own allowance while the drain skips
+them. A queue whose only waited-on client is the sender of the parked items
+themselves is therefore drained by that sender's next sync rather than by
+another peer's apply, which is what a dropped queue needed in every case.
+
 ## v1.51.3-sami.6
 
 A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
