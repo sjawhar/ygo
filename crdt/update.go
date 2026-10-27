@@ -543,6 +543,9 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 	unresolvableDs := ds.applyToPartial(txn)
 	if len(unresolvableDs.clients) > 0 {
+		if err := checkParkedDeletes(txn.doc, unresolvableDs); err != nil {
+			return err
+		}
 		parkDeletes(txn, unresolvableDs)
 	}
 
@@ -742,22 +745,42 @@ func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	return nil
 }
 
-// drainPending runs the doc-level pending drain. It first retries any
-// previously-parked delete-set entries (pendingDs), then loops over
-// store.pending as long as progress is being made, integrating items and
-// re-parking those still blocked. A panic-safety closure re-parks any
-// unprocessed items back into store.pending before re-raising, so the
-// outer applyV1Txn recover (v1.1.1) can convert the panic to an error.
-// Also retries pendingDs after each successful integration pass.
+// checkParkedDeletes refuses an update whose delete ranges, ds, the store
+// cannot apply yet, when parking them would grow the parked delete ranges past
+// the cap the pending queue has for parked items (WithMaxPendingItems): the
+// same ErrInvalidUpdate at the same point, before anything is parked, as
+// resolveWithinUpdatePending gives for parked items. The count is taken after
+// the merge, and an update that adds no range is never refused: a delete set
+// sent again, as a peer that synced the parked ranges sends them back, or one
+// that joins parked ranges, passes even on a document that holds more than the
+// cap because it loaded a stored state with the cap lifted (SetMaxPendingItems).
+func checkParkedDeletes(doc *Doc, ds DeleteSet) error {
+	pending := doc.store.pendingDs
+	after := parkedDeleteRangesAfter(pending, ds)
+	if after <= doc.maxPendingItemsLimit() {
+		return nil
+	}
+	before := 0
+	for _, ranges := range pending.clients {
+		before += len(ranges)
+	}
+	if after <= before {
+		return nil
+	}
+	return wrapUpdateErr(ErrInvalidUpdate)
+}
+
+// drainPending runs the doc-level pending drain. It first retries the
+// previously-parked delete-set entries (pendingDs) whose structs have
+// arrived, then loops over store.pending as long as progress is being made,
+// integrating items and re-parking those still blocked. A panic-safety
+// closure re-parks any unprocessed items back into store.pending before
+// re-raising, so the outer applyV1Txn recover (v1.1.1) can convert the panic
+// to an error. Also retries pendingDs after each successful integration pass.
 func drainPending(txn *Transaction) {
 	// pendingDs may be drainable even if pending items aren't — integrated
 	// items from this update might be targets of previously-parked deletes.
-	if len(txn.doc.store.pendingDs.clients) > 0 {
-		pending := txn.doc.store.pendingDs
-		txn.doc.store.pendingDs = newDeleteSet()
-		stillUnresolvable := pending.applyToPartial(txn)
-		txn.doc.store.pendingDs = stillUnresolvable
-	}
+	retryParkedDeletes(txn)
 
 	// Drain pending items whose dependencies have been satisfied by
 	// this update. Inline rather than recursive (Go's sync.Mutex is not
@@ -814,11 +837,8 @@ func drainPending(txn *Transaction) {
 		}
 		// Retry pendingDs — freshly-integrated items may now be targets
 		// of previously-parked delete entries.
-		if progressed && len(txn.doc.store.pendingDs.clients) > 0 {
-			pending := txn.doc.store.pendingDs
-			txn.doc.store.pendingDs = newDeleteSet()
-			stillUnresolvable := pending.applyToPartial(txn)
-			txn.doc.store.pendingDs = stillUnresolvable
+		if progressed {
+			retryParkedDeletes(txn)
 		}
 		if !progressed {
 			// No progress this pass — infinite-loop guard. Items remain parked.
