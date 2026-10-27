@@ -39,6 +39,25 @@ Everything under 1.51.3-sami.5 is unchanged.
   apply: an apply that brings nothing for a client costs nothing for its parked
   ranges, and a parked range still applies, part by part, as the structs it
   names arrive.
+- **`crdt`: an update whose items wait on later client groups decodes in time
+  linear in its items.** Decoding defers an item whose origin, right origin,
+  parent container or same-client predecessor lies in a later client group of
+  the update, and retried every deferred item, pass after pass, until a pass
+  integrated none, so a dependency chain that runs against the order of the
+  groups took a pass over every deferred item per link. Groups are written in
+  ascending client-id order, so in a document whose writers have random client
+  ids, as a server that forks the document with a fresh client id for each
+  write produces, most items wait on a later group, and a chain runs through
+  every writer: the state of a 400-paragraph document after 240 such versions
+  (1.14 MB, 104,700 deferred items) took 118 passes and decoded in 433 ms on
+  1.51.3-sami.5, 126 ms after 120 versions and 53 ms after 60. Each client's
+  deferred items now wait in clock order behind the one dependency the first
+  of them stopped at, and its coverage, and are retried only when a client's
+  clock passes it, as Yjs's `integrateStructs` does: 143 ms, 70 ms and 42 ms.
+  The items integrate in the order the passes integrated them, and what still
+  cannot integrate parks exactly as before: the same items in the same order,
+  waiting on the same clocks, under the same cap. V1 and V2 decoding share the
+  change.
 
 ### Changed
 
