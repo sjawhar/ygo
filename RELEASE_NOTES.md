@@ -20,8 +20,8 @@ nothing here is fork-only. Everything under v1.51.3-sami.6 is unchanged.
 | A remote update's conflict scans can be bounded, and split runs merge back in linear time | reearth/ygo#333 | f908da3e |
 | A bounded document's remote apply keeps what earlier updates parked | reearth/ygo#333 | 0dd407d6 |
 | A remote update's deferred items integrate in dependency order | to be opened | 04ce186e |
-| Parked delete ranges are retried only when they can apply, and are capped | to be opened | 7482a541 |
-| One place parks an item a remote update deferred | to be opened | 5ccfa0cc |
+| Parked delete ranges are retried only when they can apply, and are capped | reearth/ygo#334 | 7482a541 |
+| One place parks an item a remote update deferred | none needed: upstream main already parks in one place (`parkWithinUpdatePending`) | 5ccfa0cc |
 | A scan allowance for each remote update, and the scans each apply passed | to be opened | 8aca836f |
 | A drain a bounded document takes back keeps the parked items | to be opened | 8160d4e5 |
 | A budget callback's panic is reported as the callback's, and a zero `RefusedUpdateError` is safe | to be opened | 145a54cd |
