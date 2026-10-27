@@ -784,7 +784,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		}
 	}
 
-	if err := resolveWithinUpdatePending(txn, pending); err != nil {
+	if err := resolveDeferred(txn, pending); err != nil {
 		return err
 	}
 

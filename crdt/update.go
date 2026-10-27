@@ -533,7 +533,7 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 
 	// 2. Within-update retry pass: items whose parents arrived later in this update.
-	if err := resolveWithinUpdatePending(txn, withinUpdatePending); err != nil {
+	if err := resolveDeferred(txn, withinUpdatePending); err != nil {
 		return err
 	}
 
@@ -689,23 +689,39 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 	return pending, nil
 }
 
-// resolveWithinUpdatePending retries items deferred during decoding until
-// no more dependencies resolve. tryIntegrate also stores genuine GC orphans
+// resolveDeferred is resolveWithinUpdatePending, the V1 and V2 decoders' retry
+// of deferred items; the differential test swaps in the fixed-point retry it
+// replaced.
+var resolveDeferred = resolveWithinUpdatePending
+
+// resolveWithinUpdatePending integrates the items decoding deferred because a
+// dependency lay in a later client group of this update, or in none of it.
+// Each client's deferred items are retried in clock order and, once one does
+// not integrate, wait behind it on the one dependency it stopped at - its
+// same-client predecessor's clock, or the origin, right origin or parent
+// container itemMissingDep names - and on its own client's clock covering it.
+// They are retried only when a client's store clock passes one of the two
+// (deferredWorklist), so n deferred items cost O(n log n), where the
+// fixed-point traversal this replaced retried every blocked item once per
+// resolved link. The retries keep that traversal's order, so the items
+// integrate in the same order. tryIntegrate also stores genuine GC orphans
 // without attaching them to a root, and respects same-client clock gaps.
-// Survivors are parked in store.pending within the cross-update limit.
-// Preflight bounds unresolved items before decoding an oversized blocked tail;
-// this integration loop still uses the existing fixed-point traversal.
+// Survivors are parked in store.pending, in arrival order, within the
+// cross-update limit. Preflight bounds unresolved items before decoding an
+// oversized blocked tail.
 // Returns ErrInvalidUpdate (wrapped) if the pending queue cap is exceeded.
 func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
-	for len(pending) > 0 {
-		remaining := pending[:0]
-		for _, item := range pending {
-			if !tryIntegrate(txn, item) {
-				remaining = append(remaining, item)
-			}
-		}
-		if len(remaining) == len(pending) {
-			for _, item := range remaining {
+	if len(pending) == 0 {
+		return nil
+	}
+	w := newDeferredWorklist(pending)
+	for {
+		run, ok := w.next()
+		if !ok {
+			for i, item := range pending {
+				if w.done[i] {
+					continue
+				}
 				if txn.doc.store.pending != nil && len(txn.doc.store.pending.items) >= txn.doc.maxPendingItemsLimit() {
 					return wrapUpdateErr(ErrInvalidUpdate)
 				}
@@ -721,7 +737,7 @@ func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 			}
 			break
 		}
-		pending = remaining
+		w.integrate(txn, pending, run)
 	}
 	return nil
 }
@@ -1512,25 +1528,26 @@ func tryIntegrate(txn *Transaction, item *Item) bool {
 // (0, 0, false) indicating the item's parent is truly unresolvable (e.g.
 // origin references a GC placeholder whose parent info was lost).
 func itemFutureDep(item *Item, store *StructStore) (ClientID, uint64, bool) {
-	if item.Origin != nil {
-		storeClock := store.NextClock(item.Origin.Client)
-		if item.Origin.Clock >= storeClock {
-			return item.Origin.Client, storeClock, true
-		}
+	if dep, missing := itemMissingDep(item, store); missing {
+		return dep.Client, store.NextClock(dep.Client), true
 	}
-	if item.OriginRight != nil {
-		storeClock := store.NextClock(item.OriginRight.Client)
-		if item.OriginRight.Clock >= storeClock {
-			return item.OriginRight.Client, storeClock, true
-		}
+	return 0, 0, false
+}
+
+// itemMissingDep returns the first of item's origin, right origin and (while
+// its parent is unresolved) parent container whose clock the store does not
+// hold yet. tryIntegrate cannot integrate the item until the store holds it.
+func itemMissingDep(item *Item, store *StructStore) (ID, bool) {
+	if item.Origin != nil && item.Origin.Clock >= store.NextClock(item.Origin.Client) {
+		return *item.Origin, true
+	}
+	if item.OriginRight != nil && item.OriginRight.Clock >= store.NextClock(item.OriginRight.Client) {
+		return *item.OriginRight, true
 	}
 	// Parent referenced by an as-yet-unintegrated container item (review
 	// finding C-3): park on the container's client until it arrives.
-	if item.Parent == nil && item.parentID != nil {
-		storeClock := store.NextClock(item.parentID.Client)
-		if item.parentID.Clock >= storeClock {
-			return item.parentID.Client, storeClock, true
-		}
+	if item.Parent == nil && item.parentID != nil && item.parentID.Clock >= store.NextClock(item.parentID.Client) {
+		return *item.parentID, true
 	}
-	return 0, 0, false
+	return ID{}, false
 }
