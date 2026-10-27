@@ -1,3 +1,114 @@
+## v1.51.3-sami.6
+
+A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
+(07bd8f62) from the `v1.51.3-sami.5` tag (e0a2f4ff). It carries the eleven
+changes of v1.51.3-sami.5 and three new ones, each bound for upstream; nothing
+here is fork-only. Everything under v1.51.3-sami.5 is unchanged.
+
+| Change | Upstream pull request | Commit carried |
+|---|---|---|
+| A complete update resolves its own dependencies before the pending cap | reearth/ygo#260 | 2cbc892e |
+| Transactional GC finds deleted ranges by binary search (unchanged; described under v1.50.1-sami.1) | reearth/ygo#262, closed as a duplicate of reearth/ygo#258 | 3dc75a11 |
+| No stack overflow on deeply nested types | reearth/ygo#263 | b0558b1c |
+| Items merge only when their right origins match | reearth/ygo#266 | 9dd6ef4f |
+| The bundled persistence stores and BroadcastUpdate keep large incremental updates | reearth/ygo#268 | 7c787a8b |
+| Rooms only Apply or the relay touched are swept when idle | reearth/ygo#269 | 5a035e51 |
+| Hocuspocus-framed connections are answered a SyncStatus for every sync frame | reearth/ygo#291 | 96333155 |
+| CloseRoom closes a peer that joins while it runs | reearth/ygo#331 | ccb8f22c |
+| `Doc.OpenUpdateLog` records committed updates in commit order | reearth/ygo#332 | 8d697bca |
+| `Server.OnPeerUpdate`, a hook in place of the room's apply of a peer update | reearth/ygo#304, merged upstream in 1.54.0 | 7030d34a, a4308a3b |
+| A remote update's conflict scans can be bounded, and split runs merge back in linear time | reearth/ygo#333 | f908da3e |
+| A bounded document's remote apply keeps what earlier updates parked | to be opened, with the three below | 0dd407d6 |
+| A remote update's deferred items integrate in dependency order | to be opened | 04ce186e |
+| Parked delete ranges are retried only when they can apply, and are capped | to be opened | 7482a541 |
+| One place parks an item a remote update deferred | to be opened | 5ccfa0cc |
+
+**Changes from v1.51.3-sami.5.** Three changes to how a remote update is
+applied, each of which removes work that grew with what a document already
+held. They sit on top of the v1.51.3-sami.5 tag rather than on the shared base,
+as the two members of that release do. The eleven members above are unchanged.
+
+### A remote update's deferred items integrate in dependency order
+
+**Who is affected: every server whose documents are written by many client
+ids** — one that forks a document with a fresh client id for each write, among
+them.
+
+Decoding defers an item whose origin, right origin, parent container or
+same-client predecessor lies in a later client group of the same update, and
+retried every deferred item, pass after pass, until a pass integrated none. A
+dependency chain running against the order of the groups therefore took one
+pass over every deferred item per link. Groups are written in ascending
+client-id order, so in a document whose writers have random client ids most
+items wait on a later group and a chain runs through every writer.
+
+Each client's deferred items now wait, in clock order, behind the one
+dependency the first of them stopped at, and are retried only when a client's
+clock passes it, as Yjs's `integrateStructs` does. The items integrate in the
+order the passes integrated them, and what still cannot integrate parks exactly
+as before: the same items in the same order, waiting on the same clocks, under
+the same cap. V1 and V2 decoding share the change.
+
+The state of a 400-paragraph document after 240 such versions (1.14 MB, 104,700
+deferred items) took 118 passes and decoded in 433 ms on v1.51.3-sami.5, and
+takes 143 ms here; after 120 versions, 126 ms against 70 ms; after 60, 53 ms
+against 42 ms.
+
+### A bounded document's remote apply keeps what earlier updates parked
+
+**Who is affected: servers that bound a document's conflict scans**
+(`WithMaxIntegrateScan`, new in v1.51.3-sami.5).
+
+To restore them when it refuses an update, such a document's apply copied the
+pending queue's items, the clocks it waits on and the pending deletes as it
+began, and the drain copied the pending deletes again. Every remote apply
+therefore cost time and memory in proportion to what sat parked, however small
+the update: one keystroke allocated 806,264 bytes with 100,000 parked items,
+and 4,821,112 bytes with 100,000 parked delete ranges.
+
+The apply now keeps them by reference and copies only what it writes. It
+appends to the parked items past the length it keeps, copies the map of clocks
+the queue waits on at its first write to it, and merges a delete range it parks
+into copies of the clients that range names. A refused update still leaves the
+parked items, the clocks they wait on and the pending deletes exactly as they
+were. The same keystrokes now allocate 3,176 bytes and 1,609,192 bytes, against
+1,608 and 1,607,624 on a document with no bound.
+
+### Parked delete ranges are retried only when they can apply, and are capped
+
+**Who is affected: every server**, whether or not its documents are bounded.
+
+Every remote apply handed all the parked delete ranges to the retry, which
+copied each range of a client the store does not hold into a new set, so one
+keystroke allocated about 1.6 MB with 100,000 ranges parked. A client's parked
+ranges are now retried only once the store's next clock for that client has
+passed the first of them, since until then none of them can apply. An apply
+that brings nothing for a client costs nothing for its parked ranges, and a
+parked range still applies, part by part, as the structs it names arrive.
+
+Nothing bounded the parked delete ranges, so a peer could grow them without
+limit with delete sets naming clocks of a client nobody holds.
+`WithMaxPendingItems` (and `Server.MaxPendingItems`) now also caps them,
+counted separately from parked items with the same default of 100,000. An
+update whose delete set would grow the parked ranges past the cap returns
+`ErrInvalidUpdate` before it parks anything, at the point and in the way an
+update that would park too many items is refused, and a bounded document is
+left as it was. The count is taken after the merge, and an update that adds no
+range is never refused, so a delete set sent again, or ranges that join parked
+ones, pass.
+
+**`Doc.SetMaxPendingItems`, and a room's stored state loads with the cap
+lifted.** A stored state carries what was parked when it was written, which can
+be more than the cap: the cap was lowered since, or the state was written
+before parked delete ranges were capped. A document capped before such a state
+arrives refuses it, so the room never loads. `provider/websocket` now makes
+each room's document with the cap lifted and sets `MaxPendingItems` with
+`SetMaxPendingItems` once the stored state is in, before the `OnLoadDocument`
+hook and before any peer's update, so what arrives after the load is capped as
+before. A stored state with more parked items than the cap now loads too, and
+such a document still applies an update whose items wait on each other within
+it, refusing only one that would park something new.
+
 ## v1.51.3-sami.5
 
 A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
