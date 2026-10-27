@@ -36,16 +36,40 @@ const (
 // ErrInvalidUpdate is returned when a binary update cannot be decoded.
 var ErrInvalidUpdate = errors.New("crdt: invalid update")
 
-// ErrIntegrateScanBudget is returned by ApplyUpdate for a remote update whose
-// conflict scans pass more items than the document's bound
-// (WithMaxIntegrateScan). It wraps ErrInvalidUpdate. Like every remote update
-// a document with a bound refuses, it leaves the document as it was
+// ErrIntegrateScanBudget is why a bounded document (WithMaxIntegrateScan,
+// WithIntegrateScanBudget) refuses a remote update whose conflict scans would
+// pass more items than the apply's limit. It wraps ErrInvalidUpdate, and
+// ApplyUpdate returns it inside a RefusedUpdateError: like every remote update
+// a bounded document refuses, the update leaves the document as it was
 // (apply_rollback.go).
 var ErrIntegrateScanBudget = fmt.Errorf("%w: its conflict scans pass more items than the document allows", ErrInvalidUpdate)
 
+// RefusedUpdateError is the error ApplyUpdateV1 and ApplyUpdateV2 return for a
+// remote update a bounded document (WithMaxIntegrateScan,
+// WithIntegrateScanBudget) refused and took back. The refused apply commits no
+// transaction an observer sees, so this error is what reports the work it did.
+//
+// Err is why the update was refused: ErrIntegrateScanBudget when its scans
+// reached the apply's limit, otherwise an error wrapping ErrInvalidUpdate.
+// Unwrap returns it, so errors.Is matches either, and Error is its message.
+// Scanned is the number of items the refused apply's conflict scans passed,
+// counted as Transaction.IntegrateScanned counts them for an apply that
+// commits: never more than the apply's limit, and exactly the limit when the
+// scans reached it.
+type RefusedUpdateError struct {
+	Err     error
+	Scanned int
+}
+
+// Error is the message of the error the update was refused for.
+func (e *RefusedUpdateError) Error() string { return e.Err.Error() }
+
+// Unwrap is the error the update was refused for.
+func (e *RefusedUpdateError) Unwrap() error { return e.Err }
+
 // integrateScanBudgetExceeded is the panic Item.integrate raises when a remote
-// update's scans pass the bound, before it links the item; applyV1Txn and
-// applyV2Txn recover it as ErrIntegrateScanBudget.
+// update's scans reach the apply's limit, before it links the item;
+// applyV1Txn and applyV2Txn recover it as ErrIntegrateScanBudget.
 type integrateScanBudgetExceeded struct{}
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -507,7 +531,7 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 		if r := recover(); r != nil {
 			retErr = recoveredApplyErr(r)
 		}
-		endRemoteApply(txn, retErr != nil)
+		retErr = endRemoteApply(txn, retErr)
 	}()
 
 	dec := encoding.NewDecoder(update)

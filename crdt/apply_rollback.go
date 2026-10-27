@@ -6,8 +6,9 @@ import (
 	"sort"
 )
 
-// A document with a scan bound (WithMaxIntegrateScan, SetMaxIntegrateScan)
-// applies a remote update whole or not at all. Integration is not a pure
+// A document with a scan bound (WithMaxIntegrateScan, SetMaxIntegrateScan) or
+// a scan budget (WithIntegrateScanBudget, SetIntegrateScanBudget) is bounded:
+// it applies a remote update whole or not at all. Integration is not a pure
 // function of the update: each item is placed by a scan of the list as the
 // items before it in the same update left it, so whether an update's scans
 // pass the bound is known only by integrating it. An update refused partway -
@@ -15,15 +16,22 @@ import (
 // therefore integrated as far as it got and then taken out again
 // (applyJournal.rollBack) before the transaction commits, so the document is
 // left as it was and the transaction fires no observer (Transaction.rolledBack):
-// nothing the update carried is persisted, relayed or seen by anyone.
+// nothing the update carried is persisted, relayed or seen by anyone. The
+// apply returns its error as a RefusedUpdateError, which carries what the
+// apply's scans passed, since no observer reports it (endRemoteApply).
 //
 // The pending queue is not the update's. Items an earlier update parked behind
 // a gap in its clocks integrate in the apply of the update that fills the gap
-// (drainPending), and charged to that update, an earlier sender could make
-// every later update that fills its gap be refused. So the drain is a phase of
-// its own: it has an allowance of its own (the scan count starts again), and a
-// drain that fails is taken back to where it began (applyPoint) and the parked
-// queue dropped, while the update that filled the gap stands.
+// (drainPending), and were a failed drain to refuse that update, an earlier
+// sender could make every later update that fills its gap be refused. So the
+// drain is a phase that fails on its own: a drain that fails is taken back to
+// where it began (applyPoint) and the parked queue dropped, while the update
+// that filled the gap stands. Under a bound the drain has an allowance of its
+// own, the bound again (the scan count starts again from the drain); under a
+// budget it draws on what the apply's allowance has left, so one apply's
+// scans, drain included, never pass what the budget gave it. The scans of a
+// drain taken back stay counted (Transaction.IntegrateScanned): the work was
+// done.
 //
 // What a rollback has to undo is what integrating and deleting change:
 //   - every struct added since the point it rolls back to, which is every
@@ -72,6 +80,9 @@ type applyJournal struct {
 	// map key's previous value is recorded on.
 	drain *applyPoint
 	at    *applyPoint
+	// drainOwnAllowance is whether the drain's scans have an allowance of
+	// their own (a bound) rather than drawing on the apply's (a budget).
+	drainOwnAllowance bool
 	// integrating is the item integrate has linked into its parent's list and
 	// not yet appended to the store, for a failure between the two.
 	integrating *Item
@@ -111,17 +122,19 @@ func pointNow(txn *Transaction, sv StateVector) applyPoint {
 	return point
 }
 
-// beginRemoteApply starts txn's journal when its document has a scan bound;
-// before is the store's state vector as the apply begins. The parked items,
-// their missing map and the pending deletes are kept as they are, by reference
-// (see the top of this file).
+// beginRemoteApply starts txn's journal when its document is bounded, and sets
+// the most its scans may pass from the document's budget for txn's origin or
+// its bound; before is the store's state vector as the apply begins. The
+// parked items, their missing map and the pending deletes are kept as they
+// are, by reference (see the top of this file).
 func beginRemoteApply(txn *Transaction, before StateVector) {
 	d := txn.doc
-	if d.integrateScanLimit() == 0 {
+	if !d.scanBounded() {
 		return
 	}
+	txn.scanLimit = d.applyScanLimit(txn.Origin)
 	s := d.store
-	j := &applyJournal{start: pointNow(txn, before)}
+	j := &applyJournal{start: pointNow(txn, before), drainOwnAllowance: d.integrateScanBudget == nil}
 	j.at = &j.start
 	if s.pending != nil {
 		j.pending = s.pending
@@ -179,20 +192,26 @@ func parkDeletes(txn *Transaction, ds DeleteSet) {
 	s.pendingDs.Merge(ds)
 }
 
-// endRemoteApply ends txn's journal, rolling the whole apply back when it
-// failed.
-func endRemoteApply(txn *Transaction, failed bool) {
+// endRemoteApply ends txn's journal and returns the apply's error err. When a
+// bounded document's apply failed it rolls the whole apply back and returns err
+// as a RefusedUpdateError carrying the items the apply's scans passed, which no
+// observer reports for a rolled-back transaction (buildPhase2).
+func endRemoteApply(txn *Transaction, err error) error {
 	j := txn.journal
 	txn.journal = nil
-	if j != nil && failed {
-		j.rollBack(txn)
+	if j == nil || err == nil {
+		return err
 	}
+	j.rollBack(txn)
+	return &RefusedUpdateError{Err: err, Scanned: txn.scanned}
 }
 
 // drainParked runs drain, the apply's drain of the pending queue and pending
-// deletes. On a document with a scan bound it is a phase of its own, with an
-// allowance of its own; one that fails is taken back to where it began and the
-// parked queue is dropped, and the apply goes on as if nothing had been parked.
+// deletes. On a bounded document it is a phase that can fail on its own: under
+// a bound it has an allowance of its own of the bound's size, and under a
+// budget it draws on what the apply's allowance has left. One that fails is
+// taken back to where it began and the parked queue is dropped, and the apply
+// goes on as if nothing had been parked; the scans it did stay counted.
 func drainParked(txn *Transaction, drain func()) {
 	j := txn.journal
 	if j == nil {
@@ -205,7 +224,9 @@ func drainParked(txn *Transaction, drain func()) {
 	// they are kept as they are, by reference.
 	pendingDs := s.pendingDs
 	j.drain, j.at = &point, &point
-	txn.scanned = 0
+	if j.drainOwnAllowance {
+		txn.scanFrom = txn.scanned
+	}
 	defer func() {
 		r := recover()
 		j.at = &j.start
@@ -411,9 +432,9 @@ func copyDeleteSet(ds DeleteSet) DeleteSet {
 var errUnboundableContent = fmt.Errorf("%w: a document with a scan bound takes no subdocument or move from a remote update", ErrInvalidUpdate)
 
 // refuseOnBoundedDoc is errUnboundableContent for content a remote update
-// decoded into doc carries, when doc has a scan bound; nil otherwise.
+// decoded into doc carries, when doc is bounded; nil otherwise.
 func refuseOnBoundedDoc(doc *Doc, content Content) error {
-	if doc.integrateScanLimit() == 0 {
+	if !doc.scanBounded() {
 		return nil
 	}
 	switch content.(type) {

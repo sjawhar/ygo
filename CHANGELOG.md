@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.3-sami.7] — 2026-10-27
+
+Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.6
+tag (32e09873) and one new member, the entry directly below. Everything under
+1.51.3-sami.6 is unchanged.
+
+### Added
+
+- **`crdt`: a scan allowance for each remote update, and the scans each
+  apply passed, committed or refused.** `WithIntegrateScanBudget(func(origin
+  any) int)` and `Doc.SetIntegrateScanBudget` give a document a budget it asks,
+  under its lock, as each remote apply (`ApplyUpdate`, V1 and V2) begins, with
+  that apply's origin: the apply's conflict scans, the drain of the pending
+  queue it ends with included, may pass at most the number it returns, and
+  zero or negative leaves that one apply unbounded. One fixed bound
+  (`WithMaxIntegrateScan`) has to hold the largest honest update and so lets
+  every update scan as much; a budget lets an owner size each update's
+  allowance from what it knows before applying it - the structs the update
+  carries, who sent it, or what remains of an allowance it keeps for the whole
+  document. An update whose own scans would pass its allowance is refused with
+  `ErrIntegrateScanBudget`; a drain that would pass what the update left of the
+  allowance is taken back and the parked queue dropped while the update stands,
+  so one apply never scans more than its budget. Under a bound the drain keeps
+  an allowance of its own, the bound again, as before. A document with a budget
+  is bounded whatever the budget returns: it applies every remote update whole
+  or not at all and refuses subdocuments and moves from remote updates, as a
+  document with a bound does, and the budget takes the bound's place while it
+  is set. `(*Transaction).IntegrateScanned()` is the number of items the
+  transaction's conflict scans passed, a drain taken back included, counted on
+  every document, bounded or not, and read from `OnAfterTransaction`, which
+  runs after the document's lock is released and before `ApplyUpdate` returns.
+  An update a bounded document refuses commits no transaction an observer sees,
+  so `ApplyUpdateV1` and `ApplyUpdateV2` now return its error as a
+  `*RefusedUpdateError{Err, Scanned}`: `Scanned` is what the refused apply's
+  scans passed - exactly its limit when the scans reached it - and `Unwrap`
+  returns `Err`, so `errors.Is` matches `ErrIntegrateScanBudget` and
+  `ErrInvalidUpdate` as before, and the message is unchanged. The count is
+  exactly what the bound measures: a document bounded at the count takes the
+  update, and one bounded one item under it refuses it. Decoding a document's
+  whole state into a fresh document scans those items again: measured on a
+  document fed 64 updates whose scans passed 1,754,872 items in all, the
+  copy's own transaction passed 1,754,876, so an owner can keep a document's
+  running total of what every later copy of it will pay.
+
 ## [1.51.3-sami.6] — 2026-10-26
 
 Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.5
