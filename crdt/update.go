@@ -61,8 +61,14 @@ type RefusedUpdateError struct {
 	Scanned int
 }
 
-// Error is the message of the error the update was refused for.
-func (e *RefusedUpdateError) Error() string { return e.Err.Error() }
+// Error is the message of the error the update was refused for, or a bare
+// message when the zero value is used (Err nil).
+func (e *RefusedUpdateError) Error() string {
+	if e.Err == nil {
+		return "crdt: update refused"
+	}
+	return e.Err.Error()
+}
 
 // Unwrap is the error the update was refused for.
 func (e *RefusedUpdateError) Unwrap() error { return e.Err }
@@ -71,6 +77,12 @@ func (e *RefusedUpdateError) Unwrap() error { return e.Err }
 // update's scans reach the apply's limit, before it links the item;
 // applyV1Txn and applyV2Txn recover it as ErrIntegrateScanBudget.
 type integrateScanBudgetExceeded struct{}
+
+// budgetCallbackPanic wraps a panic the WithIntegrateScanBudget callback
+// raised, so recoveredApplyErr names the callback rather than item integration.
+// callIntegrateScanBudget tags it; the apply runs the callback inside its own
+// panic recovery (beginRemoteApply).
+type budgetCallbackPanic struct{ v any }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -1325,12 +1337,16 @@ func clientsSorted[T any](m map[ClientID]T) []ClientID {
 	return out
 }
 
-// recoveredApplyErr is the error an apply returns for a panic it recovered
-// while integrating: ErrIntegrateScanBudget for the scan bound's own panic,
-// otherwise ErrInvalidUpdate naming the panic.
+// recoveredApplyErr is the error an apply returns for a panic it recovered:
+// ErrIntegrateScanBudget for the scan bound's own panic, a message naming the
+// WithIntegrateScanBudget callback for a panic it raised, otherwise
+// ErrInvalidUpdate naming the panic from integrating the update.
 func recoveredApplyErr(r any) error {
-	if _, ok := r.(integrateScanBudgetExceeded); ok {
+	switch r := r.(type) {
+	case integrateScanBudgetExceeded:
 		return ErrIntegrateScanBudget
+	case budgetCallbackPanic:
+		return fmt.Errorf("%w: panic in the WithIntegrateScanBudget callback: %v", ErrInvalidUpdate, r.v)
 	}
 	return fmt.Errorf("%w: panic during item integration: %v", ErrInvalidUpdate, r)
 }

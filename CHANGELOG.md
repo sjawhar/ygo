@@ -43,7 +43,12 @@ with the parked items whose drain it takes back (under Changed).
   the refused apply's scans passed - exactly its limit when the scans reached
   it - and `Unwrap` returns `Err`, so `errors.Is` matches
   `ErrIntegrateScanBudget` and `ErrInvalidUpdate` as before, and the message is
-  unchanged. The count is exactly what the bound measures: a document bounded
+  unchanged. On a bounded document (a budget or `WithMaxIntegrateScan`) this
+  wrapping covers every failed apply, not only a scan refusal: any error that
+  rolls the apply back, a malformed update included, is returned as a
+  `*RefusedUpdateError`. A caller using `errors.Is` or `errors.As` needs no
+  change; one that type-asserts the concrete error type must now expect the
+  wrapper. The count is exactly what the bound measures: a document bounded
   at the count takes the update, and one bounded one item under it refuses it.
   Decoding a document's whole state into a fresh document scans those items
   again: measured on a document fed 64 updates whose scans passed 1,754,872

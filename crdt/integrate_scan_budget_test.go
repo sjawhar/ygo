@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/reearth/ygo/encoding"
@@ -357,6 +358,49 @@ func TestADocumentWithoutABudgetOrBoundKeepsWhatAFailedApplyIntegrated(t *testin
 	}
 	if got := doc.StateVector().Clock(9); got != n {
 		t.Fatalf("client 9's clock is %d, want the %d items the failed apply integrated", got, n)
+	}
+}
+
+// A panic from the WithIntegrateScanBudget callback is recovered as a refused
+// update whose message names the callback, not item integration, and the
+// document is left as it was.
+func TestAPanicFromTheBudgetCallbackIsReportedAsTheCallbacks(t *testing.T) {
+	doc := New(WithClientID(1))
+	doc.SetIntegrateScanBudget(func(any) int { panic("boom in the budget") })
+	before := EncodeStateAsUpdateV1(doc, nil)
+
+	writer := New(WithClientID(2))
+	written := writer.GetText("t")
+	writer.Transact(func(txn *Transaction) { written.Insert(txn, 0, "hi", nil) })
+	err := ApplyUpdateV1(doc, EncodeStateAsUpdateV1(writer, nil), "peer")
+	if !errors.Is(err, ErrInvalidUpdate) {
+		t.Fatalf("apply returned %v, want it to wrap ErrInvalidUpdate", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "WithIntegrateScanBudget callback") || !strings.Contains(msg, "boom in the budget") {
+		t.Fatalf("error is %q, want it to name the budget callback and the panic", msg)
+	}
+	if strings.Contains(err.Error(), "item integration") {
+		t.Fatalf("error is %q, want it not to blame item integration", err.Error())
+	}
+	if after := EncodeStateAsUpdateV1(doc, nil); string(after) != string(before) {
+		t.Fatal("the refused update changed the document's state")
+	}
+}
+
+// The zero RefusedUpdateError does not panic in Error, and errors.As onto it
+// reads its fields.
+func TestTheZeroRefusedUpdateErrorIsSafe(t *testing.T) {
+	var e RefusedUpdateError
+	if got := e.Error(); got == "" {
+		t.Fatal("the zero RefusedUpdateError's Error is empty, want a message")
+	}
+	wrapped := fmt.Errorf("apply: %w", &RefusedUpdateError{Err: ErrIntegrateScanBudget, Scanned: 7})
+	var got *RefusedUpdateError
+	if !errors.As(wrapped, &got) {
+		t.Fatal("errors.As did not find the RefusedUpdateError")
+	}
+	if got.Scanned != 7 || !errors.Is(got, ErrIntegrateScanBudget) {
+		t.Fatalf("recovered %+v, want Scanned 7 wrapping ErrIntegrateScanBudget", got)
 	}
 }
 
