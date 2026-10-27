@@ -1499,6 +1499,10 @@ func tryIntegrate(txn *Transaction, item *Item) bool {
 	// here, so the offset is never negative.
 	if item.Parent == nil && item.Deleted {
 		if offset := int(existingEnd - item.ID.Clock); offset > 0 {
+			// A drain taken back parks the item again as it was.
+			if j := txn.journal; j != nil {
+				j.keepParked(item)
+			}
 			item.ID.Clock += uint64(offset)
 			item.Content = item.Content.Splice(offset)
 		}

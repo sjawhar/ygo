@@ -8,8 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.51.3-sami.7] — 2026-10-27
 
 Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.6
-tag (32e09873) and one new member, the entry directly below. Everything under
-1.51.3-sami.6 is unchanged.
+tag (32e09873) and the commits on top of it that the entries below describe.
+Everything under 1.51.3-sami.6 is unchanged but what a bounded document does
+with the parked items whose drain it takes back (under Changed).
 
 ### Added
 
@@ -26,28 +27,52 @@ tag (32e09873) and one new member, the entry directly below. Everything under
   carries, who sent it, or what remains of an allowance it keeps for the whole
   document. An update whose own scans would pass its allowance is refused with
   `ErrIntegrateScanBudget`; a drain that would pass what the update left of the
-  allowance is taken back and the parked queue dropped while the update stands,
-  so one apply never scans more than its budget. Under a bound the drain keeps
-  an allowance of its own, the bound again, as before. A document with a budget
-  is bounded whatever the budget returns: it applies every remote update whole
-  or not at all and refuses subdocuments and moves from remote updates, as a
-  document with a bound does, and the budget takes the bound's place while it
-  is set. `(*Transaction).IntegrateScanned()` is the number of items the
-  transaction's conflict scans passed, a drain taken back included, counted on
-  every document, bounded or not, and read from `OnAfterTransaction`, which
-  runs after the document's lock is released and before `ApplyUpdate` returns.
-  An update a bounded document refuses commits no transaction an observer sees,
-  so `ApplyUpdateV1` and `ApplyUpdateV2` now return its error as a
-  `*RefusedUpdateError{Err, Scanned}`: `Scanned` is what the refused apply's
-  scans passed - exactly its limit when the scans reached it - and `Unwrap`
-  returns `Err`, so `errors.Is` matches `ErrIntegrateScanBudget` and
-  `ErrInvalidUpdate` as before, and the message is unchanged. The count is
-  exactly what the bound measures: a document bounded at the count takes the
-  update, and one bounded one item under it refuses it. Decoding a document's
-  whole state into a fresh document scans those items again: measured on a
-  document fed 64 updates whose scans passed 1,754,872 items in all, the
-  copy's own transaction passed 1,754,876, so an owner can keep a document's
-  running total of what every later copy of it will pay.
+  allowance is taken back while the update stands, and the queue parked again
+  (under Changed), so one apply never scans more than its budget. Under a bound
+  the drain keeps an allowance of its own, the bound again, as before. A
+  document with a budget is bounded whatever the budget returns: it applies
+  every remote update whole or not at all and refuses subdocuments and moves
+  from remote updates, as a document with a bound does, and the budget takes
+  the bound's place while it is set. `(*Transaction).IntegrateScanned()` is the
+  number of items the transaction's conflict scans passed, a drain taken back
+  included, counted on every document, bounded or not, and read from
+  `OnAfterTransaction`, which runs after the document's lock is released and
+  before `ApplyUpdate` returns. An update a bounded document refuses commits no
+  transaction an observer sees, so `ApplyUpdateV1` and `ApplyUpdateV2` now
+  return its error as a `*RefusedUpdateError{Err, Scanned}`: `Scanned` is what
+  the refused apply's scans passed - exactly its limit when the scans reached
+  it - and `Unwrap` returns `Err`, so `errors.Is` matches
+  `ErrIntegrateScanBudget` and `ErrInvalidUpdate` as before, and the message is
+  unchanged. The count is exactly what the bound measures: a document bounded
+  at the count takes the update, and one bounded one item under it refuses it.
+  Decoding a document's whole state into a fresh document scans those items
+  again: measured on a document fed 64 updates whose scans passed 1,754,872
+  items in all, the copy's own transaction passed 1,754,876, so an owner can
+  keep a document's running total of what every later copy of it will pay.
+
+### Changed
+
+- **`crdt`: a drain a bounded document takes back keeps the parked items.**
+  When the drain of the pending queue that ends a remote apply would pass its
+  allowance - the bound again under `WithMaxIntegrateScan`, what the update
+  left of its allowance under a budget - the document takes the drain back and
+  keeps the update that filled the gap; it also dropped every parked item, of
+  every peer. A parked item is an edit whose sender was told it was delivered
+  and which the document's state vector does not show, so a dropped one came
+  back only when its sender next connected, and under a budget any apply that
+  used its allowance dropped the queue at the drain's first scan. The take-back
+  now parks the queue again as the drain found it: the same items in the same
+  order, a parked item the drain integrated and then split, or trimmed, given
+  its clock and content back, and the pending deletes and pending moves as
+  they were, so `PendingStats` and the document's encoded state, which carries
+  parked items, are what they were before the drain. Each clock the queue
+  waits on is raised to the document's, so the queue is drained again only
+  once an apply brings a client it waits on further - the rule every drain
+  runs under - and an apply that brings none pays for no drain; left as they
+  were, the clocks would have every later apply pay again for a drain that
+  integrates nothing. The parked items integrate once such an apply's
+  allowance holds the drain, or when their sender sends them again: its update
+  integrates them under its own allowance and the drain skips them.
 
 ## [1.51.3-sami.6] — 2026-10-26
 

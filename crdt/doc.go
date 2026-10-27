@@ -152,11 +152,13 @@ func (d *Doc) SetMaxPendingItems(n int) {
 // remote update the bounded document refuses, it leaves the document as it was,
 // fires no observer, and is returned as a RefusedUpdateError reporting what its
 // scans passed. The drain of the pending queue an update's apply ends with has
-// an allowance of its own, the bound again (apply_rollback.go). Such a document
-// refuses a remote update carrying a subdocument or a move. Zero or negative,
-// the default, sets no bound. Local transactions are never bounded: their
-// inserts name both neighbours. A budget (WithIntegrateScanBudget) takes the
-// bound's place while it is set.
+// an allowance of its own, the bound again; a drain that would pass it is taken
+// back and the queue parked again as it was, while the update stands, and the
+// queue is drained again once an apply brings a clock it waits on further
+// (apply_rollback.go). Such a document refuses a remote update carrying a
+// subdocument or a move. Zero or negative, the default, sets no bound. Local
+// transactions are never bounded: their inserts name both neighbours. A budget
+// (WithIntegrateScanBudget) takes the bound's place while it is set.
 func WithMaxIntegrateScan(n int) DocOption {
 	return func(d *Doc) { d.maxIntegrateScan = n }
 }
@@ -183,8 +185,9 @@ func (d *Doc) SetMaxIntegrateScan(n int) {
 // carries, keyed by the origin it applies it with. An update whose own scans
 // would pass its allowance is refused, with ErrIntegrateScanBudget, as under
 // WithMaxIntegrateScan; a drain whose scans would pass what the update left of
-// it is taken back and the parked queue dropped, while the update stands
-// (apply_rollback.go).
+// it is taken back and the queue parked again as it was, while the update
+// stands, and the queue is drained again once an apply brings a clock it waits
+// on further (apply_rollback.go).
 //
 // An owner keeping an account of scans learns what each apply cost from
 // Transaction.IntegrateScanned in an OnAfterTransaction observer when the

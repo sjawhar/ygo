@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -214,9 +215,9 @@ func TestTheScanCountHoldsADrainThatStaysAndOneTakenBack(t *testing.T) {
 // On a document with a budget, the drain of the pending queue draws on the
 // allowance its apply was given, so one apply's scans, drain included, never
 // pass that allowance: the drain is refused at what the update that filled the
-// gap left of it, and taken back with the parked queue dropped while that
-// update stands. A document with a bound keeps giving the drain an allowance
-// of its own, so its apply may scan up to the bound twice over.
+// gap left of it, and taken back with the queue parked again while that update
+// stands. A document with a bound keeps giving the drain an allowance of its
+// own, so its apply may scan up to the bound twice over.
 func TestABudgetedApplysDrainDrawsOnTheApplysOwnAllowance(t *testing.T) {
 	const l, n = 2_000, 20
 	// The filling update is client 99's clock 0 naming the list's first item
@@ -245,16 +246,16 @@ func TestABudgetedApplysDrainDrawsOnTheApplysOwnAllowance(t *testing.T) {
 	}
 
 	for _, c := range []struct {
-		name           string
-		opt            func(fill int) DocOption
-		limit, scanned int
-		clock          uint64
+		name                   string
+		opt                    func(fill int) DocOption
+		limit, scanned, parked int
+		clock                  uint64
 	}{
-		{"a budget the apply and its drain fit", budgetFor, total, total, n + 1},
-		{"a budget one item short of the drain", budgetFor, total - 1, total - 1, 1},
-		{"a budget the filling update alone fits", budgetFor, own, own, 1},
-		{"a bound the drain alone fits", WithMaxIntegrateScan, drain, total, n + 1},
-		{"a bound one item short of the drain", WithMaxIntegrateScan, drain - 1, own + drain - 1, 1},
+		{"a budget the apply and its drain fit", budgetFor, total, total, 0, n + 1},
+		{"a budget one item short of the drain", budgetFor, total - 1, total - 1, n, 1},
+		{"a budget the filling update alone fits", budgetFor, own, own, n, 1},
+		{"a bound the drain alone fits", WithMaxIntegrateScan, drain, total, 0, n + 1},
+		{"a bound one item short of the drain", WithMaxIntegrateScan, drain - 1, own + drain - 1, n, 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			doc := parkedDoc(c.opt(c.limit))
@@ -264,8 +265,8 @@ func TestABudgetedApplysDrainDrawsOnTheApplysOwnAllowance(t *testing.T) {
 			if got := doc.StateVector().Clock(99); got != c.clock {
 				t.Fatalf("client 99's clock is %d, want %d", got, c.clock)
 			}
-			if parked := doc.PendingStats().Items; parked != 0 {
-				t.Fatalf("%d items are still parked, want none", parked)
+			if parked := doc.PendingStats().Items; parked != c.parked {
+				t.Fatalf("%d items are parked, want %d", parked, c.parked)
 			}
 		})
 	}
@@ -356,5 +357,158 @@ func TestADocumentWithoutABudgetOrBoundKeepsWhatAFailedApplyIntegrated(t *testin
 	}
 	if got := doc.StateVector().Clock(9); got != n {
 		t.Fatalf("client 9's clock is %d, want the %d items the failed apply integrated", got, n)
+	}
+}
+
+// itemAfter is client's clock: one item holding s that names origin as its
+// left origin and no right origin.
+func itemAfter(client ClientID, clock uint64, origin ID, s string) []byte {
+	enc := encoding.NewEncoder()
+	enc.WriteVarUint(1) // clients
+	enc.WriteVarUint(1)
+	enc.WriteVarUint(uint64(client))
+	enc.WriteVarUint(clock)
+	enc.WriteUint8(wireString | flagHasOrigin)
+	enc.WriteVarUint(uint64(origin.Client))
+	enc.WriteVarUint(origin.Clock)
+	enc.WriteVarString(s)
+	enc.WriteVarUint(0) // delete set: no clients
+	return append([]byte(nil), enc.Bytes()...)
+}
+
+// A drain a bounded document takes back parks the queue again as the drain
+// found it, the items of every peer in it, and undoes what the drain did to
+// the items it integrated: here the drain integrates client 99's parked item,
+// splits it for client 98's item, which names the item's middle as its left
+// origin, and runs out of allowance in that item's scan; client 76's item,
+// waiting on client 77, which no update has brought, is parked too. What the
+// document hands a peer, parked items included, reads as an unbounded twin
+// given the same updates does. The queue is tried again only by an apply that
+// brings one of its clients past the clock the store held at the take-back, so
+// an apply that brings none pays for no drain. Once an apply with an allowance
+// that holds the drain brings client 77, or the parked item's sender sends it
+// again, the parked items integrate and the document is the twin's. This is
+// one behaviour under a budget and under a bound.
+func TestATakenBackDrainParksTheQueueAgainAsItFoundIt(t *testing.T) {
+	const l = 2_000
+	parked := [][]byte{
+		itemAfter(99, 1, ID{Client: 5, Clock: 0}, "abc"), // behind client 99's clock 0
+		itemAfter(98, 0, ID{Client: 99, Clock: 2}, "r"),  // the middle of client 99's item
+		itemAfter(76, 0, ID{Client: 77, Clock: 0}, "z"),  // waits on client 77
+	}
+	lastOf := func(doc *Doc) *Item {
+		last := doc.GetText("t").start
+		for last.Right != nil {
+			last = last.Right
+		}
+		return last
+	}
+	// end is the end of a text, where every item these updates carry lands.
+	end := func(text string) string { return text[max(0, len(text)-12):] }
+	park := func(doc *Doc, updates ...[]byte) {
+		t.Helper()
+		for _, update := range updates {
+			if err := ApplyUpdateV1(doc, update, "park"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := doc.StateVector().Clock(99); got != 0 {
+			t.Fatalf("client 99's clock is %d after parking, want 0", got)
+		}
+	}
+	// What the update filling client 99's gap counts, on an unbounded
+	// document, with updates parked before it.
+	filling := func(updates ...[]byte) int {
+		doc := chainedList(t, l)
+		park(doc, updates...)
+		return scannedBy(t, doc, fillTheGap(lastOf(doc)))
+	}
+	if own := filling(); own != 0 {
+		t.Fatalf("the filling update alone passed %d items, want 0", own)
+	}
+	// The drain's allowance holds client 99's item and runs out in the scan
+	// of client 98's, after the split.
+	limit := filling(parked[0])
+	if both := filling(parked[:2]...); both <= limit {
+		t.Fatalf("the drain of both items passed %d items, want more than the %d of client 99's alone", both, limit)
+	}
+
+	for _, c := range []struct {
+		name string
+		opt  DocOption
+		more func(*Doc)
+	}{
+		{"budget", WithIntegrateScanBudget(func(origin any) int {
+			switch origin {
+			case nil:
+				return limit
+			case "more":
+				return testScanBound
+			}
+			return 0
+		}), func(*Doc) {}},
+		{"bound", WithMaxIntegrateScan(limit), func(doc *Doc) { doc.SetMaxIntegrateScan(testScanBound) }},
+	} {
+		for _, then := range []struct {
+			name   string
+			update []byte
+		}{
+			{"an apply bringing client 77", itemAfter(77, 0, ID{Client: 50, Clock: 0}, "w")},
+			{"the parked item's sender sending it again", parked[0]},
+		} {
+			t.Run(c.name+"/"+then.name, func(t *testing.T) {
+				doc, twin := chainedList(t, l, c.opt), chainedList(t, l)
+				park(doc, parked...)
+				park(twin, parked...)
+				stats := fmt.Sprintf("%+v", doc.PendingStats())
+				fill := fillTheGap(lastOf(doc))
+				if got := scannedBy(t, doc, fill); got != limit {
+					t.Fatalf("the filling apply counted %d items, want its drain refused at %d", got, limit)
+				}
+				if err := ApplyUpdateV1(twin, fill, nil); err != nil {
+					t.Fatal(err)
+				}
+				if got := doc.StateVector().Clock(99); got != 1 {
+					t.Fatalf("client 99's clock is %d, want 1: the drain taken back", got)
+				}
+				if got := fmt.Sprintf("%+v", doc.PendingStats()); got != stats {
+					t.Fatalf("after the drain was taken back the pending queue is %s, want %s as it was", got, stats)
+				}
+				copied := New()
+				if err := ApplyUpdateV1(copied, EncodeStateAsUpdateV1(doc, nil), nil); err != nil {
+					t.Fatal(err)
+				}
+				if a, b := copied.GetText("t").ToString(), twin.GetText("t").ToString(); a != b {
+					t.Fatalf("the document's state, parked items included, reads differently from the twin's: ends %q, the twin's %q", end(a), end(b))
+				}
+
+				unrelated := itemAfter(50, 0, ID{Client: 99, Clock: 0}, "u")
+				if got := scannedBy(t, doc, unrelated); got != 0 {
+					t.Fatalf("an apply bringing no client the queue waits on counted %d items, want 0", got)
+				}
+				if err := ApplyUpdateV1(twin, unrelated, nil); err != nil {
+					t.Fatal(err)
+				}
+				if got := fmt.Sprintf("%+v", doc.PendingStats()); got != stats {
+					t.Fatalf("after an apply bringing no client the queue waits on the pending queue is %s, want %s", got, stats)
+				}
+
+				c.more(doc)
+				for _, d := range []*Doc{doc, twin} {
+					if err := ApplyUpdateV1(d, then.update, "more"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if got, want := fmt.Sprintf("%+v", doc.PendingStats()), fmt.Sprintf("%+v", twin.PendingStats()); got != want {
+					t.Fatalf("the pending queue is %s, the twin's %s", got, want)
+				}
+				if a, b := doc.GetText("t").ToString(), twin.GetText("t").ToString(); a != b {
+					t.Fatalf("the text diverged from the twin's: ends %q, the twin's %q", end(a), end(b))
+				}
+				if a, b := EncodeStateAsUpdateV1(doc, nil), EncodeStateAsUpdateV1(twin, nil); string(a) != string(b) {
+					t.Fatal("the document's state, parked items included, differs from the twin's")
+				}
+			})
+		}
 	}
 }
