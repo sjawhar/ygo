@@ -31,17 +31,8 @@ func resolveWithinUpdatePendingFixedPoint(txn *Transaction, pending []*Item) err
 		}
 		if len(remaining) == len(pending) {
 			for _, item := range remaining {
-				if txn.doc.store.pending != nil && len(txn.doc.store.pending.items) >= txn.doc.maxPendingItemsLimit() {
-					return wrapUpdateErr(ErrInvalidUpdate)
-				}
-				if txn.doc.store.pending == nil {
-					txn.doc.store.pending = &pendingUpdate{missing: make(StateVector)}
-				}
-				txn.doc.store.pending.items = append(txn.doc.store.pending.items, item)
-				if client, parkedAt, future := itemFutureDep(item, txn.doc.store); future {
-					mergePendingMissing(parkedMissing(txn), client, parkedAt)
-				} else {
-					mergePendingMissing(parkedMissing(txn), item.ID.Client, txn.doc.store.NextClock(item.ID.Client))
+				if err := parkDeferredItem(txn, item); err != nil {
+					return err
 				}
 			}
 			break

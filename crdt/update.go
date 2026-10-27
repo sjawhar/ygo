@@ -725,22 +725,37 @@ func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 				if w.done[i] {
 					continue
 				}
-				if txn.doc.store.pending != nil && len(txn.doc.store.pending.items) >= txn.doc.maxPendingItemsLimit() {
-					return wrapUpdateErr(ErrInvalidUpdate)
-				}
-				if txn.doc.store.pending == nil {
-					txn.doc.store.pending = &pendingUpdate{missing: make(StateVector)}
-				}
-				txn.doc.store.pending.items = append(txn.doc.store.pending.items, item)
-				if client, parkedAt, future := itemFutureDep(item, txn.doc.store); future {
-					mergePendingMissing(parkedMissing(txn), client, parkedAt)
-				} else {
-					mergePendingMissing(parkedMissing(txn), item.ID.Client, txn.doc.store.NextClock(item.ID.Client))
+				if err := parkDeferredItem(txn, item); err != nil {
+					return err
 				}
 			}
 			break
 		}
 		w.integrate(txn, pending, run)
+	}
+	return nil
+}
+
+// parkDeferredItem parks item, which this update deferred and nothing in it
+// resolved, in the document's pending queue: in arrival order, waiting on the
+// clock that blocks it, within the cross-update cap. It is the one place that
+// parks a deferred item, so the test oracle of the retry
+// (within_update_diff_test.go) parks exactly as the retry does.
+func parkDeferredItem(txn *Transaction, item *Item) error {
+	s := txn.doc.store
+	if s.pending != nil && len(s.pending.items) >= txn.doc.maxPendingItemsLimit() {
+		return wrapUpdateErr(ErrInvalidUpdate)
+	}
+	if s.pending == nil {
+		s.pending = &pendingUpdate{missing: make(StateVector)}
+	}
+	s.pending.items = append(s.pending.items, item)
+	// parkedMissing copies the map the journal of a bounded document's apply
+	// keeps, so a refused update leaves the clocks it waits on as they were.
+	if client, parkedAt, future := itemFutureDep(item, s); future {
+		mergePendingMissing(parkedMissing(txn), client, parkedAt)
+	} else {
+		mergePendingMissing(parkedMissing(txn), item.ID.Client, s.NextClock(item.ID.Client))
 	}
 	return nil
 }
