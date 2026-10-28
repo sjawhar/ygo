@@ -1,3 +1,78 @@
+## v1.51.3-sami.8
+
+A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
+(07bd8f62) from the `v1.51.3-sami.7` tag (bc93c5b0). It carries the changes of
+v1.51.3-sami.7 and two new ones, bound for upstream like the rest; nothing here
+is fork-only. Everything under v1.51.3-sami.7 is unchanged.
+
+| Change | Upstream pull request | Commit carried |
+|---|---|---|
+| A complete update resolves its own dependencies before the pending cap | reearth/ygo#260 | 2cbc892e |
+| Transactional GC finds deleted ranges by binary search (unchanged; described under v1.50.1-sami.1) | reearth/ygo#262, closed as a duplicate of reearth/ygo#258 | 3dc75a11 |
+| No stack overflow on deeply nested types | reearth/ygo#263 | b0558b1c |
+| Items merge only when their right origins match | reearth/ygo#266 | 9dd6ef4f |
+| The bundled persistence stores and BroadcastUpdate keep large incremental updates | reearth/ygo#268 | 7c787a8b |
+| Rooms only Apply or the relay touched are swept when idle | reearth/ygo#269 | 5a035e51 |
+| Hocuspocus-framed connections are answered a SyncStatus for every sync frame | reearth/ygo#291 | 96333155 |
+| CloseRoom closes a peer that joins while it runs | reearth/ygo#331 | ccb8f22c |
+| `Doc.OpenUpdateLog` records committed updates in commit order | reearth/ygo#332 | 8d697bca |
+| `Server.OnPeerUpdate`, a hook in place of the room's apply of a peer update | reearth/ygo#304, merged upstream in 1.54.0 | 7030d34a, a4308a3b |
+| A remote update's conflict scans can be bounded, and split runs merge back in linear time | reearth/ygo#333 | f908da3e |
+| A bounded document's remote apply keeps what earlier updates parked | reearth/ygo#333 | 0dd407d6 |
+| A remote update's deferred items integrate in dependency order | none needed: upstream fixed it in reearth/ygo#296 and reearth/ygo#312 | 04ce186e |
+| Parked delete ranges are retried only when they can apply, and are capped | reearth/ygo#334 | 7482a541 |
+| One place parks an item a remote update deferred | none needed: upstream main already parks in one place (`parkWithinUpdatePending`) | 5ccfa0cc |
+| A scan allowance for each remote update, and the scans each apply passed | to be opened | 8aca836f |
+| A drain a bounded document takes back keeps the parked items | to be opened | 8160d4e5 |
+| A budget callback's panic is reported as the callback's, and a zero `RefusedUpdateError` is safe | to be opened | 145a54cd |
+| `(*Transaction).ChangedTypes()` and `Parent()` on every shared type | to be opened | f71bc04e |
+| An observed text with a map-valued format no longer panics with the lock held | reearth/ygo#335 | 733019ba |
+
+**Changes from v1.51.3-sami.7.** A transaction now says which shared types it
+changed, and every shared type which type contains it, so an owner can learn
+which parts of a document an update touched without a subscription per node.
+And observing a text whose formats hold maps no longer panics and hangs the
+document. The members above v1.51.3-sami.7 carried are unchanged.
+
+### `(*Transaction).ChangedTypes()` and `Parent()` on every shared type
+
+**Who is affected: owners that apply remote updates and want to know where in
+the document an update landed**, for example to re-render only the top-level
+blocks of a ProseMirror document it touched.
+
+`ChangedTypes()` returns every shared type an item was integrated into or
+deleted from in the transaction, once per type. `Parent()`, on every shared
+type and on the `SharedType` interface, returns the type that contains it, or
+nil for a root or a detached type. Walking `Parent()` from each entry names the
+top-level children an update touched.
+
+`ChangedTypes()` is not Yjs `transaction.changed`. It also names the types the
+transaction created, the types it deleted, and types deleted earlier that a
+concurrent remote change still writes into. A caller that wants only live,
+pre-existing types filters those out: a type whose own item is deleted no
+longer appears among its `Parent()`'s children or values. Neither accessor
+hands out ygo's internal placeholder for a root nobody has opened by name or
+for a type of a class ygo does not know (a Yjs `YXmlHook`).
+
+Neither takes the document lock. Reading `ChangedTypes()` in an
+`OnAfterTransaction` observer is safe. Walking `Parent()` there races any other
+goroutine that writes the document; it is safe inside a `Transact` callback, or
+on a document only one goroutine writes.
+
+### An observed text with a map-valued format no longer panics with the lock held
+
+**Who is affected: anyone who observes a `YText` (a `YXmlText` too) with
+`Observe` while its formats can hold maps or slices**, as link, comment and
+colour marks from y-prosemirror, Tiptap or Quill do.
+
+The next edit of such a text, local or applied from a peer, panicked while the
+observer's delta was built: "comparing uncomparable type map[string]interface
+{}". The panic left the document lock held, so every later call on that
+document blocked forever. The delta now compares format values with
+`reflect.DeepEqual`, and a panic while a transaction's observer events are
+built now releases the lock before it reaches the caller, as a panic in the
+`Transact` callback already did.
+
 ## v1.51.3-sami.7
 
 A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2

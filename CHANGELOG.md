@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.51.3-sami.8] — 2026-10-28
+
+Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.7
+tag (bc93c5b0) and the commits on top of it that the entries below describe.
+Everything under 1.51.3-sami.7 is unchanged.
 
 ### Added
 
