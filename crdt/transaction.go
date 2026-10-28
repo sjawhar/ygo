@@ -107,6 +107,44 @@ func (t *Transaction) IntegrateScanned() int {
 	return t.scanned
 }
 
+// ChangedTypes returns the shared types the transaction changed: every type an
+// item was integrated into or deleted from, as that item's direct parent, once
+// per type and in no particular order. A change under a nested type names that
+// type, not the root above it; walk Parent from an entry to find the
+// containers it sits in.
+//
+// It is not the key set of Yjs `transaction.changed`. It also names the types
+// the transaction itself created, whose own content integrates into them, and
+// the types it deleted, whose own item is deleted and whose content the delete
+// cascades into; Yjs leaves both out. A caller that wants only live types that
+// existed before the transaction filters these entries out, for example a type
+// whose own item is deleted (it no longer appears among its Parent's children
+// or values).
+//
+// It never names an internal placeholder: a root nobody has opened by name
+// (Doc.GetXmlFragment, Doc.GetMap, …) or a nested type of a class ygo does not
+// know (a Yjs YXmlHook, say). A change to either is left out; once the root is
+// opened, later transactions name the type its Get* returned.
+//
+// ChangedTypes does not take the document lock. OnAfterTransaction observers
+// run after the transaction released the lock, and reading ChangedTypes there
+// is safe: it reads only the committed transaction. Walking Parent from an
+// entry there, or anywhere outside a Transact callback, races any other
+// goroutine writing the document; it is safe inside a Transact callback, or in
+// an observer of a document no other goroutine writes (for example a copy one
+// goroutine applies updates to). Each call returns a new slice.
+func (t *Transaction) ChangedTypes() []SharedType {
+	types := make([]SharedType, 0, len(t.changed))
+	for at := range t.changed {
+		switch at.owner.(type) {
+		case nil, *rawType:
+			continue
+		}
+		types = append(types, at.owner)
+	}
+	return types
+}
+
 // Transaction-scoped root accessors (issue #138).
 //
 // The Doc-level GetText/GetMap/GetArray/GetXmlFragment take the document
