@@ -37,6 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in an observer of a document no other goroutine writes, for example a copy
   one goroutine applies updates to.
 
+### Fixed
+
+- **`crdt`: an observed `YText` whose format value is a map no longer panics
+  and locks its document for good.** A `YText.Observe` observer makes the
+  commit build a delta, and `attrDiff` compared format values with `!=`, so a
+  format whose value is a map or a slice (a link mark's attributes, as
+  y-prosemirror and Quill write them) panicked with "comparing uncomparable
+  type map[string]interface {}" on the next local or remote edit of that text.
+  It now compares them as the rest of the formatting code does
+  (`reflect.DeepEqual`). The panic also escaped with the document lock held,
+  because the commit built observer events unguarded when the `Transact`
+  callback had returned normally, so every later call on the document blocked
+  forever. A panic there now releases the lock first, as one in the callback
+  does, and reaches the caller; no observer fires.
+
 ## [1.51.3-sami.7] — 2026-10-27
 
 Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.6
