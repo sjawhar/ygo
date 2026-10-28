@@ -506,6 +506,54 @@ func TestChangedTypes_NamesCreatedAndDeletedTypes(t *testing.T) {
 	}
 }
 
+// TestChangedTypes_NamesATypeDeletedBeforeAConcurrentWrite pins the third
+// kind of entry Yjs `transaction.changed` leaves out: a type deleted before
+// the transaction that a concurrent remote write still reaches. Its own item
+// is deleted (the earlier delete cascaded into it), so it no longer appears
+// among its Parent's children, which is how a caller filters it.
+func TestChangedTypes_NamesATypeDeletedBeforeAConcurrentWrite(t *testing.T) {
+	w := New(WithClientID(1))
+	r := New(WithClientID(2))
+	wFrag := w.GetXmlFragment("prosemirror")
+	p := NewYXmlElement("paragraph")
+	txt := NewYXmlText()
+	w.Transact(func(txn *Transaction) {
+		wFrag.InsertElement(txn, 0, p)
+		p.InsertText(txn, 0, txt)
+		txt.Insert(txn, 0, "hi", nil)
+	})
+	if err := ApplyUpdateV1(r, EncodeStateAsUpdateV1(w, nil), nil); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+	rFrag := r.GetXmlFragment("prosemirror")
+	rP := rFrag.Children()[0].(*YXmlElement)
+	rTxt := rP.Children()[0].(*YXmlText)
+	r.Transact(func(txn *Transaction) { rFrag.Delete(txn, 0, 1) })
+
+	var changed []SharedType
+	r.OnAfterTransaction(func(txn *Transaction) { changed = txn.ChangedTypes() })
+	sv := r.StateVector()
+	w.Transact(func(txn *Transaction) { txt.Insert(txn, 2, "!", nil) })
+	if err := ApplyUpdateV1(r, EncodeStateAsUpdateV1(w, sv), nil); err != nil {
+		t.Fatalf("concurrent write apply: %v", err)
+	}
+	if !slices.Contains(changed, SharedType(rTxt)) {
+		t.Fatalf("ChangedTypes %v misses the text the concurrent write reached", changed)
+	}
+	if !rTxt.item.Deleted {
+		t.Fatal("the text's own item is live after its paragraph was deleted")
+	}
+	if p := rTxt.Parent(); p != SharedType(rP) {
+		t.Fatalf("text Parent() = %T, want its deleted paragraph", p)
+	}
+	if n := len(rP.Children()); n != 0 {
+		t.Fatalf("the deleted paragraph lists %d children, want 0", n)
+	}
+	if n := rFrag.Len(); n != 0 {
+		t.Fatalf("the fragment holds %d children, want 0", n)
+	}
+}
+
 // TestChangedTypes_ParentOfRootsAndDetachedTypes: Parent is nil for a root and
 // for a type not yet inserted, and set once it is.
 func TestChangedTypes_ParentOfRootsAndDetachedTypes(t *testing.T) {

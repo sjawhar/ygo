@@ -113,13 +113,14 @@ func (t *Transaction) IntegrateScanned() int {
 // type, not the root above it; walk Parent from an entry to find the
 // containers it sits in.
 //
-// It is not the key set of Yjs `transaction.changed`. It also names the types
-// the transaction itself created, whose own content integrates into them, and
-// the types it deleted, whose own item is deleted and whose content the delete
-// cascades into; Yjs leaves both out. A caller that wants only live types that
-// existed before the transaction filters these entries out, for example a type
-// whose own item is deleted (it no longer appears among its Parent's children
-// or values).
+// It is not the key set of Yjs `transaction.changed`, which leaves out every
+// type the transaction created and every type whose own item is deleted.
+// ChangedTypes names those too: a type the transaction created, whose own
+// content integrates into it; a type it deleted, whose content the delete
+// cascades into; and a type deleted before the transaction that a concurrent
+// remote change still writes into. A caller that wants only live types that
+// existed before the transaction filters these entries out: a type whose own
+// item is deleted no longer appears among its Parent's children or values.
 //
 // It never names an internal placeholder: a root nobody has opened by name
 // (Doc.GetXmlFragment, Doc.GetMap, …) or a nested type of a class ygo does not

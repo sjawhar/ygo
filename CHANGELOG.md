@@ -13,9 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   type.** `ChangedTypes` returns every shared type an item was integrated into
   or deleted from in the transaction, once per type and in no particular
   order. It is not the key set of Yjs `transaction.changed`: it also names the
-  types the transaction itself created and the types it deleted (whose own
-  item is deleted), and Yjs leaves both out, so a caller that wants only live
-  types that existed before the transaction filters those entries out.
+  types the transaction itself created, the types it deleted, and types
+  deleted earlier that a concurrent remote change still writes into, all of
+  which Yjs leaves out, so a caller that wants only live types that existed
+  before the transaction filters those entries out (a type whose own item is
+  deleted no longer appears among its `Parent()`'s children or values).
   `Parent()`, on every shared type and on the `SharedType` interface, returns
   the type that contains it; a deleted type keeps it also after the garbage
   collector freed its container item. Neither hands out ygo's internal
