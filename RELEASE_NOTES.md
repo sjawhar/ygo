@@ -1,3 +1,26 @@
+## v1.51.3-sami.9
+
+A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2
+(07bd8f62) from v1.51.3-sami.8. It carries reearth/ygo#338 and every member
+of v1.51.3-sami.8 unchanged.
+
+**Who is affected: a ygo server with an idle `@hocuspocus/provider` editor or
+viewer.**
+
+The provider sends an awareness renewal every 15 seconds and reconnects after
+30 seconds without a received message. ygo now sends a read-write peer's valid
+awareness update to every peer, including its sender. A read-only peer cannot
+change shared awareness; it gets an empty awareness response to keep its
+provider connected without retaining its input.
+
+The existing per-peer outbound queue remains capped at 512 frames. At its
+default 64 MiB maximum frame, that is 34,359,738,368 bytes (32 GiB) before the
+full-queue path closes the peer. Sender echo makes that existing bound reachable
+from one non-reading connection rather than two; the bound and close behavior
+are unchanged.
+
+No API or wire format changes.
+
 ## v1.51.3-sami.8
 
 A fork release of `github.com/reearth/ygo`, built on upstream v1.51.2

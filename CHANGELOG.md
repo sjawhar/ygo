@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.3-sami.9] — 2026-10-29
+
+Fork release on upstream 1.51.2 (07bd8f62), composed from the
+1.51.3-sami.8 tag (567f5679) and one upstream-bound fix. Everything under
+1.51.3-sami.8 is unchanged.
+
+### Fixed
+
+- **`provider/websocket`: awareness keeps its sender connected.** A read-write
+  peer's valid update reaches every peer in its room. A read-only peer gets an
+  empty awareness response without changing shared awareness or retaining its
+  input. A lone `@hocuspocus/provider` editor or viewer therefore receives its
+  15-second renewal and does not reconnect after its 30-second no-message
+  timeout. (reearth/ygo#338)
+
 ## [1.51.3-sami.8] — 2026-10-29
 
 Fork release on upstream 1.51.2 (07bd8f62), composed from the 1.51.3-sami.7
