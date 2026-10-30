@@ -551,10 +551,8 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	// Snapshot state vector before applying anything (used for skip/offset logic).
 	sv := txn.doc.store.StateVector()
 	beginRemoteApply(txn, sv)
-	scanner := func() *pendingScanner { return newPendingScanner(update, false) }
-	if err := checkParkedDeletes(txn.doc, sv, len(update), scanner, false); err != nil {
-		// Refused before anything changed: the commit tells no observer.
-		txn.rolledBack = true
+	budget := newPendingBudget(txn.doc, sv, update, false)
+	if err := refuseBeforeApply(txn, sv, len(update), &budget); err != nil {
 		return err
 	}
 
@@ -569,7 +567,7 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	// 1. Decode all items, parking any with future-clock deps or same-client gaps.
 	//    Returns the within-update pending list (items whose parent might resolve
 	//    later in this same update).
-	withinUpdatePending, err := decodeAndPark(txn, dec, sv, numClients, update)
+	withinUpdatePending, err := decodeAndPark(txn, dec, sv, numClients)
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
@@ -603,9 +601,8 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 //	    into the returned slice for the within-update retry pass.
 //
 // numClients is the count parsed from the header.
-func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numClients uint64, update []byte) ([]*Item, error) {
+func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numClients uint64) ([]*Item, error) {
 	var pending []*Item
-	budget := newPendingBudget(txn.doc, sv, update, false)
 
 	totalStructs := uint64(0)
 	for i := uint64(0); i < numClients; i++ {
@@ -664,9 +661,6 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			// the cross-update pending limit.
 			if clock > existingEnd {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return nil, err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -688,9 +682,6 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			// reference to a group not yet decoded) are deferred.
 			if item.Parent == nil {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return nil, err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -707,9 +698,6 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			if offset == 0 && item.OriginRight != nil &&
 				item.OriginRight.Clock >= txn.doc.store.NextClock(item.OriginRight.Client) {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return nil, err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -776,9 +764,12 @@ func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 
 // parkDeferredItem parks item, which this update deferred and nothing in it
 // resolved, in the document's pending queue: in arrival order, waiting on the
-// clock that blocks it, within the cross-update cap. It is the one place that
-// parks a deferred item, so the test oracle of the retry
-// (within_update_diff_test.go) parks exactly as the retry does.
+// clock that blocks it, within the cross-update cap. The apply checked the
+// whole update against the cap before it changed anything
+// (refuseBeforeApply), so the cap's check here refuses nothing an apply
+// reaches; it stays as the cap's last guard. It is the one place that parks a
+// deferred item, so the test oracle of the retry (within_update_diff_test.go)
+// parks exactly as the retry does.
 func parkDeferredItem(txn *Transaction, item *Item) error {
 	s := txn.doc.store
 	if s.pending != nil && len(s.pending.items) >= txn.doc.maxPendingItemsLimit() {
@@ -796,6 +787,26 @@ func parkDeferredItem(txn *Transaction, item *Item) error {
 		mergePendingMissing(parkedMissing(txn), item.ID.Client, s.NextClock(item.ID.Client))
 	}
 	return nil
+}
+
+// refuseBeforeApply is where a remote apply refuses an update for the pending
+// cap (WithMaxPendingItems), before it changes anything: when the update's
+// structs would park more items than the cap has room for (budget,
+// pendingBudget.checkBeforeApply) or its delete set would grow the parked
+// delete ranges past it (checkParkedDeletes). A refused apply is marked rolled
+// back, so its commit tells no observer: the document, with or without a scan
+// bound, is as it was, and nothing of the update is persisted or relayed. sv
+// is the store's state vector as the apply begins and size the update's length
+// in bytes.
+func refuseBeforeApply(txn *Transaction, sv StateVector, size int, budget *pendingBudget) error {
+	err := budget.checkBeforeApply(size)
+	if err == nil {
+		err = checkParkedDeletes(txn.doc, sv, size, budget.scanner, budget.v2)
+	}
+	if err != nil {
+		txn.rolledBack = true
+	}
+	return err
 }
 
 // checkParkedDeletes refuses a remote update, V1 or V2, when its delete set

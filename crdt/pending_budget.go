@@ -49,6 +49,37 @@ func (b *pendingBudget) scanner() *pendingScanner {
 	return &pendingScanner{v2: &v2, rest: &rest}
 }
 
+// checkBeforeApply refuses the update, before the apply integrates any of it,
+// when its structs would leave more items parked than the pending cap has
+// room for: the check that once ran when the deferred items reached the room
+// left, after the items before them had integrated, runs whole before the
+// first. size is the update's length in bytes. An update with no more structs
+// than the room left cannot pass it and is not read again: a V1 struct takes
+// two bytes of the update at least, so a V1 update of at most twice the room
+// costs a comparison; a V2 update, whose columns can hold many structs in a
+// few bytes, is read past its structs to count them (skipStructs) first.
+func (b *pendingBudget) checkBeforeApply(size int) error {
+	if !b.v2 && size/2 <= b.remaining {
+		return nil
+	}
+	if b.v2 && b.v2Start != nil {
+		// A scanner of the update's own decoder, as scanner makes, that
+		// allocates nothing: the column cursors are a copy on the stack, and
+		// the rest cursor is the apply's own (applyV2Txn), which has read
+		// nothing yet and is put back where it began. The scan's error is not
+		// returned from here, so nothing of the scanner escapes; an update
+		// whose structs do not scan fails the same scan in check, which
+		// returns its error.
+		v2 := *b.v2Start
+		n, err := skipStructs(&pendingScanner{v2: &v2, rest: v2.restDec})
+		*v2.restDec = b.v2Rest
+		if err == nil && n <= b.remaining {
+			return nil
+		}
+	}
+	return b.check(b.remaining)
+}
+
 func (b *pendingBudget) check(count int) error {
 	if b.checked || count < b.remaining {
 		return nil

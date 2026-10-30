@@ -277,33 +277,43 @@ func parkedDeleteRangesAfter(pending, ds DeleteSet) int {
 // deleteSetOf is the delete set of the update s scans, a V1 one or a V2 one,
 // read past its structs without keeping anything of them.
 func deleteSetOf(s *pendingScanner, v2 bool) (DeleteSet, error) {
-	if s.err != nil {
-		return DeleteSet{}, s.err
-	}
-	clients := s.uint()
-	if clients > maxV2Items {
-		return DeleteSet{}, ErrInvalidUpdate
-	}
-	var total uint64
-	for i := uint64(0); i < clients && s.err == nil; i++ {
-		n := s.uint()
-		total += n
-		if total > maxV2Items {
-			return DeleteSet{}, ErrInvalidUpdate
-		}
-		s.client()
-		s.uint()
-		for j := uint64(0); j < n && s.err == nil; j++ {
-			s.item()
-		}
-	}
-	if s.err != nil {
-		return DeleteSet{}, s.err
+	if _, err := skipStructs(s); err != nil {
+		return DeleteSet{}, err
 	}
 	if v2 {
 		return decodeDeleteSetV2(s.v2)
 	}
 	return decodeDeleteSet(s.rest)
+}
+
+// skipStructs reads the update s scans past its structs, keeping nothing of
+// them, and is how many of them are not skips (tag 10): the most the update
+// can park in the pending queue.
+func skipStructs(s *pendingScanner) (int, error) {
+	if s.err != nil {
+		return 0, s.err
+	}
+	clients := s.uint()
+	if clients > maxV2Items {
+		return 0, ErrInvalidUpdate
+	}
+	var total uint64
+	structs := 0
+	for i := uint64(0); i < clients && s.err == nil; i++ {
+		n := s.uint()
+		total += n
+		if total > maxV2Items {
+			return 0, ErrInvalidUpdate
+		}
+		s.client()
+		s.uint()
+		for j := uint64(0); j < n && s.err == nil; j++ {
+			if _, skip, _, _ := s.item(); !skip {
+				structs++
+			}
+		}
+	}
+	return structs, s.err
 }
 
 // structClocksOf is the store's state vector once the structs of the update s

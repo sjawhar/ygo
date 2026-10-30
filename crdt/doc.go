@@ -109,9 +109,9 @@ const defaultMaxPendingItems = 100_000
 // ApplyUpdate to return ErrInvalidUpdate, and so does an update whose delete
 // set would grow the parked ranges past the cap; ranges an update names
 // again, or that join parked ones, count once, and an update that adds no
-// range is never refused. An update refused for its delete ranges is refused
-// before the apply changes anything, with or without a scan bound: the
-// document is as it was and no observer is told. Zero or negative uses the
+// range is never refused. An update the cap refuses, for its items or for its
+// delete ranges, is refused before the apply changes anything, with or without
+// a scan bound: the document is as it was and no observer is told. Zero or negative uses the
 // default (100,000). To load stored state, which can hold more than the cap,
 // see SetMaxPendingItems.
 //
