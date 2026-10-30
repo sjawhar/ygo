@@ -783,8 +783,8 @@ func (s *Server) markIdleIfEmpty(r *room) {
 // here in a backward-compatible way.
 type ConnectionConfig struct {
 	// ReadOnly, when true, makes the peer read-only: it receives document and
-	// awareness broadcasts but its inbound writes are dropped server-side. See
-	// Server.Authorize for the exact semantics.
+	// awareness broadcasts, and its awareness update gets an empty response.
+	// Its sync updates and awareness update do not change the room or reach others.
 	ReadOnly bool
 }
 
@@ -915,9 +915,10 @@ type Server struct {
 	// returns a ConnectionConfig describing the accepted connection — notably
 	// whether it is read-only (issue #59). When Authorize is set it takes
 	// precedence over AuthFunc. A read-only peer receives document and awareness
-	// broadcasts but its inbound writes (SyncStep2/Update and awareness updates)
-	// are dropped; it can still request state (SyncStep1 is answered) and query
-	// awareness. Stateless signals are not gated by read-only.
+	// broadcasts; its sync updates and awareness update do not change the room
+	// or reach other peers, and its awareness update gets an empty response. It
+	// can still request state (SyncStep1 is answered) and query awareness.
+	// Stateless signals are not gated by read-only.
 	Authorize func(r *http.Request) (ConnectionConfig, bool)
 
 	// AllowedOrigins is the list of origins permitted to open WebSocket
@@ -1096,6 +1097,12 @@ type Server struct {
 	// Zero (the default) uses 512, sized for typical sync workloads.
 	PeerWriteQueueSize int
 
+	// PeerWriteQueueBytes bounds the bytes queued for one peer beyond its
+	// handshake, closing the peer when reached, because PeerWriteQueueSize
+	// alone lets one peer pin many full-state frames; zero or negative
+	// disables it.
+	PeerWriteQueueBytes int64
+
 	// SlowPeerPolicy selects the reaction when a peer's broadcast write queue
 	// overflows: SlowPeerDisconnect (default) closes the connection; SlowPeerResync
 	// keeps it open and re-syncs the peer in place. See SlowPeerPolicy. Like the
@@ -1212,10 +1219,8 @@ type Server struct {
 	// crdt.MergeUpdatesV1). Tests inject a failing merge to exercise fallback.
 	mergeFn func(...[]byte) ([]byte, error)
 
-	// MaxPendingItems caps the per-document pending-items queue depth. The
-	// queue holds items whose dependencies have not yet arrived, waiting for
-	// out-of-order delivery to resolve. Zero or negative uses the crdt default
-	// (100,000). See crdt.WithMaxPendingItems and issue #46.
+	// MaxPendingItems caps each document's parked items and, separately, parked
+	// delete ranges (crdt.WithMaxPendingItems).
 	MaxPendingItems int
 
 	// HandshakeTimeout caps how long a peer may stay connected without sending
@@ -1423,9 +1428,8 @@ func NewServer() *Server {
 	return s
 }
 
-// Shutdown closes all active peer connections and waits for their goroutines
-// to exit or for ctx to expire. Call this during server shutdown to prevent
-// goroutine leaks and ensure in-flight operations complete cleanly.
+// Shutdown closes all peer connections, dropping input their read loops have
+// not handled, and waits for their goroutines to exit or for ctx to expire.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() { close(s.shutdownCh) })
 
@@ -1446,27 +1450,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	// NOTE the relay context is deliberately NOT cancelled here (#202). It
-	// used to be, and that ordering silently discarded the outbound tail:
-	// peers keep committing for the whole connection-close-plus-persistence
-	// -drain window below, every one of those updates lands in a room lane
-	// whose worker had already exited on ctx.Done() without draining, and no
-	// counter fired. Cancellation now happens at the END of Shutdown, after
-	// the lanes have been retired, drained under the still-live relay
-	// context, and joined. Delaying it is safe for the INBOUND side because
-	// Inject (like Apply and BroadcastUpdate) refuses with ErrServerShutdown
-	// the moment shutdownCh closes — which was this function's first act —
-	// so the relay's delivery goroutine outliving this point cannot mutate
-	// any room; its deliveries just bounce.
+	// The relay context is cancelled at the end, not here, because read loops
+	// can still commit while connections close and their updates must reach a
+	// live room lane.
 
-	// Collect all active peer connections and persistence channels.
+	// Collect all active peers and persistence channels.
 	s.rmu.RLock()
-	var conns []*gws.Conn
+	var peers []*peer
 	var persistDones []chan struct{}
 	for _, r := range s.rooms {
 		r.mu.Lock()
 		for p := range r.peers {
-			conns = append(conns, p.conn)
+			peers = append(peers, p)
 		}
 		r.mu.Unlock()
 		// Stop this room's awareness auto-expiry sweep (if AwarenessExpiry>0
@@ -1493,12 +1488,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.rmu.RUnlock()
 
-	// Close each connection. The peer read loop will exit on the next
-	// ReadMessage call, triggering handleDisconnect cleanup.
-	for _, c := range conns {
-		if err := c.Close(); err != nil {
-			s.log().Debug("shutdown close failed", "err", err)
-		}
+	// Close each connection; each read loop drops unhandled input and runs
+	// handleDisconnect.
+	for _, p := range peers {
+		p.closeConn()
 	}
 
 	// Wait for all persistence goroutines to drain in-flight writes.
@@ -1516,14 +1509,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	// Join the stranded writers (#229). A transaction committed during this
-	// Shutdown — peer read loops keep committing right through the connection
-	// closes above — may have arrived too late for its room's worker, in which
-	// case the committing goroutine performs the adapter write itself. It
-	// blocks on the same persistDone the loop above just waited for, so without
-	// this join Shutdown would routinely return with that write still in
-	// flight, and the usual `srv.Shutdown(ctx); return` shape would kill the
-	// process mid-write — the original bug through a narrower window.
+	// Join the stranded writers, since a read loop can still commit while its
+	// connection closes and its adapter write must finish before Shutdown
+	// returns.
 	//
 	// Placed HERE deliberately: after the persistence join (a stranded writer
 	// cannot even start until its worker has exited) and before the relay steps
@@ -1736,10 +1724,8 @@ func (s *Server) createRoomPlaceholder(name string) (*room, bool, error) {
 	if s.MaxRooms > 0 && len(s.rooms) >= s.MaxRooms {
 		return nil, false, ErrTooManyRooms
 	}
-	docOpts := []crdt.DocOption{}
-	if s.MaxPendingItems > 0 {
-		docOpts = append(docOpts, crdt.WithMaxPendingItems(s.MaxPendingItems))
-	}
+	// The pending cap stays lifted until loadRoom has loaded the stored state.
+	docOpts := []crdt.DocOption{crdt.WithMaxPendingItems(math.MaxInt)}
 	aw := awareness.New(0)
 	if s.MaxAwarenessBytesPerRoom > 0 {
 		aw.SetMaxBytes(s.MaxAwarenessBytesPerRoom)
@@ -1804,6 +1790,8 @@ func (s *Server) releaseInflight(rm *room) {
 // leak that administrative CloseRoom cannot even clear (#182 follow-up).
 func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 	loadErr := s.loadRoomDoc(r, name)
+	// Cap only after the stored state is in, since it can hold more than the cap.
+	r.doc.SetMaxPendingItems(s.MaxPendingItems)
 	// #60 — fire OnLoadDocument AFTER persistence bootstrap but BEFORE the
 	// persistence worker starts, so a hook returning an error fails room creation
 	// cleanly. Runs off-lock now (#182), so a slow hook no longer stalls other
@@ -2069,6 +2057,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		clientIDs:         make(map[uint64]struct{}),
 		writeCh:           make(chan []byte, s.peerWriteQueueSize()),
 		writerDone:        make(chan struct{}),
+		writeBudget:       s.PeerWriteQueueBytes,
 		limiter:           s.newPeerLimiter(),
 		readOnly:          readOnly,
 		hocuspocusFraming: s.HocuspocusFraming,
@@ -2148,23 +2137,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				p.inputClosed.Store(true)
 				_ = ws.WriteControl(gws.CloseMessage, frame, time.Now().Add(closeFrameTimeout))
 			}
-			_ = ws.Close() // close errors during teardown are expected; not logged
+			p.closeConn()
 		case <-s.shutdownCh:
-			_ = ws.Close() // close errors during teardown are expected; not logged
+			p.closeConn()
 		case <-p.done: // H1: read loop exited normally; nothing to do
 		}
 	}()
 
-	// 1. Send sync step-1 — request the peer's state vector.
-	p.sendSync(ygsync.EncodeSyncStep1(rm.doc))
+	// 1. Sync step-1 — request the peer's state vector.
+	step1 := syncFrame(ygsync.EncodeSyncStep1(rm.doc))
 
-	// 2. Send sync step-2 — give the peer everything the server already has.
+	// 2. Sync step-2 — give the peer everything the server already has.
 	fullUpdate := crdt.EncodeStateAsUpdateV1(rm.doc, nil)
-	step2 := encodeSyncStep2Msg(fullUpdate)
-	p.sendSync(step2)
+	step2 := syncFrame(encodeSyncStep2Msg(fullUpdate))
 
-	// 3. Send the current awareness state of all active peers.
-	p.sendAwareness(rm.awareness.EncodeUpdate(nil))
+	// 3. The current awareness state of all active peers.
+	aw := awarenessFrame(rm.awareness.EncodeUpdate(nil))
+
+	// Queued together, outside PeerWriteQueueBytes (see writeHandshake).
+	p.writeHandshake(step1, step2, aw)
 
 	// Read loop — exits when the connection is closed (by peer, by context
 	// cancellation, or by Shutdown).
@@ -2186,9 +2177,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if p.inputClosed.Load() {
-			// A close is queued or sent: nothing more from this peer lands.
-			// continue, not break: the deferred teardown would drop the
-			// queued close frame or race the one being sent.
+			// Continue, not break, so the deferred teardown neither drops the
+			// queued close frame nor races the one being sent.
 			continue
 		}
 		if firstMessage {

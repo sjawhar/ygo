@@ -44,15 +44,11 @@ func decodeStructsV1(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteS
 		if total > maxV2Items {
 			return nil, DeleteSet{}, ErrInvalidUpdate
 		}
-		clientU, err := dec.ReadVarUint()
+		start, err := readID(dec)
 		if err != nil {
 			return nil, DeleteSet{}, wrapUpdateErr(err)
 		}
-		client := ClientID(clientU)
-		clock, err := dec.ReadVarUint()
-		if err != nil {
-			return nil, DeleteSet{}, wrapUpdateErr(err)
-		}
+		client, clock := start.Client, start.Clock
 		// A later group for the client replaces earlier ones, as in apply (yjs parity).
 		var structs []*Item
 		for j := uint64(0); j < numStructs; j++ {
@@ -60,7 +56,9 @@ func decodeStructsV1(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteS
 			if err != nil {
 				return nil, DeleteSet{}, wrapUpdateErr(err)
 			}
-			clock += uint64(item.Content.Len())
+			if clock, err = structEnd(clock, uint64(item.Content.Len())); err != nil {
+				return nil, DeleteSet{}, err
+			}
 			// Skip structs are clock-range placeholders, not content. Drop them
 			// from the struct list — advancing clock above leaves a gap that the
 			// encoder re-emits as a skip (Yjs filterSkips). Carrying them would
@@ -79,16 +77,10 @@ func decodeStructsV1(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteS
 	return out, ds, nil
 }
 
-// sliceItemFront mutates item to drop its first `offset` logical units, so it
-// starts `offset` clocks later. Used to dedup overlapping struct ranges when
-// merging. Content.Splice(offset) mutates the receiver to hold [0,offset) and
-// returns the suffix; we keep the suffix.
+// sliceItemFront drops item's first offset clocks, as Yjs sliceStruct does.
 func sliceItemFront(item *Item, offset int) {
-	// An origin-less, parent-less struct (a GC placeholder) must stay so it
-	// re-encodes as a GC struct rather than a normal item; only set Origin for a
-	// real item (one that already has an origin or a resolved parent). Skip
-	// structs never reach here — they're filtered out during decode.
-	hadAnchor := item.Origin != nil || item.Parent != nil
+	// A GC placeholder keeps no origin so it re-encodes as a GC struct.
+	hadAnchor := !item.isGCOrphan()
 	suffix := item.Content.Splice(offset)
 	item.ID.Clock += uint64(offset)
 	if hadAnchor {

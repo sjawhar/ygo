@@ -5,7 +5,175 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.54.1] — 2026-10-25
+## [1.54.1-sami.1] — 2026-10-30
+
+Fork release on upstream 1.54.0 (64fa0b47), composed on upstream main
+201d3bc7, which adds only a change to mobile/go.mod. It replaces the
+1.51.3-sami.N line, which was built on upstream 1.51.2: the changes of that
+line that upstream merged come from 1.54.0 itself, and every other change it
+carries is one of the open upstream pull requests named below, or one whose
+pull request is not yet opened. The 1.51.3-sami.N entries are in the
+CHANGELOG of the v1.51.3-sami.9 tag.
+
+### Added
+
+- **`crdt`: `Doc.OpenUpdateLog` records committed updates in commit order.**
+  OnUpdate observers run after the transaction releases the document lock, so
+  the observers of two transactions that commit close together on different
+  goroutines run in either order, and nothing they are handed says which
+  committed first. An `UpdateLog` is appended to under the document lock, at
+  the point where the commit already encodes its update for OnUpdate, so an
+  observer that drains it finds its own transaction's update after every
+  update committed before it. The first commit after the log opens also
+  records the document's whole state just before it, parked structs included
+  (the log's base). Each logged update is the very slice its `OnUpdate`
+  observers get, and, in `LoggedUpdate.Parked`, what the commit parked:
+  structs and deletions that wait for something the document lacks, which
+  `OnUpdate` leaves out as Yjs does. A reader that applies the base and then
+  each update's `Update` and `Parked` holds the document as it stood after
+  each commit, what it holds parked included. A remote update's format cleanup
+  is a commit of its own and is logged like one. `Drain`, `Pending`, `Reset`
+  (start again from a fresh base) and `Close` complete it. Without an open log
+  nothing changes: a commit encodes its update only for OnUpdate observers, as
+  before. (reearth/ygo#332)
+- **`crdt`: `WithMaxIntegrateScan`, `Doc.SetMaxIntegrateScan` and
+  `ErrIntegrateScanBudget`: a document can bound the conflict scans of a remote
+  update, and then applies every remote update whole or not at all.** YATA
+  places an item by scanning right from its left origin past every item whose
+  own origin lies in what the scan has passed, so an item naming an early left
+  origin and no right origin scans to the end of a list, and an update of n of
+  them scans n times the list: 2,000 such items (about 12 KB) into a list of
+  20,000 unmerged items took 20.8 s and allocated 2,365,640,192 bytes. With a
+  bound, the scans of one remote update together pass at most that many items;
+  past it, `ApplyUpdateV1` and `ApplyUpdateV2` return `ErrIntegrateScanBudget`
+  (which wraps `ErrInvalidUpdate`). A bounded document takes out what such an
+  update, or any remote update whose apply fails, integrated before it failed,
+  so the document is left as it was and the transaction fires no observer:
+  nothing of the update is persisted or relayed. A bounded document refuses a
+  remote update carrying a subdocument or a move. Local transactions are never
+  bounded. No bound is set by default. The drain of the pending queue that
+  ends an apply has an allowance of its own, the bound again; a drain that
+  would pass it is taken back and the queue is parked again as it was, every
+  peer's items kept, while the update that filled the gap stands. The clocks
+  the queue waits on are raised to the store's, so only an apply that brings
+  one of its clients further drains it again. Bounded or not, a transaction's
+  conflict scans share one map of marks, made by the first scan that needs it
+  and kept until the transaction commits: each mark records which scan, and
+  which step of it, passed the item, so a new scan reuses the map without
+  clearing it. (reearth/ygo#333)
+- **`crdt`: a scan allowance for each remote update, and the scans each
+  apply passed, committed or refused.** `WithIntegrateScanBudget(func(origin
+  any) int)` and `Doc.SetIntegrateScanBudget` give a document a budget it asks,
+  under its lock, as each remote apply (`ApplyUpdate`, V1 and V2) begins, with
+  that apply's origin: the apply's conflict scans, the drain of the pending
+  queue it ends with included, may pass at most the number it returns, and
+  zero or negative leaves that one apply unbounded. One fixed bound
+  (`WithMaxIntegrateScan`) has to hold the largest honest update and so lets
+  every update scan as much; a budget lets an owner size each update's
+  allowance from what it knows before applying it - the structs the update
+  carries, who sent it, or what remains of an allowance it keeps for the whole
+  document. An update whose own scans would pass its allowance is refused with
+  `ErrIntegrateScanBudget`; a drain that would pass what the update left of the
+  allowance is taken back while the update stands, and the queue parked again
+  as under a bound, so one apply never scans more than its budget. Under a
+  bound the drain keeps an allowance of its own, the bound again, as before. A
+  document with a budget is bounded whatever the budget returns: it applies
+  every remote update whole or not at all and refuses subdocuments and moves
+  from remote updates, as a document with a bound does, and the budget takes
+  the bound's place while it is set. `(*Transaction).IntegrateScanned()` is the
+  number of items the transaction's conflict scans passed, a drain taken back
+  included, counted on every document, bounded or not, and read from
+  `OnAfterTransaction`, which runs after the document's lock is released and
+  before `ApplyUpdate` returns. An update a bounded document refuses commits no
+  transaction an observer sees, so `ApplyUpdateV1` and `ApplyUpdateV2` return
+  its error as a `*RefusedUpdateError{Err, Scanned}`: `Scanned` is what the
+  refused apply's scans passed - exactly its limit when the scans reached it -
+  and `Unwrap` returns `Err`, so `errors.Is` matches `ErrIntegrateScanBudget`
+  and `ErrInvalidUpdate`, and the message is that of `Err`. On a bounded
+  document (a budget or `WithMaxIntegrateScan`) this wrapping covers every
+  failed apply, not only a scan refusal: any error that rolls the apply back, a
+  malformed update included, is returned as a `*RefusedUpdateError`, and so is
+  a failure before the apply begins to integrate - an update whose header or
+  group framing does not read, or one the pending cap refuses
+  (reearth/ygo#334, #340) - which rolls nothing back and reports no scans
+  (`Scanned` 0). A caller
+  using `errors.Is` or `errors.As` needs no change; one that type-asserts the
+  concrete error type must expect the wrapper. A panic in the budget callback
+  refuses the update before the apply changes anything, with an error that
+  names the callback and no observer told. The zero `RefusedUpdateError` is
+  safe to print. The count is exactly what the bound
+  measures: a document bounded at the count takes the update, and one bounded
+  one item under it refuses it. Decoding a document's whole state into a fresh
+  document is a remote apply too, so its transaction's count is what a copy of
+  the document pays to load it, and an owner can keep a document's running
+  total from it. (fork member `feat/integrate-scan-budget`, stacked on
+  reearth/ygo#333; upstream pull request not yet opened)
+- **`crdt`: `(*Transaction).ChangedTypes()` and `Parent()` on every shared
+  type.** `ChangedTypes` returns every shared type an item was integrated into
+  or deleted from in the transaction, once per type and in no particular
+  order. It is not the key set of Yjs `transaction.changed`: it also names the
+  types the transaction itself created, the types it deleted, and types
+  deleted earlier that a concurrent remote change still writes into, all of
+  which Yjs leaves out, so a caller that wants only live types that existed
+  before the transaction filters those entries out (a type whose own item is
+  deleted no longer appears among its `Parent()`'s children or values).
+  `Parent()`, on every shared type and on the `SharedType` interface, returns
+  the type that contains it, as Yjs `type.parent` does; a deleted type keeps
+  it also after the garbage collector freed its container item. Neither hands
+  out ygo's internal placeholder for a root nobody has opened by name or for a
+  nested type of a class ygo does not know (a Yjs `YXmlHook`): `ChangedTypes`
+  leaves such a type out, and `Parent()` returns nil for a root, a detached
+  type, or a type whose container is such a placeholder. Once the root is
+  opened by name, `Parent()` and later transactions' `ChangedTypes` name the
+  type the `Get*` call returned. Together they let an owner that applies
+  remote updates learn which nested types an apply changed, and which
+  top-level children they sit in, without a subscription on every node, for
+  example to re-render only the blocks of a document an update touched.
+  Neither takes the document lock: reading `ChangedTypes` from an
+  `OnAfterTransaction` observer, which runs after the transaction released the
+  lock, is safe, but walking `Parent()` there, or anywhere else outside a
+  `Transact` callback, races any other goroutine writing the document. It is
+  safe inside a `Transact` callback, or in an observer of a document no other
+  goroutine writes, for example a copy one goroutine applies updates to. (reearth/ygo#336)
+- **`crdt`: `Doc.SetMaxPendingItems`** sets the pending cap on a document
+  already made, so stored state, which can carry more parked items or ranges
+  than the cap, can be loaded with the cap lifted. `provider/websocket` now
+  loads each room's stored state that way and sets `MaxPendingItems` before
+  the `OnLoadDocument` hook and any peer's update. A document over its cap
+  still applies an update whose items resolve within it. (reearth/ygo#334)
+- **`provider/websocket`: `Server.PeerWriteQueueBytes`, a per-peer bound on the
+  bytes waiting in a peer's write queue.** `PeerWriteQueueSize`
+  bounds that queue in frames only, so one connection can make the server hold
+  512 times the largest frame its room produces. A peer that sends SyncStep1
+  and never reads is answered the room's full state each time: on a 4 MiB
+  document, 100 such messages of 4 bytes each grew a server's heap by about
+  420 MB, and the connection stayed open. With the budget set, when the frames
+  waiting for a peer reach it, the next frame is not queued and the peer is
+  closed as for a full queue. This holds on every enqueue path (a room
+  broadcast, the SyncStep2 answering a SyncStep1, awareness, an `Apply` or
+  `Inject` delivery) and whatever `SlowPeerPolicy` is set, because a peer over
+  its budget drains only if it reads. The close is logged at Warn as
+  `peer queued bytes over budget`. The frame that crosses the budget is queued
+  whatever its size, and the handshake is not counted, so one peer holds at
+  most the budget plus one frame, besides its handshake and the frame being
+  written. A frame that arrives while the budget or more waits closes even a
+  peer that reads, so set the budget above the largest room state. Zero, the
+  default, or a negative value means no byte budget. (reearth/ygo#342)
+
+### Changed
+
+- **`crdt`: parked delete ranges are capped as parked items are.** Nothing
+  bounded the delete ranges parked waiting for their structs, so a peer could
+  grow them without limit with delete sets naming clocks of a client nobody
+  holds, taxing every later apply in the room and surviving into every
+  snapshot. `WithMaxPendingItems` (and `Server.MaxPendingItems`) now also caps
+  them, counted separately from parked items with the same default of 100,000.
+  An update whose delete set would leave more parked ranges than the cap
+  returns `ErrInvalidUpdate` before it changes anything: nothing of it is
+  applied, stored or sent to observers. Ranges the update's own structs
+  resolve make room, and ranges a peer sends again or that join parked ones
+  add nothing. The count does not credit ranges that items the update unblocks
+  would resolve, so near the cap it can refuse such an update. (reearth/ygo#334)
 
 ### Fixed
 
@@ -20,7 +188,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closes that peer too before it returns; the peer's disconnect handler, and
   `OnLastPeer` with it, may still run after `OnUnloadDocument`. Without
   `force`, `CloseRoom` removed a room that had such a peer and returned nil;
-  it now returns `ErrRoomHasPeers` and leaves the room open, as its doc says.
+  it now returns `ErrRoomHasPeers` and leaves the room open, as its doc says. (reearth/ygo#331)
+- **`crdt`: a bounded document's remote apply no longer copies what earlier
+  updates parked.** To restore them when it refuses an update, the apply of a
+  document with a scan bound (`WithMaxIntegrateScan`) copied the pending queue's
+  items, the clocks it waits on and the pending deletes as it began, and the
+  drain copied the pending deletes again, so every remote apply cost time and
+  memory in proportion to what sat parked: one keystroke allocated 2,806,176
+  bytes on a bounded document holding 349,517 parked structs (2,880 unbounded)
+  and 25,171,104 bytes on one holding 524,280 parked delete ranges (8,391,872
+  unbounded). The apply now keeps them by reference: it only appends to the
+  parked items past the length it keeps, copies the map of clocks the queue
+  waits on at its first write to it, and merges a delete range it parks into
+  copies of the clients that range names, so a refused update still leaves the
+  parked items, the clocks they wait on and the pending deletes exactly as they
+  were. With 100,000 parked items a keystroke now allocates 3,176 bytes on a
+  bounded document against 1,608 unbounded (806,264 before), and with 100,000
+  parked delete ranges 1,609,192 against 1,607,624 (4,821,112 before). (reearth/ygo#333)
+- **`crdt`: merging split runs back at commit is linear in the run.** An update
+  that splits one run n times and leaves each half where it merges back at
+  commit made each merge append the half to the run's whole text and search and
+  shift the client's store slice: 20,000 halves of a 40,000-character run
+  allocated 440,968,992 bytes in one apply, 11,384,168 bytes with this change.
+  The halves merge in clock order, each run's text is joined once, and the
+  merged halves leave their store slices in one pass per client. (reearth/ygo#333)
+- **`crdt`: a remote apply no longer pays for every parked delete range.**
+  Every remote apply retried every parked delete range, re-sorting and copying
+  each range of a client the store does not hold, so one keystroke allocated
+  about 9 MB with 100,000 ranges parked. A client's parked ranges are now
+  retried only once the client gains structs past the lowest of them, so an
+  apply costs nothing for the parked ranges of clients it brings nothing for.
+  (reearth/ygo#334)
+- **`crdt`: an observed `YText` whose format value is a map no longer panics
+  and locks its document for good.** A `YText.Observe` observer makes the
+  commit build a delta, and `attrDiff` compared format values with `!=`, so a
+  format whose value is a map or a slice (a link mark's attributes, as
+  y-prosemirror and Quill write them) panicked with "comparing uncomparable
+  type map[string]interface {}" on the next local or remote edit of that text.
+  It now compares them as the rest of the formatting code does
+  (`reflect.DeepEqual`). The panic also escaped with the document lock held,
+  because the commit built observer events unguarded when the `Transact`
+  callback had returned normally, so every later call on the document blocked
+  forever. A panic there now releases the lock first, as one in the callback
+  does, and reaches the caller; no observer fires. (reearth/ygo#335)
+- **`provider/websocket`: awareness keeps its sender connected.** A read-write
+  peer's valid update reaches every peer in its room. A read-only peer gets an
+  empty awareness response without changing shared awareness or retaining its
+  input. A lone idle editor or viewer on `@hocuspocus/provider` or the
+  `y-websocket` client now receives a message after its 15-second awareness
+  renewal and does not reconnect after its 30-second no-message timeout.
+  (reearth/ygo#338)
+- **`provider/websocket`: a failed write closes the peer's connection.** When
+  a write to a peer failed (for example, its 10-second write deadline expired
+  because the peer stopped reading), the peer's writer stopped but the
+  connection stayed open. A peer that kept sending stayed in its room, did not
+  trigger `OnLastPeer`, and its replies queued with no writer until the write
+  queue overflowed. The writer now closes the connection, and the read loop
+  removes the peer without handling the frames left in its read buffer.
+  (reearth/ygo#339)
+- **`crdt`: the pending cap refuses an update before the update changes the
+  document.** `WithMaxPendingItems` refused an update whose items would park
+  past the cap only when the decoder reached those items. The items before
+  them had already integrated, so the document kept them, `OnUpdate` fired, and
+  the apply returned `ErrInvalidUpdate`. A `provider/websocket` room stored and
+  relayed that part and answered the sender `SyncStatus(0)`. The cap now checks
+  the whole update before the apply integrates any of it. A refused update
+  leaves the document unchanged, and no observer is told. An update that the
+  check reads and finds malformed is also refused before anything integrates,
+  and an update whose header does not read, or whose group framing does not
+  read in an update of several groups, no longer fires `OnUpdate` or
+  `OnAfterTransaction`. (reearth/ygo#340)
+- **`crdt`: an update that fails after part of it integrated drains the
+  pending queue on that part.** An update cut short in its structs or its
+  delete set keeps the structs before the cut, but the apply returned before
+  its drain, so an item that an earlier update parked behind those structs
+  stayed parked. A peer that applied the update that `OnUpdate` handed it, or
+  the part that a `provider/websocket` room relayed, ran its own drain and
+  integrated that item. The room was then behind its peers. The apply now
+  drains after every failure once it has begun to integrate, in V1 and V2, and
+  the commit's update holds what the drain integrated; a bounded document
+  rolls such an apply back whole and drains nothing for it. V2 applies now
+  drain through the same code as V1, so a V2 drain that panics parks the rest
+  of the queue again with the clocks it waits on, where before those items
+  could stay parked for good. (reearth/ygo#340)
+- **`crdt`: a struct sent again while it waits in the pending queue is parked
+  once.** A struct that waits for a missing predecessor parked again each time
+  it arrived again: a client that reconnects sends again what the room did not
+  acknowledge, and a stored state carries the structs parked when it was
+  saved. The queue grew by the whole resend each time (5, 10, 15 items for one
+  5-struct tail sent three times), and once it reached `WithMaxPendingItems`
+  the document refused the client's updates, the resend included. What an
+  update leaves to park now merges with the queue, as Yjs merges it with its
+  pending structs: a struct whose clocks the queue holds parks no second time,
+  one whose first or last clocks the queue holds parks only the rest, and the
+  pending cap does not count a held struct. (reearth/ygo#344)
+- **`provider/websocket`: the part of a relay-injected update that a node's
+  room integrated never reached that node's peers.** `Server.Inject` applies a
+  cluster relay's sync update item by item, so one that fails partway (for
+  example, a later struct or its delete set does not decode) leaves part of
+  itself in the room, which the room's update observers, persistence among
+  them, are told of; Inject returned the error and rebroadcast nothing. It now
+  rebroadcasts the structs that integrated and the deletions it made (from
+  `crdt.ApplyUpdateV1Landed`) to the node's peers, as a peer's partly applied
+  update reaches the room's other peers since 1.54.0, and still returns the
+  apply's error. The structs the apply parked go with it
+  (`fix/relay-parked-landed`, below).
+  (reearth/ygo#341)
+- **`provider/websocket`: a peer the server closes while its read loop runs
+  no longer has its buffered input handled.** When the server closed a
+  connection itself, for a
+  full write queue (on a direct send, or on a broadcast under
+  `SlowPeerDisconnect`), for a Hocuspocus close message, for a cancelled
+  request context without a close code, in `Shutdown`, or in
+  `CloseRoom(name, true)`, the read loop still handled the messages already
+  in its read buffer (up to about 4 KiB). For a client that sent SyncStep1 and
+  never read, the server encoded the room's full state for each of them (up
+  to about 400), then refused it for the full queue and logged a warning.
+  Updates in that input were applied after the close, and stored too after
+  `Shutdown` or `CloseRoom`. The read loop now drops that input, as it
+  already did after a queued close, and so does every other close the server
+  makes, a failed write (reearth/ygo#339) and the byte budget
+  (reearth/ygo#342) included. Runtime change: updates a client sent but the
+  server had not read when it closed the connection are not saved; a client
+  that reconnects sends them again. (reearth/ygo#343)
+- **`crdt`: an update can no longer leave a document holding a clock or
+  client its own state encodings cannot carry.** The decoders took clocks
+  past 2^53-1, which no Yjs peer can create (JavaScript's
+  `Number.MAX_SAFE_INTEGER`): V1 up to 2^56-1, and V2 also an origin clock
+  that runs below zero, read as a value past 2^63. V1 also took client IDs
+  past 2^55-1, the most a V2 update can carry. After a crafted update:
+  - `EncodeStateAsUpdateV2` panicked on a parked origin clock of 2^54 or a
+    client of 2^55.
+  - A parked struct whose clock V1 cannot read back (after a skip past 2^56,
+    or a negative V2 origin) made `EncodeStateAsUpdateV1` drop every parked
+    struct and deletion from the state, so a copy loaded from it lost other
+    peers' parked edits.
+
+  The apply and merge decoders now refuse such clocks and clients with
+  `ErrInvalidUpdate`, and the state encodings leave out only a parked part
+  that does not merge.
+
+  **Upgrade note:** a document saved by an earlier release after it accepted
+  such an update (a struct, delete range or reference past 2^53-1, or a
+  client past 2^55-1) is now refused whole when it loads. No Yjs peer can
+  make such a document. A document made with `WithClientID` past 2^55-1 is
+  refused too: its V2 encoding already panicked, and now its V1 updates do
+  not load either. Where the stored log keeps such an update as an entry of
+  its own, apply the entries one at a time and skip those that return
+  `ErrInvalidUpdate`; a compacted state that holds it does not load. (fork
+  member `fix/crdt-clock-bounds`; upstream pull request not yet opened)
+- **`crdt`/`provider/websocket`: a partly applied update reaches the other
+  peers with what it parked.** When an apply failed after part of the update
+  integrated, `ApplyUpdateV1Landed` returned only the structs it added and the
+  deletions it made, so `provider/websocket` relayed none of the structs the
+  failed apply parked, waiting for something the room lacked. Once that
+  arrived, the room drained them and showed their content, and the peers never
+  received it. The landed update now also carries the structs the failed
+  apply parked, so a peer that applies it parks the same structs, as it would
+  had the update applied and been relayed whole. (fork member
+  `fix/relay-parked-landed`, stacked on `fix/crdt-clock-bounds`; upstream pull
+  request not yet opened)
 
 ## [1.54.0] — 2026-10-22
 

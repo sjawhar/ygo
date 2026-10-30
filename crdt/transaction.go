@@ -1,7 +1,9 @@
 package crdt
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -27,6 +29,23 @@ type Transaction struct {
 	// transient (no item was inserted between them). Mirrors Yjs JS's
 	// `_mergeStructs` and powers gap #78 H2.
 	mergeStructs []*Item
+	// scanned counts the items the conflict scans of this transaction's
+	// integrates have passed (IntegrateScanned). scanLimit is the most a phase
+	// of a remote apply on a bounded document may add to it, set as the apply
+	// begins (beginRemoteApply), and 0 for no limit; scanFrom is scanned as the
+	// phase began: the whole apply is one phase under a budget, and under a
+	// bound the drain of the pending queue is a phase with an allowance of its
+	// own (drainParked). scanMarks holds what the scans mark
+	// (Item.integrate): made by the first scan that needs it, kept for the
+	// transaction and dropped when it commits; scanSerial numbers the scans.
+	scanned, scanLimit, scanFrom int
+	scanMarks                    map[*Item]scanMark
+	scanSerial                   uint32
+	// journal is the record a remote apply on a document with a scan bound
+	// keeps to undo itself on failure, and rolledBack whether it did, so the
+	// commit fires nothing (apply_rollback.go).
+	journal    *applyJournal
+	rolledBack bool
 	// rearbitrate queues, per parent, move targets whose winning ContentMove
 	// was tombstoned; rearbitrateMoves resolves them in one pass at commit.
 	rearbitrate map[*abstractType]map[*Item]struct{}
@@ -66,6 +85,34 @@ type Transaction struct {
 	formatCleanup      bool
 	typeObserved       bool
 	afterTypeObservers func()
+	// refused marks a remote apply that failed before integrating, so the
+	// commit fires nothing.
+	refused bool
+	// parkedItems and parkedDeletes are what this transaction parked in the
+	// store's pending queue and pending deletes: structs and deletions that
+	// wait for something the document lacks. The structs are kept always, for
+	// a failed apply's landed update (encodeTxnV1Locked); the deletions only
+	// while an update log is open, whose logged update carries both
+	// (parkedUpdate), as the OnUpdate update does not.
+	parkedItems   []*Item
+	parkedDeletes DeleteSet
+}
+
+// noteParkedItem records item, which this transaction parked.
+func (t *Transaction) noteParkedItem(item *Item) {
+	t.parkedItems = append(t.parkedItems, item)
+}
+
+// noteParkedDeletes records ds, deletions this transaction parked, for the
+// open update logs.
+func (t *Transaction) noteParkedDeletes(ds DeleteSet) {
+	if len(t.doc.updateLogs) == 0 {
+		return
+	}
+	if t.parkedDeletes.clients == nil {
+		t.parkedDeletes = newDeleteSet()
+	}
+	t.parkedDeletes.Merge(ds)
 }
 
 // Ctx returns the context associated with this transaction. Transactions
@@ -78,6 +125,60 @@ type Transaction struct {
 // and reconcile via sync or recreate the doc from persistence.
 func (t *Transaction) Ctx() context.Context {
 	return t.ctx
+}
+
+// IntegrateScanned is the number of items the conflict scans of the
+// transaction's integrates passed (Item.integrate), the drain of the pending
+// queue included, also when a bounded document took the drain back: what
+// WithMaxIntegrateScan and WithIntegrateScanBudget bound for a remote update,
+// counted for every transaction of every document, bounded or not. Read from
+// an OnAfterTransaction observer, which runs after the document's lock is
+// released and before ApplyUpdate returns, it is the scan work an applied
+// remote update cost: under a budget at most what the budget gave the apply,
+// and under a bound at most the bound for the update and the bound again for
+// its drain. A remote update a bounded document refuses commits no
+// transaction an observer sees; RefusedUpdateError.Scanned reports its scans.
+func (t *Transaction) IntegrateScanned() int {
+	return t.scanned
+}
+
+// ChangedTypes returns the shared types the transaction changed: every type an
+// item was integrated into or deleted from, as that item's direct parent, once
+// per type and in no particular order. A change under a nested type names that
+// type, not the root above it; walk Parent from an entry to find the
+// containers it sits in.
+//
+// It is not the key set of Yjs `transaction.changed`, which leaves out every
+// type the transaction created and every type whose own item is deleted.
+// ChangedTypes names those too: a type the transaction created, whose own
+// content integrates into it; a type it deleted, whose content the delete
+// cascades into; and a type deleted before the transaction that a concurrent
+// remote change still writes into. A caller that wants only live types that
+// existed before the transaction filters these entries out: a type whose own
+// item is deleted no longer appears among its Parent's children or values.
+//
+// It never names an internal placeholder: a root nobody has opened by name
+// (Doc.GetXmlFragment, Doc.GetMap, …) or a nested type of a class ygo does not
+// know (a Yjs YXmlHook, say). A change to either is left out; once the root is
+// opened, later transactions name the type its Get* returned.
+//
+// ChangedTypes does not take the document lock. OnAfterTransaction observers
+// run after the transaction released the lock, and reading ChangedTypes there
+// is safe: it reads only the committed transaction. Walking Parent from an
+// entry there, or anywhere outside a Transact callback, races any other
+// goroutine writing the document; it is safe inside a Transact callback, or in
+// an observer of a document no other goroutine writes (for example a copy one
+// goroutine applies updates to). Each call returns a new slice.
+func (t *Transaction) ChangedTypes() []SharedType {
+	types := make([]SharedType, 0, len(t.changed))
+	for at := range t.changed {
+		switch at.owner.(type) {
+		case nil, *rawType:
+			continue
+		}
+		types = append(types, at.owner)
+	}
+	return types
 }
 
 // Transaction-scoped root accessors (issue #138).
@@ -348,9 +449,79 @@ func tryMergeWithLefts(txn *Transaction) {
 	if len(txn.mergeStructs) == 0 {
 		return
 	}
+	// The right halves are merged in clock order, so a run of halves of one
+	// client merges left to right, each into the run already merged before it:
+	// a merge's conditions are all local to the two items, so the runs it
+	// leaves do not depend on the order. Merged left to right, each merge adds
+	// only its own half to the run: a ContentAny or ContentJSON run appends the
+	// half's values, and a ContentString run's text is joined once, when every
+	// half has been merged (merging.strings), rather than copied whole by each
+	// merge. The merged halves leave their clients' store slices in one pass
+	// each (merging.removed) rather than one search and shift each. A
+	// transaction that split a long run n times, each half merged back at
+	// commit, otherwise copied the run's text and its client's store slice n
+	// times: n = 20,000 halves of a 40,000-character run allocated 407 MB.
+	slices.SortFunc(txn.mergeStructs, func(a, b *Item) int {
+		if c := cmp.Compare(a.ID.Client, b.ID.Client); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.ID.Clock, b.ID.Clock)
+	})
 	store := txn.doc.store
+	merging := &mergeRuns{}
 	for _, item := range txn.mergeStructs {
-		tryMergeWithLeft(item, store)
+		tryMergeWithLeft(item, merging)
+	}
+	merging.finish(store)
+}
+
+// mergeRuns is what tryMergeWithLefts defers to the end of its merges: the
+// text each ContentString run gains, joined once, and the merged halves, which
+// leave their clients' store slices together.
+type mergeRuns struct {
+	strings map[*ContentString]*strings.Builder
+	removed map[ClientID]map[*Item]struct{}
+}
+
+// appendString adds right's text to left's run.
+func (m *mergeRuns) appendString(left, right *ContentString) {
+	if m.strings == nil {
+		m.strings = make(map[*ContentString]*strings.Builder)
+	}
+	b := m.strings[left]
+	if b == nil {
+		b = &strings.Builder{}
+		b.WriteString(left.Str)
+		m.strings[left] = b
+	}
+	b.WriteString(right.Str)
+	left.utf16Len += right.utf16Len
+}
+
+// remove records item, merged into its left neighbour, to leave the store.
+func (m *mergeRuns) remove(item *Item) {
+	if m.removed == nil {
+		m.removed = make(map[ClientID]map[*Item]struct{})
+	}
+	gone := m.removed[item.ID.Client]
+	if gone == nil {
+		gone = make(map[*Item]struct{})
+		m.removed[item.ID.Client] = gone
+	}
+	gone[item] = struct{}{}
+}
+
+// finish joins each ContentString run's text and removes the merged halves
+// from their clients' store slices.
+func (m *mergeRuns) finish(store *StructStore) {
+	for content, b := range m.strings {
+		content.Str = b.String()
+	}
+	for client, gone := range m.removed {
+		store.clients[client] = slices.DeleteFunc(store.clients[client], func(it *Item) bool {
+			_, merged := gone[it]
+			return merged
+		})
 	}
 }
 
@@ -366,7 +537,7 @@ func tryMergeWithLefts(txn *Transaction) {
 //
 // On success: left's content is extended in place, the linked list is spliced
 // past item, and item is removed from the store.
-func tryMergeWithLeft(item *Item, store *StructStore) bool {
+func tryMergeWithLeft(item *Item, merging *mergeRuns) bool {
 	left := item.Left
 	if left == nil {
 		return false
@@ -420,8 +591,7 @@ func tryMergeWithLeft(item *Item, store *StructStore) bool {
 		if !ok {
 			return false
 		}
-		lc.Str += rc.Str
-		lc.utf16Len += rc.utf16Len
+		merging.appendString(lc, rc)
 	case *ContentAny:
 		rc, ok := item.Content.(*ContentAny)
 		if !ok {
@@ -463,13 +633,20 @@ func tryMergeWithLeft(item *Item, store *StructStore) bool {
 		left.Parent.clearMarkers()
 	}
 
-	// Remove item from the store's per-client slice.
-	storeItems := store.clients[item.ID.Client]
-	for i, it := range storeItems {
-		if it == item {
-			store.clients[item.ID.Client] = append(storeItems[:i], storeItems[i+1:]...)
-			break
-		}
-	}
+	// Remove item from the store's per-client slice, with the run's other
+	// merged halves (mergeRuns.finish).
+	merging.remove(item)
 	return true
+}
+
+// scanMark is a conflict scan's mark on an item it passed: which scan of the
+// transaction, and at which step of it (Item.integrate).
+type scanMark struct{ scan, step uint32 }
+
+// scanMarkMap returns the transaction's scan marks, made on first use.
+func (txn *Transaction) scanMarkMap() map[*Item]scanMark {
+	if txn.scanMarks == nil {
+		txn.scanMarks = make(map[*Item]scanMark)
+	}
+	return txn.scanMarks
 }

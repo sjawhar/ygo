@@ -39,18 +39,19 @@ func TestUnit_ApplyUpdateV1Landed(t *testing.T) {
 	writer.Transact(func(txn *Transaction) { wm.Set(txn, "a", 1) })
 	written := EncodeStateAsUpdateV1(writer, nil)
 	newRoom := func() *Doc {
-		room := New(WithClientID(100), WithMaxPendingItems(10))
+		// The cap leaves room for this update's delete ranges, so the
+		// pending-cap checks that run before the apply (checkBeforeApply,
+		// checkParkedDeletes) do not read its delete set: the apply reaches
+		// it and fails there, after its structs integrated or parked.
+		room := New(WithClientID(100), WithMaxPendingItems(100))
 		require.NoError(t, ApplyUpdateV1(room, written, nil))
 		require.NoError(t, ApplyUpdateV1(room, landedParking(t, 2, 4), nil))
 		require.Equal(t, 4, room.PendingStats().Items)
 		return room
 	}
 
-	// The editor inserts "abc" and overwrites w.a, which integrate (the
-	// overwrite deletes the writer's entry), then sets seven entries on a map
-	// the room never received, which overflow the six pending slots left. Its
-	// own deletion of a character travels in the update's delete set, which
-	// the apply never reaches.
+	// The editor's text and overwrite integrate and five map entries park
+	// before its cut-short delete set fails the apply.
 	editor := newTestDoc(7)
 	require.NoError(t, ApplyUpdateV1(editor, written, nil))
 	author := newTestDoc(1)
@@ -65,29 +66,33 @@ func TestUnit_ApplyUpdateV1Landed(t *testing.T) {
 		et.Insert(txn, 0, "abc", nil)
 		et.Delete(txn, 3, 1)
 		em.Set(txn, "a", 2)
-		for i := range 7 {
+		for i := range 5 {
 			nested.Set(txn, "e"+strconv.Itoa(i), i)
 		}
 	})
-	overflowing := EncodeStateAsUpdateV1(editor, before)
+	cut := EncodeStateAsUpdateV1(editor, before)
+	cut = cut[:len(cut)-1]
 
 	room := newRoom()
-	landed, err := ApplyUpdateV1Landed(room, overflowing, nil)
+	landed, err := ApplyUpdateV1Landed(room, cut, nil)
 	require.ErrorIs(t, err, ErrInvalidUpdate)
 	require.Equal(t, "abc"+strings.Repeat("x", 50), room.GetText("t").ToString(), "the insertion integrated")
 	require.NotNil(t, landed)
 
 	ids, err := ContentIDsFromUpdateV1(landed)
 	require.NoError(t, err)
-	assert.Equal(t, []ClientID{7}, ids.Inserts.Clients(), "only structs this apply integrated")
-	assert.Equal(t, []IDRange{{Clock: 0, Len: 4}}, ids.Inserts.Ranges(7), `"abc" and w.a`)
+	assert.Equal(t, []ClientID{7}, ids.Inserts.Clients(), "only structs this apply integrated or parked")
+	assert.Equal(t, []IDRange{{Clock: 0, Len: 9}}, ids.Inserts.Ranges(7), `"abc", w.a and the five parked entries`)
 	assert.Equal(t, []ClientID{3}, ids.Deletes.Clients(), "only the deletion this apply made")
 	assert.Equal(t, []IDRange{{Clock: 100, Len: 1}}, ids.Deletes.Ranges(3), "the overwritten w.a")
 
-	// A peer that held what the room held before ends where the room did.
+	// A peer that held what the room held before ends where the room did,
+	// parked entries included.
 	peer := newRoom()
 	require.NoError(t, ApplyUpdateV1(peer, landed, nil))
 	assert.Equal(t, room.GetText("t").ToString(), peer.GetText("t").ToString())
+	assert.Equal(t, EncodeStateAsUpdateV1(room, nil), EncodeStateAsUpdateV1(peer, nil))
+	assert.Equal(t, room.PendingStats(), peer.PendingStats())
 
 	t.Run("an update that does not decode, and one that applies, land nil", func(t *testing.T) {
 		landed, err := ApplyUpdateV1Landed(newRoom(), EncodeStateAsUpdateV1(editor, nil)[:0], nil)
@@ -102,6 +107,7 @@ func TestUnit_ApplyUpdateV1Landed(t *testing.T) {
 
 	t.Run("a failure that integrates nothing lands nil", func(t *testing.T) {
 		room := newRoom()
+		room.SetMaxPendingItems(10) // 4 parked and 7 more pass it
 		landed, err := ApplyUpdateV1Landed(room, landedParking(t, 5, 7), nil)
 		require.ErrorIs(t, err, ErrInvalidUpdate)
 		assert.Nil(t, landed)

@@ -237,7 +237,7 @@ func (d *v2Decoder) readLeftID() (ID, error) {
 	if err != nil {
 		return ID{}, err
 	}
-	return ID{Client: ClientID(client), Clock: uint64(clock)}, nil
+	return v2ID(client, clock)
 }
 
 func (d *v2Decoder) readRightID() (ID, error) {
@@ -248,6 +248,16 @@ func (d *v2Decoder) readRightID() (ID, error) {
 	clock, err := d.rightClockDec.Read()
 	if err != nil {
 		return ID{}, err
+	}
+	return v2ID(client, clock)
+}
+
+// v2ID is the ID the client and clock columns give, refused when the clock,
+// a running sum of diffs, is below 0 (as uint64 it would be past 2^63) or
+// past maxSafeInteger.
+func v2ID(client uint64, clock int64) (ID, error) {
+	if clock < 0 || clock > maxSafeInteger {
+		return ID{}, ErrInvalidUpdate
 	}
 	return ID{Client: ClientID(client), Clock: uint64(clock)}, nil
 }
@@ -316,22 +326,33 @@ func (d *v2Decoder) readBuf() ([]byte, error) {
 
 func (d *v2Decoder) resetDsCurVal() { d.dsCurrVal = 0 }
 
+// readDsClock reads a delete range's clock, a diff from the end of the range
+// before, refused past maxSafeInteger.
 func (d *v2Decoder) readDsClock() (uint64, error) {
 	diff, err := d.restDec.ReadVarUint()
 	if err != nil {
 		return 0, err
 	}
-	d.dsCurrVal += diff
+	if d.dsCurrVal, err = structEnd(d.dsCurrVal, diff); err != nil {
+		return 0, err
+	}
+	if d.dsCurrVal > maxSafeInteger {
+		return 0, ErrInvalidUpdate
+	}
 	return d.dsCurrVal, nil
 }
 
+// readDsLen reads a delete range's length, refused when the range would reach
+// a clock past maxSafeInteger.
 func (d *v2Decoder) readDsLen() (uint64, error) {
 	v, err := d.restDec.ReadVarUint()
 	if err != nil {
 		return 0, err
 	}
 	l := v + 1
-	d.dsCurrVal += l
+	if d.dsCurrVal, err = structEnd(d.dsCurrVal, l); err != nil {
+		return 0, err
+	}
 	return l, nil
 }
 
@@ -415,19 +436,7 @@ func encodeItemV2(enc *v2Encoder, item *Item, offset int, store *StructStore) {
 		originRight = item.OriginRight
 	}
 
-	// If the origin item is a GC placeholder (no Parent), the receiver can't
-	// infer this item's parent from it. Clear the origin so explicit parent
-	// info is encoded instead.
-	if origin != nil {
-		if oi := store.Find(*origin); oi != nil && oi.isGCOrphan() {
-			origin = nil
-		}
-	}
-	if originRight != nil {
-		if ori := store.Find(*originRight); ori != nil && ori.isGCOrphan() {
-			originRight = nil
-		}
-	}
+	origin, originRight = dropGCOrigins(item, origin, originRight, store)
 
 	contentTag := contentTagOf(item.Content)
 	info := contentTag
@@ -605,11 +614,23 @@ func nonEmptyRanges(ranges []DeleteRange) []DeleteRange {
 
 func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	// Same panic recovery as applyV1Txn — guard against crafted V2 updates
-	// that force a Splice on non-splittable content types.
+	// that force a Splice on non-splittable content types — and the same
+	// refusal of an apply that fails before it changes anything.
+	applying := false
 	defer func() {
 		if r := recover(); r != nil {
-			retErr = fmt.Errorf("%w: panic during item integration: %v", ErrInvalidUpdate, r)
+			retErr = recoveredApplyErr(r)
 		}
+		// An apply that fails before it began to integrate must tell no observer.
+		txn.refused = retErr != nil && !applying
+		if !applying {
+			retErr = refuseRemoteApply(txn, retErr)
+			return
+		}
+		if retErr == nil || txn.journal == nil {
+			retErr = drainAfterApply(txn, retErr)
+		}
+		retErr = endRemoteApply(txn, retErr)
 	}()
 
 	dec, err := newV2Decoder(update)
@@ -622,8 +643,10 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	budget := newPendingBudget(txn.doc, sv, update, true)
 	budget.v2Start = &initialV2
 	budget.v2Rest = *dec.restDec
-
-	numClients, err := dec.restDec.ReadVarUint()
+	// The group count is peeked on a copy of the rest cursor: the pending-cap
+	// check reads the update from where the apply begins.
+	peek := budget.v2Rest
+	numClients, err := peek.ReadVarUint()
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
@@ -634,15 +657,31 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 
 	var pending []*Item
-	var superseded groupSet
 	if numClients > 1 {
 		// Fail before integrating anything: a later malformed group must not
-		// leave earlier, superseded groups applied.
-		if superseded, err = supersededGroups(update, &initialV2, budget.v2Rest); err != nil {
+		// leave earlier, superseded groups applied. The scan also counts the
+		// update's structs, which bounds the pending-cap check's work.
+		if err := budget.knowSuperseded(); err != nil {
 			return wrapUpdateErr(err)
 		}
+	} else {
+		budget.setSuperseded(nil)
 	}
-	budget.setSuperseded(superseded)
+	superseded := budget.superseded
+	// The pending cap refuses an update before the apply changes anything,
+	// for its items (checkBeforeApply) or for its delete ranges
+	// (checkParkedDeletes), so on a bounded document too a refusal starts no
+	// journal. Both checks read the update through the apply's one budget,
+	// on copies of its cursors.
+	if err := budget.checkBeforeApply(len(update)); err != nil {
+		return err
+	}
+	if err := checkParkedDeletes(txn.doc, &budget); err != nil {
+		return err
+	}
+	*dec.restDec = peek
+	applying = true
+	beginRemoteApply(txn, sv)
 
 	totalStructs := uint64(0)
 	for i := uint64(0); i < numClients; i++ {
@@ -683,11 +722,17 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 				if err != nil {
 					return wrapUpdateErr(err)
 				}
+				// Bounded before the replaced-group check, as every struct is,
+				// so apply refuses what the merge decoders refuse.
+				length := uint64(l)
+				itemEnd, err := structEnd(clock, length)
+				if err != nil {
+					return err
+				}
 				if drop {
+					clock = itemEnd
 					continue
 				}
-				length := uint64(l)
-				itemEnd := clock + length
 				if itemEnd > existingEnd {
 					// Record the range in the transaction's delete set: items we
 					// already hold here get tombstoned, and items we have never
@@ -728,7 +773,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 				if err != nil {
 					return wrapUpdateErr(err)
 				}
-				clock += l
+				if clock, err = structEnd(clock, l); err != nil {
+					return err
+				}
 				continue
 
 			default:
@@ -739,11 +786,17 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 					return wrapUpdateErr(derr)
 				}
 				if drop {
+					if clock, err = structEnd(clock, uint64(contentLen)); err != nil {
+						return err
+					}
 					continue
 				}
 			}
 
-			itemEnd := clock + uint64(contentLen)
+			itemEnd, err := structEnd(clock, uint64(contentLen))
+			if err != nil {
+				return err
+			}
 			if itemEnd <= existingEnd {
 				clock = itemEnd
 				continue
@@ -759,9 +812,6 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 			// the cross-update pending limit.
 			if clock > existingEnd {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -786,9 +836,6 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 			// reference to a group not yet decoded) are deferred.
 			if item.Parent == nil {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -802,9 +849,6 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 			if offset == 0 && item.OriginRight != nil &&
 				item.OriginRight.Clock >= txn.doc.store.NextClock(item.OriginRight.Client) {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -828,79 +872,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
-	unresolvableDs := ds.applyToPartial(txn)
-	if len(unresolvableDs.clients) > 0 {
-		txn.doc.store.pendingDs.Merge(unresolvableDs)
-	}
-
-	// pendingDs may be drainable even if pending items aren't — integrated
-	// items from this update might be targets of previously-parked deletes.
-	if len(txn.doc.store.pendingDs.clients) > 0 {
-		retryPendingDs(txn)
-	}
-
-	// Drain pending items whose dependencies have been satisfied by
-	// this update. Inline rather than recursive (Go's sync.Mutex is not
-	// reentrant; ApplyUpdateV2 is already under d.mu via doc.Transact).
-	//
-	// Loop until no progress to handle chained dependencies:
-	//   A arriving satisfies B; B (now integrated) satisfies C; etc.
-	//
-	// Matches yrs' apply_update retry gate and Yjs JS's readUpdateV2
-	// recursion, but executed inline so everything integrated during
-	// this call surfaces in a single OnUpdate notification.
-	for txn.doc.store.pending != nil && txn.doc.store.retryable(txn.doc.store.pending.missing) {
-		items := txn.doc.store.pending.items
-		txn.doc.store.pending = nil
-
-		var stillPending []*Item
-		stillMissing := make(StateVector)
-		progressed := false
-
-		// Process items with panic-safety: if tryIntegrate panics, re-park
-		// unprocessed items and stillPending back into store.pending so a
-		// subsequent ApplyUpdate can retry them. The outer applyV2Txn recover
-		// (v1.1.1) then converts the panic to an error for the caller.
-		idx := 0
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Restore: anything already re-parked + the unprocessed tail.
-					restore := append(stillPending, items[idx:]...)
-					if len(restore) > 0 {
-						txn.doc.store.pending = &pendingUpdate{items: restore, missing: stillMissing}
-					}
-					panic(r) // re-raise for outer recover
-				}
-			}()
-			for idx = 0; idx < len(items); idx++ {
-				item := items[idx]
-				if tryIntegrate(txn, item) {
-					progressed = true
-				} else {
-					stillPending = append(stillPending, item)
-					if client, parkedAt, isFuture := itemFutureDep(item, txn.doc.store); isFuture {
-						mergePendingMissing(stillMissing, client, parkedAt)
-					} else if item.ID.Clock > txn.doc.store.NextClock(item.ID.Client) {
-						// Same-client gap still blocks it.
-						mergePendingMissing(stillMissing, item.ID.Client, txn.doc.store.NextClock(item.ID.Client))
-					}
-				}
-			}
-		}()
-
-		if len(stillPending) > 0 {
-			txn.doc.store.pending = &pendingUpdate{items: stillPending, missing: stillMissing}
-		}
-		// Retry pendingDs — freshly-integrated items may now be targets
-		// of previously-parked delete entries.
-		if progressed && len(txn.doc.store.pendingDs.clients) > 0 {
-			retryPendingDs(txn)
-		}
-		if !progressed {
-			// No progress this pass — infinite-loop guard. Items remain parked.
-			break
-		}
+	if unresolvableDs := ds.applyToPartial(txn); len(unresolvableDs.clients) > 0 {
+		parkDeletes(txn, unresolvableDs)
+		txn.noteParkedDeletes(unresolvableDs)
 	}
 
 	return nil
@@ -979,6 +953,9 @@ func decodeItemV2(dec *v2Decoder, doc *Doc, client ClientID, clock uint64, info 
 
 	content, err := decodeContentV2(dec, doc, info&0x1F)
 	if err != nil {
+		return nil, 0, err
+	}
+	if err := refuseOnBoundedDoc(doc, content); err != nil {
 		return nil, 0, err
 	}
 
@@ -1126,7 +1103,7 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
-		clock, err := dec.restDec.ReadVarUint()
+		clock, err := readClock(dec.restDec)
 		if err != nil {
 			return nil, err
 		}

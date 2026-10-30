@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"sync"
 
-	gws "github.com/gorilla/websocket"
-
 	"github.com/reearth/ygo/crdt"
 	"github.com/reearth/ygo/encoding"
 	"github.com/reearth/ygo/internal/updatecheck"
@@ -479,11 +477,12 @@ func encodeBroadcastWire(update []byte) []byte {
 // If peers are connected:
 //   - force=false: returns ErrRoomHasPeers without modifying state. A peer
 //     that joins while CloseRoom runs counts too.
-//   - force=true:  closes each peer connection and waits for its read loop
-//     to exit, then deletes the room. A peer that joins while CloseRoom runs
-//     is closed the same way before the CloseRoom call that deletes the room
-//     returns. A closed peer's disconnect handler, and so OnLastPeer, can
-//     still be running when CloseRoom returns.
+//   - force=true:  closes each peer connection, dropping input its read loop
+//     has not handled, and waits for its read loop to exit, then deletes the
+//     room. A peer that joins while CloseRoom runs is closed the same way
+//     before the CloseRoom call that deletes the room returns. A closed
+//     peer's disconnect handler, and so OnLastPeer, can still be running when
+//     CloseRoom returns.
 //
 // CloseRoom is primarily intended for releasing rooms created by Apply
 // that never accumulated peer connections. In eager-evict mode
@@ -536,15 +535,15 @@ func (s *Server) CloseRoom(name string, force bool) error {
 		return ErrRoomHasPeers
 	}
 
-	// Collect connection handles and done channels for force-close.
-	conns, dones := peerHandles(rm)
+	// Collect peers and done channels for force-close.
+	peers, dones := peerHandles(rm)
 	rm.mu.Unlock()
 	s.rmu.Unlock()
 
 	// Close each connection outside the locks. handleDisconnect reacquires
 	// s.rmu and rm.mu, so we MUST have released both before entering this
 	// block to avoid deadlock.
-	closePeerConns(conns, dones)
+	closePeerConns(peers, dones)
 
 	// FLUSH-BEFORE-EVICT (#175 follow-up). Make the pending coalesced batch
 	// durable while rm is still in s.rooms — before re-acquiring s.rmu to
@@ -604,7 +603,7 @@ func (s *Server) CloseRoom(name string, force bool) error {
 		s.rmu.Unlock()
 		return ErrRoomHasPeers
 	}
-	lateConns, lateDones := peerHandles(rm)
+	latePeers, lateDones := peerHandles(rm)
 	rm.mu.Unlock()
 	delete(s.rooms, name)
 	if rm.persistStop != nil {
@@ -617,7 +616,7 @@ func (s *Server) CloseRoom(name string, force bool) error {
 	}
 	s.rmu.Unlock()
 
-	closePeerConns(lateConns, lateDones)
+	closePeerConns(latePeers, lateDones)
 
 	if rm.persistDone != nil {
 		<-rm.persistDone
@@ -643,27 +642,28 @@ func (s *Server) CloseRoom(name string, force bool) error {
 	return nil
 }
 
-// peerHandles returns the connection and the done channel of each peer in rm.
-// The caller holds rm.mu.
-func peerHandles(rm *room) ([]*gws.Conn, []chan struct{}) {
+// peerHandles returns each peer in rm and its done channel. The caller holds
+// rm.mu.
+func peerHandles(rm *room) ([]*peer, []chan struct{}) {
 	if len(rm.peers) == 0 {
 		return nil, nil
 	}
-	conns := make([]*gws.Conn, 0, len(rm.peers))
+	peers := make([]*peer, 0, len(rm.peers))
 	dones := make([]chan struct{}, 0, len(rm.peers))
 	for p := range rm.peers {
-		conns = append(conns, p.conn)
+		peers = append(peers, p)
 		dones = append(dones, p.done)
 	}
-	return conns, dones
+	return peers, dones
 }
 
-// closePeerConns closes each connection, then waits for each done channel,
-// which a peer's read loop closes when it exits. The caller holds neither
-// s.rmu nor rm.mu: each peer's handleDisconnect takes both.
-func closePeerConns(conns []*gws.Conn, dones []chan struct{}) {
-	for _, c := range conns {
-		_ = c.Close()
+// closePeerConns closes each peer's connection, dropping input its read loop
+// has not handled (closeConn), then waits for each done channel, which a
+// peer's read loop closes when it exits. The caller holds neither s.rmu nor
+// rm.mu: each peer's handleDisconnect takes both.
+func closePeerConns(peers []*peer, dones []chan struct{}) {
+	for _, p := range peers {
+		p.closeConn()
 	}
 	for _, d := range dones {
 		<-d

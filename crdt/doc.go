@@ -60,6 +60,9 @@ type DocOption func(*Doc)
 
 // WithClientID sets a fixed ClientID instead of generating a random one.
 // Useful in tests and server-side scenarios where the ID must be deterministic.
+// Keep it at most 2^55-1, the largest client a V2 update can carry: the
+// decoders refuse a larger one, so other documents could not load this one's
+// updates. Yjs client IDs are 32 bits.
 func WithClientID(id ClientID) DocOption {
 	return func(d *Doc) { d.clientID = id }
 }
@@ -94,23 +97,98 @@ func WithCollectionID(id string) DocOption {
 	}
 }
 
-// defaultMaxPendingItems is the default cap on items parked in the per-doc
-// pending queue waiting for out-of-order dependencies. It is smaller than the
-// decoder's per-update item limit (maxV2Items, 1<<20), so one legal update
-// applied to a document that lacks the state it depends on can exceed it. See
-// WithMaxPendingItems and #46.
+// defaultMaxPendingItems is the default cap on parked items and, separately,
+// parked delete ranges (see WithMaxPendingItems).
 const defaultMaxPendingItems = 100_000
 
-// WithMaxPendingItems caps the per-doc pending queue depth — items parked
-// waiting for out-of-order dependencies. Once the cap is reached, further
-// items that would be parked cause ApplyUpdate to return ErrInvalidUpdate.
-// Zero or negative uses the default (100,000).
-//
-// This is a defence against a malicious peer crafting an update full of
-// far-future-clock items, which would otherwise grow the pending queue
-// without bound. See issue #46.
+// WithMaxPendingItems caps parked items and, separately, parked delete ranges
+// (default 100,000 when n <= 0), refusing with ErrInvalidUpdate, before any
+// change, an update that would park past either, so a peer cannot grow them
+// without bound. A struct sent again parks without the clocks the queue already
+// holds at its start and end, and one the queue holds whole does not count.
 func WithMaxPendingItems(n int) DocOption {
 	return func(d *Doc) { d.maxPendingItems = n }
+}
+
+// SetMaxPendingItems sets the WithMaxPendingItems cap after construction, so
+// stored state that exceeds it can load uncapped first.
+func (d *Doc) SetMaxPendingItems(n int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.maxPendingItems = n
+}
+
+// WithMaxIntegrateScan bounds the items the conflict scans of one remote
+// update (ApplyUpdate and its V1 and V2 forms) may pass, all of its items
+// together, and makes the document apply a remote update whole or not at all
+// (apply_rollback.go). Integrating an item scans the items between its left
+// origin and its right origin (Item.integrate). An item an editor sends scans
+// only what other peers inserted concurrently at the same place, so a remote
+// update's scans pass a handful of items; an item that names a left origin
+// early in a list and no right origin scans to the list's end instead, and an
+// update of n such items scans n times the list - 2,000 of them, about 12 KB,
+// took 20.8 s against a list of 20,000 unmerged items. An update whose scans
+// would pass the bound is refused with ErrIntegrateScanBudget, and like every
+// remote update the bounded document refuses, it leaves the document as it was,
+// fires no observer, and is returned as a RefusedUpdateError reporting what its
+// scans passed. The drain of the pending queue an update's apply ends with has
+// an allowance of its own, the bound again; a drain that would pass it is taken
+// back and the queue parked again as it was, while the update stands, and the
+// queue is drained again once an apply brings a clock it waits on further
+// (apply_rollback.go). Such a document refuses a remote update carrying a
+// subdocument or a move. Zero or negative, the default, sets no bound. Local
+// transactions are never bounded: their inserts name both neighbours. A budget
+// (WithIntegrateScanBudget) takes the bound's place while it is set.
+func WithMaxIntegrateScan(n int) DocOption {
+	return func(d *Doc) { d.maxIntegrateScan = n }
+}
+
+// SetMaxIntegrateScan sets the bound of WithMaxIntegrateScan on a document
+// already made, for an owner that loads trusted state first and bounds what
+// arrives after it. It takes the document lock.
+func (d *Doc) SetMaxIntegrateScan(n int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.maxIntegrateScan = n
+}
+
+// WithIntegrateScanBudget bounds the conflict scans of each remote update by an
+// allowance of its own: as each remote apply (ApplyUpdate and its V1 and V2
+// forms) begins, the document calls budget with the apply's origin, and the
+// items that apply's scans pass, the drain of the pending queue it ends with
+// included, may number at most what budget returns; zero or negative leaves
+// that one apply's scans unbounded. One fixed bound has to hold the largest
+// honest update - a peer handing over a whole state edited offline scans what
+// others wrote meanwhile at every place it wrote too - so it lets a small
+// update scan as much; a budget lets the owner size each update's allowance by
+// what it can see of the update before applying it, such as the structs it
+// carries, keyed by the origin it applies it with. An update whose own scans
+// would pass its allowance is refused, with ErrIntegrateScanBudget, as under
+// WithMaxIntegrateScan; a drain whose scans would pass what the update left of
+// it is taken back and the queue parked again as it was, while the update
+// stands, and the queue is drained again once an apply brings a clock it waits
+// on further (apply_rollback.go).
+//
+// An owner keeping an account of scans learns what each apply cost from
+// Transaction.IntegrateScanned in an OnAfterTransaction observer when the
+// apply commits, and from RefusedUpdateError.Scanned when the document
+// refused it; either is at most what budget returned for it, when positive.
+//
+// A document with a budget is a bounded document whatever budget returns: it
+// applies every remote update whole or not at all, and refuses a remote update
+// carrying a subdocument or a move. While a budget is set, the bound of
+// WithMaxIntegrateScan is not used. budget runs under the document's lock, so
+// it must not call the document. Local transactions are never bounded.
+func WithIntegrateScanBudget(budget func(origin any) int) DocOption {
+	return func(d *Doc) { d.integrateScanBudget = budget }
+}
+
+// SetIntegrateScanBudget sets the budget of WithIntegrateScanBudget on a
+// document already made, or with nil removes it. It takes the document lock.
+func (d *Doc) SetIntegrateScanBudget(budget func(origin any) int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.integrateScanBudget = budget
 }
 
 // updateSub pairs a unique subscription ID with its callback so that
@@ -154,6 +232,11 @@ type Doc struct {
 	subdocs         map[string]*Doc
 	onSubdocs       []subdocsSub
 	maxPendingItems int // 0 = use defaultMaxPendingItems; see WithMaxPendingItems and #46
+	// maxIntegrateScan is the scan bound of WithMaxIntegrateScan; zero or
+	// negative for none. integrateScanBudget is the budget of
+	// WithIntegrateScanBudget, which takes the bound's place while set.
+	maxIntegrateScan    int
+	integrateScanBudget func(origin any) int
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -184,6 +267,11 @@ type Doc struct {
 	// Deleted=false on items it captured — which requires their original
 	// Content to still be present. Mutated under d.mu.
 	undoManagerCount int
+
+	// updateLogs are the open update logs (OpenUpdateLog). A committing
+	// transaction appends its update to each under d.mu; a closed log is
+	// dropped at the next commit.
+	updateLogs []*UpdateLog
 }
 
 // ClientID returns the document's client identifier (read-only after creation).
@@ -242,6 +330,36 @@ func (d *Doc) Load() {
 		}
 		txn.addSubdocLoaded(d)
 	})
+}
+
+// scanBounded is whether d bounds the conflict scans of its remote updates, by
+// a bound (WithMaxIntegrateScan) or a budget (WithIntegrateScanBudget), and so
+// applies each whole or not at all. Its caller holds d.mu.
+func (d *Doc) scanBounded() bool {
+	return d.integrateScanBudget != nil || d.maxIntegrateScan > 0
+}
+
+// applyScanLimit is the most items the conflict scans of a remote apply with
+// origin may pass on d, or 0 for no limit: what d's budget returns for origin
+// when it has one, otherwise its bound. Its caller holds d.mu.
+func (d *Doc) applyScanLimit(origin any) int {
+	if d.integrateScanBudget != nil {
+		return max(d.callIntegrateScanBudget(origin), 0)
+	}
+	return max(d.maxIntegrateScan, 0)
+}
+
+// callIntegrateScanBudget calls the WithIntegrateScanBudget callback and tags a
+// panic it raises as budgetCallbackPanic, so the apply's recovery names the
+// callback (recoveredApplyErr) rather than item integration. The caller holds
+// d.mu, as the callback contract requires.
+func (d *Doc) callIntegrateScanBudget(origin any) (n int) {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{r})
+		}
+	}()
+	return d.integrateScanBudget(origin)
 }
 
 // maxPendingItemsLimit returns the effective cap on the pending queue depth.
@@ -456,13 +574,24 @@ func (d *Doc) GetText(name string) *YText {
 // The closure must be invoked OUTSIDE d.mu — observers may re-enter Doc
 // methods that acquire d.mu, which would deadlock under the lock.
 //
-// Returns nil only if there is nothing to fire (no observers of any kind).
+// Returns nil when there is nothing to fire: no observers, or a remote apply
+// rolled back (Transaction.rolledBack) or refused (Transaction.refused).
 func buildPhase2(d *Doc, txn *Transaction) func() {
+	// A remote apply rolled back (apply_rollback.go), or refused before it
+	// began to integrate (txn.refused), left the document as it was: there is
+	// no update to encode, to log or to tell any observer.
+	if txn.rolledBack || txn.refused {
+		return nil
+	}
 	// Encode the incremental update and snapshot observer slices while still
-	// holding the lock so we get a consistent view.
+	// holding the lock so we get a consistent view. The update logs take the
+	// update here, under the lock, so they hold updates in commit order.
 	var updateBytes []byte
-	if len(d.onUpdate) > 0 {
+	if d.wantsUpdateBytes() {
 		updateBytes = encodeV1Locked(d, txn.beforeState)
+		if len(d.updateLogs) > 0 {
+			d.appendUpdateLogs(updateBytes, parkedUpdate(d, txn), txn.Origin)
+		}
 	}
 
 	// Snapshot per-type observer closures while the write lock is held.
@@ -579,8 +708,8 @@ func buildPhase2(d *Doc, txn *Transaction) func() {
 // exposed to fn via Transaction.Ctx().
 //
 // fn's returned error is captured as the named return value retErr.
-// Observers fire regardless of whether fn returned an error; the error
-// is propagated to the caller only after the observers have fired.
+// Observers fire, unless a remote apply was refused (Transaction.refused),
+// before fn's error is returned.
 //
 // See docs/superpowers/specs/2026-04-21-transact-panic-safety-design.md
 // for the full rationale on the defer/recover structure.
@@ -627,7 +756,13 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 				phase2 = buildPhase2(d, txn)
 			}()
 		} else {
-			phase2 = buildPhase2(d, txn)
+			// A panic while the events are built (a type's prepareFire) must
+			// not escape with d.mu held: it is re-raised below, after the
+			// unlock, like a panic in fn, and no observer fires.
+			func() {
+				defer func() { r = recover() }()
+				phase2 = buildPhase2(d, txn)
+			}()
 		}
 
 		// Yjs cleans up the format markers a remote change left redundant
@@ -683,7 +818,16 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 		}
 	}()
 
+	// An update log opened (or Reset) since the last commit records the
+	// state as it stands before fn, under the lock: its base.
+	if len(d.updateLogs) > 0 {
+		d.recordUpdateLogBases()
+	}
+
 	retErr = fn(txn)
+	// The scans' marks are the transaction's alone; an observer that keeps the
+	// *Transaction must not keep them.
+	txn.scanMarks = nil
 
 	rearbitrateMoves(txn)
 	txn.afterState = d.store.StateVector()
@@ -755,6 +899,9 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 //   - If fn panics and an observer callback also panics during the partial
 //     firing, the observer's panic reaches the caller and the original
 //     fn panic value is lost.
+//   - If building the observer events panics after fn returned (a type's
+//     event preparation, under the lock), d.mu is released too, no observer
+//     fires, and that panic reaches the caller.
 func (d *Doc) Transact(fn func(*Transaction), origin ...any) {
 	_ = d.transactInternal(context.Background(), func(t *Transaction) error {
 		fn(t)
@@ -1023,9 +1170,7 @@ func (d *Doc) PendingStats() PendingStats {
 		sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
 		stats.MissingFor = missing
 	}
-	for _, ranges := range d.store.pendingDs.clients {
-		stats.DeleteRanges += len(ranges)
-	}
+	stats.DeleteRanges = d.store.pendingDsRanges
 	return stats
 }
 
@@ -1036,6 +1181,7 @@ func (d *Doc) Destroy() {
 	defer d.mu.Unlock()
 	d.onUpdate = nil
 	d.onAfterTxn = nil
+	d.updateLogs = nil
 	d.share = make(map[string]sharedType)
 	d.store = newStructStore()
 }
