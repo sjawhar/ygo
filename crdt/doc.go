@@ -334,9 +334,22 @@ func (d *Doc) scanBounded() bool {
 // when it has one, otherwise its bound. Its caller holds d.mu.
 func (d *Doc) applyScanLimit(origin any) int {
 	if d.integrateScanBudget != nil {
-		return max(d.integrateScanBudget(origin), 0)
+		return max(d.callIntegrateScanBudget(origin), 0)
 	}
 	return max(d.maxIntegrateScan, 0)
+}
+
+// callIntegrateScanBudget calls the WithIntegrateScanBudget callback and tags a
+// panic it raises as budgetCallbackPanic, so the apply's recovery names the
+// callback (recoveredApplyErr) rather than item integration. The caller holds
+// d.mu, as the callback contract requires.
+func (d *Doc) callIntegrateScanBudget(origin any) (n int) {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{r})
+		}
+	}()
+	return d.integrateScanBudget(origin)
 }
 
 // maxPendingItemsLimit returns the effective cap on the pending queue depth.
