@@ -128,16 +128,26 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 		//
 		// A bounded remote apply keeps both sets as one map of marks for the
 		// whole apply, so its scans allocate one entry per distinct item.
+		//
+		// Every item a scan passes is counted (Transaction.IntegrateScanned),
+		// and a bounded remote update's scans together pass at most the limit
+		// its apply began with (WithMaxIntegrateScan, WithIntegrateScanBudget;
+		// beginRemoteApply), which a local transaction never has: an item
+		// naming a left origin early in a list and no right origin scans to the
+		// list's end, and an update of many of them would otherwise pass a
+		// number of items that grows with its length times the list's. The scan
+		// is refused before it would pass one item more than the limit, and
+		// before this item is linked; the apply's journal takes out what
+		// integrated before it.
+		bounded := txn.boundedApply
 		limit := 0
-		if !txn.Local {
-			limit = txn.doc.integrateScanLimit()
+		if bounded != nil {
+			limit = bounded.scanLimit
 		}
-		var bounded *boundedApplyState
 		var beforeOrigin, conflicting map[*Item]struct{}
 		var marks map[*Item]scanMark
 		var scan, step, groupFrom uint32
-		if limit > 0 {
-			bounded = txn.beginBoundedApply()
+		if bounded != nil {
 			marks = bounded.scanMarkMap()
 			bounded.scanSerial++
 			scan, groupFrom = bounded.scanSerial, 1
@@ -148,14 +158,12 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 
 		// Scan right until we hit our right origin (item.Right) or the end.
 		for o != nil && o != item.Right {
-			// Every item the scan passes counts toward the bound, including
-			// one it steps over for a different key.
-			if bounded != nil {
-				bounded.scanned++
-				if bounded.scanned > limit {
-					panic(integrateScanBudgetExceeded{})
-				}
+			// Every item the scan passes counts, including one it steps over
+			// for a different key.
+			if limit > 0 && txn.scanned-bounded.scanFrom >= limit {
+				panic(integrateScanBudgetExceeded{})
 			}
+			txn.scanned++
 			// Children and keyed attributes have independent conflict orders.
 			if !parentSubEqual(item.ParentSub, o.ParentSub) {
 				o = o.Right

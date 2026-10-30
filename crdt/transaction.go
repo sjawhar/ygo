@@ -29,6 +29,11 @@ type Transaction struct {
 	// transient (no item was inserted between them). Mirrors Yjs JS's
 	// `_mergeStructs` and powers gap #78 H2.
 	mergeStructs []*Item
+	// scanned counts the items the conflict scans of this transaction's
+	// integrates have passed (IntegrateScanned), for every transaction of
+	// every document, so it is a field of its own: a bounded apply's limit is
+	// checked against it (boundedApplyState.scanLimit, scanFrom).
+	scanned int
 	// boundedApply holds a bounded remote apply's scan and rollback state, so
 	// other transactions do not carry it.
 	boundedApply *boundedApplyState
@@ -83,6 +88,21 @@ type Transaction struct {
 // and reconcile via sync or recreate the doc from persistence.
 func (t *Transaction) Ctx() context.Context {
 	return t.ctx
+}
+
+// IntegrateScanned is the number of items the conflict scans of the
+// transaction's integrates passed (Item.integrate), the drain of the pending
+// queue included, also when a bounded document took the drain back: what
+// WithMaxIntegrateScan and WithIntegrateScanBudget bound for a remote update,
+// counted for every transaction of every document, bounded or not. Read from
+// an OnAfterTransaction observer, which runs after the document's lock is
+// released and before ApplyUpdate returns, it is the scan work an applied
+// remote update cost: under a budget at most what the budget gave the apply,
+// and under a bound at most the bound for the update and the bound again for
+// its drain. A remote update a bounded document refuses commits no
+// transaction an observer sees; RefusedUpdateError.Scanned reports its scans.
+func (t *Transaction) IntegrateScanned() int {
+	return t.scanned
 }
 
 // Transaction-scoped root accessors (issue #138).
@@ -582,11 +602,17 @@ type scanMark struct{ scan, step uint32 }
 // boundedApplyState is the scan and rollback state of one remote apply on a
 // document with a scan bound.
 type boundedApplyState struct {
-	scanned    int
-	scanMarks  map[*Item]scanMark
-	scanSerial uint32
-	journal    *applyJournal
-	rolledBack bool
+	// scanLimit is the most a phase of the apply may add to the
+	// transaction's scanned count, set as the apply begins
+	// (beginRemoteApply), and 0 for no limit; scanFrom is scanned as the
+	// phase began: the whole apply is one phase under a budget, and under a
+	// bound the drain of the pending queue is a phase with an allowance of
+	// its own (drainParked).
+	scanLimit, scanFrom int
+	scanMarks           map[*Item]scanMark
+	scanSerial          uint32
+	journal             *applyJournal
+	rolledBack          bool
 }
 
 // beginBoundedApply returns txn's bounded apply state, made on first use.
