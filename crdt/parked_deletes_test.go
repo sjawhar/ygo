@@ -4,6 +4,7 @@ import (
 	"errors"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,58 +256,122 @@ func TestAParkedDeleteRangeAppliesOnceItsStructsArrive(t *testing.T) {
 	}
 }
 
-// A bounded document refuses an update whose delete set both deletes text it
-// holds and would park more ranges than the cap, and takes back the deletes it
-// had already applied: its state, its text and its observers are as they were.
-// An unbounded twin, which keeps what a refused update did, shows the deletes
-// ran before the refusal. The same deletes without the ranges past the cap
-// then apply.
-func TestABoundedDocumentRefusingParkedDeletesTakesBackTheDeletesItApplied(t *testing.T) {
+// A document refuses an update whose delete set would park more ranges than
+// the cap before it changes anything, with no scan bound as with one: an
+// update that inserts text, deletes text the document holds and names more
+// ranges past the store than the cap leaves the document's state, its text,
+// its parked deletes and its observers as they were. In the sami.6 member the
+// refusal came after the update's structs and resolvable deletes, and only a
+// bounded document took them back: a document with no bound (Dispatch's, which
+// sets the cap with SetMaxPendingItems and no bound) kept the insert and the
+// deletes, fired OnUpdate, and returned ErrInvalidUpdate. The same edit
+// without the ranges past the cap then applies.
+func TestARefusedParkedDeleteUpdateLeavesTheDocumentUnchanged(t *testing.T) {
 	const limit = 10
 	writer := New(WithClientID(5))
 	written := writer.GetText("t")
 	writer.Transact(func(txn *Transaction) { written.Insert(txn, 0, "hello", nil) })
 	state := EncodeStateAsUpdateV1(writer, nil)
+	sv := writer.StateVector()
+	writer.Transact(func(txn *Transaction) {
+		written.Insert(txn, 5, "!", nil)
+		written.Delete(txn, 1, 2)
+	})
+	edit := EncodeStateAsUpdateV1(writer, sv)
 	over := make([]DeleteRange, 0, limit+1)
 	for i := range limit + 1 {
 		over = append(over, DeleteRange{Clock: uint64(2 * i), Len: 1})
 	}
-	deletesText := []DeleteRange{{Clock: 1, Len: 2}}
-	refused := deleteSetUpdate(map[ClientID][]DeleteRange{5: deletesText, 98: over})
+	refused, err := MergeUpdatesV1(edit, deleteRangesUpdate(98, over...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range applyFormats {
+		for _, kind := range []struct {
+			name string
+			opts []DocOption
+		}{
+			{"unbounded", nil},
+			{"bounded", []DocOption{WithMaxIntegrateScan(testScanBound)}},
+		} {
+			t.Run(format.name+"/"+kind.name, func(t *testing.T) {
+				doc := New(append([]DocOption{WithClientID(1)}, kind.opts...)...)
+				if err := ApplyUpdateV1(doc, state, nil); err != nil {
+					t.Fatal(err)
+				}
+				doc.SetMaxPendingItems(limit)
+				text := doc.GetText("t")
+				before, textBefore := EncodeStateAsUpdateV1(doc, nil), text.ToString()
+				updates := observed(doc)
+				if err := applyIn(t, doc, format.v2, refused); !errors.Is(err, ErrInvalidUpdate) {
+					t.Fatalf("the update was applied with err %v, want ErrInvalidUpdate", err)
+				}
+				requireUnchanged(t, doc, before, textBefore, updates)
+				if got := doc.PendingStats().DeleteRanges; got != 0 {
+					t.Fatalf("after the refusal %d delete ranges are parked, want none", got)
+				}
+				if err := applyIn(t, doc, format.v2, edit); err != nil {
+					t.Fatalf("the edit alone was refused: %v", err)
+				}
+				if got := text.ToString(); got != "hlo!" {
+					t.Fatalf("after the edit alone the text is %q, want %q", got, "hlo!")
+				}
+				if *updates != 1 {
+					t.Fatalf("the observers were handed %d updates for the edit alone, want 1", *updates)
+				}
+			})
+		}
+	}
+}
+
+// An update that carries more delete ranges than the cap, each deleting a
+// struct the update itself brings, parks none of them and applies: the check
+// reads the clocks the update's structs leave, not the store's as the apply
+// begins. The structs of one client sit behind those of another in the
+// update (they are inserted between them), so some integrate only once a
+// later client group is in.
+func TestAnUpdateDeletingMoreThanTheCapOfItsOwnStructsApplies(t *testing.T) {
+	const limit = 10
+	first, second := New(WithClientID(1)), New(WithClientID(2))
+	firstText, secondText := first.GetText("t"), second.GetText("t")
+	first.Transact(func(txn *Transaction) { firstText.Insert(txn, 0, strings.Repeat("ab", 2*limit), nil) })
+	if err := ApplyUpdateV1(second, EncodeStateAsUpdateV1(first, nil), nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 * limit {
+		second.Transact(func(txn *Transaction) { secondText.Insert(txn, 3*i+1, "c", nil) })
+	}
+	for i := range 2 * limit {
+		second.Transact(func(txn *Transaction) { secondText.Delete(txn, 2*i, 1) })
+	}
+	want := secondText.ToString()
+	state := EncodeStateAsUpdateV1(second, nil)
+	if got := len(decodeDS(t, state).clients[1]); got <= limit {
+		t.Fatalf("the update deletes %d ranges of client 1, want more than %d", got, limit)
+	}
 	for _, format := range applyFormats {
 		t.Run(format.name, func(t *testing.T) {
-			twin := New(WithClientID(2), WithMaxPendingItems(limit))
-			if err := ApplyUpdateV1(twin, state, nil); err != nil {
-				t.Fatal(err)
+			doc := New()
+			doc.SetMaxPendingItems(limit)
+			if err := applyIn(t, doc, format.v2, state); err != nil {
+				t.Fatalf("the update was refused: %v", err)
 			}
-			if err := applyIn(t, twin, format.v2, refused); !errors.Is(err, ErrInvalidUpdate) {
-				t.Fatalf("the unbounded twin applied the update with err %v, want ErrInvalidUpdate", err)
+			if got := doc.GetText("t").ToString(); got != want {
+				t.Fatalf("the text is %q, want %q", got, want)
 			}
-			if got := twin.GetText("t").ToString(); got != "hlo" {
-				t.Fatalf("the unbounded twin's text is %q after the refusal, want %q: its deletes ran first", got, "hlo")
-			}
-
-			doc := New(WithClientID(1), WithMaxPendingItems(limit), WithMaxIntegrateScan(testScanBound))
-			if err := ApplyUpdateV1(doc, state, nil); err != nil {
-				t.Fatal(err)
-			}
-			text := doc.GetText("t")
-			before, textBefore := EncodeStateAsUpdateV1(doc, nil), text.ToString()
-			updates := observed(doc)
-			err := applyIn(t, doc, format.v2, refused)
-			if !errors.Is(err, ErrInvalidUpdate) {
-				t.Fatalf("the update was applied with err %v, want ErrInvalidUpdate", err)
-			}
-			requireUnchanged(t, doc, before, textBefore, updates)
 			if got := doc.PendingStats().DeleteRanges; got != 0 {
-				t.Fatalf("after the refusal %d delete ranges are parked, want none", got)
-			}
-			if err := applyIn(t, doc, format.v2, deleteRangesUpdate(5, deletesText...)); err != nil {
-				t.Fatalf("the deletes alone were refused: %v", err)
-			}
-			if got := text.ToString(); got != "hlo" {
-				t.Fatalf("after the deletes alone the text is %q, want %q", got, "hlo")
+				t.Fatalf("%d delete ranges are parked, want none", got)
 			}
 		})
 	}
+}
+
+// decodeDS is the delete set of the V1 update.
+func decodeDS(t *testing.T, update []byte) DeleteSet {
+	t.Helper()
+	ds, err := deleteSetOf(newPendingScanner(update, false), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ds
 }
