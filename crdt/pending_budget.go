@@ -54,30 +54,109 @@ func (b *pendingBudget) scanner() *pendingScanner {
 // room for: the check that once ran when the deferred items reached the room
 // left, after the items before them had integrated, runs whole before the
 // first. size is the update's length in bytes. An update with no more structs
-// than the room left cannot pass it and is not read again: a V1 struct takes
-// two bytes of the update at least, so a V1 update of at most twice the room
-// costs a comparison; a V2 update, whose columns can hold many structs in a
-// few bytes, is read past its structs to count them (skipStructs) first.
+// than the room left cannot pass it and is not checked further: a V1 struct
+// takes two bytes of the update at least, so a V1 update of at most twice the
+// room costs a comparison; a V2 update, whose columns can hold many structs in
+// a few bytes, has its structs counted from its group headers first
+// (v2StructCount), which reads no origin, parent or text.
 func (b *pendingBudget) checkBeforeApply(size int) error {
 	if !b.v2 && size/2 <= b.remaining {
 		return nil
 	}
 	if b.v2 && b.v2Start != nil {
-		// A scanner of the update's own decoder, as scanner makes, that
-		// allocates nothing: the column cursors are a copy on the stack, and
-		// the rest cursor is the apply's own (applyV2Txn), which has read
-		// nothing yet and is put back where it began. The scan's error is not
-		// returned from here, so nothing of the scanner escapes; an update
-		// whose structs do not scan fails the same scan in check, which
-		// returns its error.
+		// The count reads a copy of the update's own column cursors, on the
+		// stack, and the apply's own rest cursor, which has read nothing yet
+		// and is put back where it began, so it allocates nothing. An update
+		// whose headers do not read is checked by check, which returns the
+		// error.
 		v2 := *b.v2Start
-		n, err := skipStructs(&pendingScanner{v2: &v2, rest: v2.restDec})
+		n, ok := v2StructCount(&v2)
 		*v2.restDec = b.v2Rest
-		if err == nil && n <= b.remaining {
+		if ok && n <= b.remaining {
 			return nil
 		}
 	}
 	return b.check(b.remaining)
+}
+
+// v2StructCount is how many structs the V2 update d decodes holds, skips
+// included, read from its group headers on the rest cursor, and whether it
+// read them. It is a bound on what the update can park, not a count of it.
+// The first group's header follows the update's group count, so an update of
+// one group, as a keystroke is, costs two numbers. A later group's header
+// follows the rest content of the groups before it, so for every group but
+// the last the info column is read run by run (ReadRun), and only the rest
+// content a struct's kind carries is stepped over: a skip's length, binary
+// bytes, an embed's, format's or subdocument's value, the values of an Any
+// (whose number is on the length column, which GC, Deleted and JSON lengths
+// share and which is read only up to an Any) and a move's three numbers.
+// Origins, parents, keys and strings are on other columns and are not read.
+func v2StructCount(d *v2Decoder) (int, bool) {
+	s := pendingScanner{v2: d, rest: d.restDec}
+	clients := s.uint()
+	if s.err != nil || clients > maxV2Items {
+		return 0, false
+	}
+	var total uint64
+	lens := 0 // length-column entries passed and not yet read
+	for i := range clients {
+		structs := s.uint()
+		total += structs
+		if s.err != nil || total > maxV2Items {
+			return 0, false
+		}
+		if i == clients-1 {
+			break
+		}
+		s.uint() // the group's first clock; its client is on the client column
+		for left := int(structs); left > 0; {
+			info, k, err := d.infoDec.ReadRun(left)
+			if err != nil {
+				return 0, false
+			}
+			left -= k
+			switch info & 0x1f {
+			case 0, wireDeleted, wireJSON:
+				lens += k
+			case wireString, wireType:
+			case wireAny:
+				for range k {
+					for ; lens > 0; lens-- {
+						s.length()
+					}
+					values := s.length()
+					if values > maxV2Items {
+						return 0, false
+					}
+					for range values {
+						s.any()
+					}
+				}
+			case 10:
+				for range k {
+					s.uint()
+				}
+			case wireBinary:
+				for range k {
+					s.bytes()
+				}
+			case wireEmbed, wireFormat, wireDoc:
+				for range k {
+					s.any()
+				}
+			case wireMove:
+				for range 3 * k {
+					s.uint()
+				}
+			default:
+				return 0, false
+			}
+			if s.err != nil {
+				return 0, false
+			}
+		}
+	}
+	return int(total), true
 }
 
 func (b *pendingBudget) check(count int) error {
