@@ -28,8 +28,10 @@ type PeerUpdateInfo struct {
 // info.Update to info.Doc as the room does without a hook, returning the
 // apply's error (an update whose V1 bytes do not decode, or one that
 // overflows MaxPendingItems); a second call returns ErrPeerUpdateApplied
-// without applying anything. The hook runs on the peer's read loop, so the
-// peer's next frame waits for it.
+// without applying anything. An apply that fails after part of the update
+// integrated relays that part, and only that part, to the room's other peers,
+// as the room does without a hook (see applySyncUpdate). The hook runs on the
+// peer's read loop, so the peer's next frame waits for it.
 type PeerUpdateHook func(info PeerUpdateInfo, apply func() error) error
 
 // ErrPeerUpdateApplied is what apply returns when the hook calls it again
@@ -73,7 +75,7 @@ func closeReason(reason string) string {
 func (p *peer) applyPeerUpdate(update []byte) (applied bool, closeWith *PeerClose) {
 	hook := p.server.OnPeerUpdate
 	if hook == nil {
-		if err := crdt.ApplyUpdateV1(p.room.doc, update, p); err != nil {
+		if err := p.applyToRoom(update); err != nil {
 			p.server.log().Debug("discarded unappliable sync message",
 				"room", p.roomName, "err", err)
 			return false, nil
@@ -86,7 +88,7 @@ func (p *peer) applyPeerUpdate(update []byte) (applied bool, closeWith *PeerClos
 			return ErrPeerUpdateApplied
 		}
 		called = true
-		if err := crdt.ApplyUpdateV1(p.room.doc, update, p); err != nil {
+		if err := p.applyToRoom(update); err != nil {
 			return err
 		}
 		applied = true
