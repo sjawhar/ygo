@@ -610,7 +610,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		if r := recover(); r != nil {
 			retErr = recoveredApplyErr(r)
 		}
-		endRemoteApply(txn, retErr != nil)
+		retErr = endRemoteApply(txn, retErr)
 	}()
 
 	dec, err := newV2Decoder(update)

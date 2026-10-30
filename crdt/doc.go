@@ -123,16 +123,17 @@ func WithMaxPendingItems(n int) DocOption {
 // early in a list and no right origin scans to the list's end instead, and an
 // update of n such items scans n times the list - 2,000 of them, about 12 KB,
 // took 20.8 s against a list of 20,000 unmerged items. An update whose scans
-// pass the bound is refused with ErrIntegrateScanBudget, and like every remote
-// update the bounded document refuses, it leaves the document as it was and
-// fires no observer. The drain of the pending queue an update's apply ends
-// with has an allowance of its own, the bound again; a drain that would pass
-// it is taken back and the queue parked again as it was, while the update
-// stands, and the queue is drained again once an apply brings a clock it waits
-// on further (apply_rollback.go). Such a document refuses a remote update
-// carrying a subdocument or a move. Zero or negative, the default, sets no
-// bound. Local transactions are never bounded: their inserts name both
-// neighbours.
+// would pass the bound is refused with ErrIntegrateScanBudget, and like every
+// remote update the bounded document refuses, it leaves the document as it was,
+// fires no observer, and is returned as a RefusedUpdateError reporting what its
+// scans passed. The drain of the pending queue an update's apply ends with has
+// an allowance of its own, the bound again; a drain that would pass it is taken
+// back and the queue parked again as it was, while the update stands, and the
+// queue is drained again once an apply brings a clock it waits on further
+// (apply_rollback.go). Such a document refuses a remote update carrying a
+// subdocument or a move. Zero or negative, the default, sets no bound. Local
+// transactions are never bounded: their inserts name both neighbours. A budget
+// (WithIntegrateScanBudget) takes the bound's place while it is set.
 func WithMaxIntegrateScan(n int) DocOption {
 	return func(d *Doc) { d.maxIntegrateScan = n }
 }
@@ -144,6 +145,45 @@ func (d *Doc) SetMaxIntegrateScan(n int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.maxIntegrateScan = n
+}
+
+// WithIntegrateScanBudget bounds the conflict scans of each remote update by an
+// allowance of its own: as each remote apply (ApplyUpdate and its V1 and V2
+// forms) begins, the document calls budget with the apply's origin, and the
+// items that apply's scans pass, the drain of the pending queue it ends with
+// included, may number at most what budget returns; zero or negative leaves
+// that one apply's scans unbounded. One fixed bound has to hold the largest
+// honest update - a peer handing over a whole state edited offline scans what
+// others wrote meanwhile at every place it wrote too - so it lets a small
+// update scan as much; a budget lets the owner size each update's allowance by
+// what it can see of the update before applying it, such as the structs it
+// carries, keyed by the origin it applies it with. An update whose own scans
+// would pass its allowance is refused, with ErrIntegrateScanBudget, as under
+// WithMaxIntegrateScan; a drain whose scans would pass what the update left of
+// it is taken back and the queue parked again as it was, while the update
+// stands, and the queue is drained again once an apply brings a clock it waits
+// on further (apply_rollback.go).
+//
+// An owner keeping an account of scans learns what each apply cost from
+// Transaction.IntegrateScanned in an OnAfterTransaction observer when the
+// apply commits, and from RefusedUpdateError.Scanned when the document
+// refused it; either is at most what budget returned for it, when positive.
+//
+// A document with a budget is a bounded document whatever budget returns: it
+// applies every remote update whole or not at all, and refuses a remote update
+// carrying a subdocument or a move. While a budget is set, the bound of
+// WithMaxIntegrateScan is not used. budget runs under the document's lock, so
+// it must not call the document. Local transactions are never bounded.
+func WithIntegrateScanBudget(budget func(origin any) int) DocOption {
+	return func(d *Doc) { d.integrateScanBudget = budget }
+}
+
+// SetIntegrateScanBudget sets the budget of WithIntegrateScanBudget on a
+// document already made, or with nil removes it. It takes the document lock.
+func (d *Doc) SetIntegrateScanBudget(budget func(origin any) int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.integrateScanBudget = budget
 }
 
 // updateSub pairs a unique subscription ID with its callback so that
@@ -188,8 +228,10 @@ type Doc struct {
 	onSubdocs       []subdocsSub
 	maxPendingItems int // 0 = use defaultMaxPendingItems; see WithMaxPendingItems and #46
 	// maxIntegrateScan is the scan bound of WithMaxIntegrateScan; zero or
-	// negative for none.
-	maxIntegrateScan int
+	// negative for none. integrateScanBudget is the budget of
+	// WithIntegrateScanBudget, which takes the bound's place while set.
+	maxIntegrateScan    int
+	integrateScanBudget func(origin any) int
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -280,9 +322,20 @@ func (d *Doc) Load() {
 	})
 }
 
-// integrateScanLimit is the bound of WithMaxIntegrateScan, or 0 for none.
-// Its caller holds d.mu.
-func (d *Doc) integrateScanLimit() int {
+// scanBounded is whether d bounds the conflict scans of its remote updates, by
+// a bound (WithMaxIntegrateScan) or a budget (WithIntegrateScanBudget), and so
+// applies each whole or not at all. Its caller holds d.mu.
+func (d *Doc) scanBounded() bool {
+	return d.integrateScanBudget != nil || d.maxIntegrateScan > 0
+}
+
+// applyScanLimit is the most items the conflict scans of a remote apply with
+// origin may pass on d, or 0 for no limit: what d's budget returns for origin
+// when it has one, otherwise its bound. Its caller holds d.mu.
+func (d *Doc) applyScanLimit(origin any) int {
+	if d.integrateScanBudget != nil {
+		return max(d.integrateScanBudget(origin), 0)
+	}
 	return max(d.maxIntegrateScan, 0)
 }
 

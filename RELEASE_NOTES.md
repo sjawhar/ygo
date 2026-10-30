@@ -23,6 +23,17 @@ many seconds and allocate gigabytes:
   its transaction fires no observer, so nothing of it is persisted or relayed.
   A bounded document refuses a remote update that carries a subdocument or a
   move. Local transactions are never bounded, and no bound is set by default.
+  An owner that sizes each update's allowance itself, by who sent it or what
+  remains of a total it keeps per document, sets a budget instead with
+  `WithIntegrateScanBudget` or `Doc.SetIntegrateScanBudget`: a function the
+  document asks, under its lock, with each remote apply's origin, whose answer
+  bounds that apply's scans, the drain of the pending queue included. A budget
+  makes the document bounded as a bound does, and takes the bound's place
+  while it is set. `Transaction.IntegrateScanned` reports what every
+  transaction's scans passed, on any document, and a bounded document returns
+  a refused update's error as a `*RefusedUpdateError` whose `Scanned` is what
+  the refused apply's scans passed; `errors.Is` and `errors.As` match the
+  wrapped error as before.
 - **The merge at commit.** An update that splits one run many times, leaving
   each half where it merges back at commit, made each merge copy the run's
   whole text and shift the client's store slice: 20,000 halves of a
