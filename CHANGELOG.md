@@ -296,10 +296,9 @@ CHANGELOG of the v1.51.3-sami.9 tag.
   (reearth/ygo#341)
 - **`provider/websocket`: a peer the server closes while its read loop runs
   no longer has its buffered input handled.** When the server closed a
-  connection itself, for a
-  full write queue (on a direct send, or on a broadcast under
-  `SlowPeerDisconnect`), for a Hocuspocus close message, for a cancelled
-  request context without a close code, in `Shutdown`, or in
+  connection itself, for a full write queue (on a direct send, or on a
+  broadcast under `SlowPeerDisconnect`), for a Hocuspocus close message, for a
+  cancelled request context without a close code, in `Shutdown`, or in
   `CloseRoom(name, true)`, the read loop still handled the messages already
   in its read buffer (up to about 4 KiB). For a client that sent SyncStep1 and
   never read, the server encoded the room's full state for each of them (up
@@ -307,10 +306,10 @@ CHANGELOG of the v1.51.3-sami.9 tag.
   Updates in that input were applied after the close, and stored too after
   `Shutdown` or `CloseRoom`. The read loop now drops that input, as it
   already did after a queued close, and so does every other close the server
-  makes, a failed write (reearth/ygo#339) and the byte budget
-  (reearth/ygo#342) included. Runtime change: updates a client sent but the
-  server had not read when it closed the connection are not saved; a client
-  that reconnects sends them again. (reearth/ygo#343)
+  makes while the read loop runs, a failed write (reearth/ygo#339) and the
+  byte budget (reearth/ygo#342) included. Runtime change: updates a client
+  sent but the server had not read when it closed the connection are not
+  saved; a client that reconnects sends them again. (reearth/ygo#343)
 - **`crdt`: an update can no longer leave a document holding a clock or
   client its own state encodings cannot carry.** The decoders took clocks
   past 2^53-1, which no Yjs peer can create (JavaScript's
