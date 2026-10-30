@@ -38,8 +38,9 @@ type Transaction struct {
 	scanMarks  map[*Item]scanMark
 	scanSerial uint32
 	// journal is the record a remote apply on a document with a scan bound
-	// keeps to undo itself on failure, and rolledBack whether it did, so the
-	// commit fires nothing (apply_rollback.go).
+	// keeps to undo itself on failure, and rolledBack whether it did, or the
+	// apply refused its update before changing anything (checkParkedDeletes),
+	// so the commit fires nothing (apply_rollback.go).
 	journal    *applyJournal
 	rolledBack bool
 	// rearbitrate queues, per parent, move targets whose winning ContentMove

@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"cmp"
+	"math"
 	"slices"
 	"sort"
 )
@@ -271,6 +272,112 @@ func parkedDeleteRangesAfter(pending, ds DeleteSet) int {
 		n += mergedRangeCount(pending.clients[client], add)
 	}
 	return n
+}
+
+// deleteSetOf is the delete set of the update s scans, a V1 one or a V2 one,
+// read past its structs without keeping anything of them.
+func deleteSetOf(s *pendingScanner, v2 bool) (DeleteSet, error) {
+	if s.err != nil {
+		return DeleteSet{}, s.err
+	}
+	clients := s.uint()
+	if clients > maxV2Items {
+		return DeleteSet{}, ErrInvalidUpdate
+	}
+	var total uint64
+	for i := uint64(0); i < clients && s.err == nil; i++ {
+		n := s.uint()
+		total += n
+		if total > maxV2Items {
+			return DeleteSet{}, ErrInvalidUpdate
+		}
+		s.client()
+		s.uint()
+		for j := uint64(0); j < n && s.err == nil; j++ {
+			s.item()
+		}
+	}
+	if s.err != nil {
+		return DeleteSet{}, s.err
+	}
+	if v2 {
+		return decodeDeleteSetV2(s.v2)
+	}
+	return decodeDeleteSet(s.rest)
+}
+
+// structClocksOf is the store's state vector once the structs of the update s
+// scans are in, on a store whose state vector is sv as the apply begins. The
+// clocks are found as the pending budget finds them (scanPendingGroups,
+// resolvePendingGroups): a struct is in once its clock follows its client's
+// and its origin, right origin and parent are in, from the store or from the
+// update itself in any order. Items an earlier update parked do not count: the
+// drain that can integrate them runs after the update's delete set is parked.
+func structClocksOf(sv StateVector, s *pendingScanner) (StateVector, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	known := make(StateVector, len(sv))
+	for client, clock := range sv {
+		known[client] = clock
+	}
+	pass, err := scanPendingGroups(s, known, math.MaxInt, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(pass.groups) > 0 {
+		if err := resolvePendingGroups(pass.groups, known); err != nil {
+			return nil, err
+		}
+	}
+	return known, nil
+}
+
+// parkedPartsOf is what applyToPartial parks of ds on a store whose state
+// vector is clocks.
+func parkedPartsOf(ds DeleteSet, clocks StateVector) DeleteSet {
+	parked := newDeleteSet()
+	for client, ranges := range ds.clients {
+		next := clocks.Clock(client)
+		for _, r := range ranges {
+			if part, parks := parkedPart(r, next); parks {
+				parked.clients[client] = append(parked.clients[client], part)
+			}
+		}
+	}
+	return parked
+}
+
+// parkingRanges is how many ranges of ds would park some part on a store whose
+// state vector is sv. The update's structs can only move the store's clocks
+// past sv, so no more of them park once they are in.
+func parkingRanges(ds DeleteSet, sv StateVector) int {
+	n := 0
+	for client, ranges := range ds.clients {
+		next := sv.Clock(client)
+		for _, r := range ranges {
+			if _, parks := parkedPart(r, next); parks {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// parkedPart is the part of r, a delete range of a client the store holds up
+// to next, that applyToPartial parks, and whether it parks any: every range as
+// it is when the store holds nothing of the client, a range whose end wraps
+// whole, and otherwise what lies at or past next.
+func parkedPart(r DeleteRange, next uint64) (DeleteRange, bool) {
+	end := r.Clock + r.Len
+	switch {
+	case next == 0, end < r.Clock:
+		return r, true
+	case r.Len == 0, end <= next:
+		return DeleteRange{}, false
+	}
+	start := max(r.Clock, next)
+	return DeleteRange{Clock: start, Len: end - start}, true
 }
 
 // mergedRangeCount is how many ranges sortAndCompact leaves of have and add

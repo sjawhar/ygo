@@ -515,6 +515,12 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	// Snapshot state vector before applying anything (used for skip/offset logic).
 	sv := txn.doc.store.StateVector()
 	beginRemoteApply(txn, sv)
+	scanner := func() *pendingScanner { return newPendingScanner(update, false) }
+	if err := checkParkedDeletes(txn.doc, sv, len(update), scanner, false); err != nil {
+		// Refused before anything changed: the commit tells no observer.
+		txn.rolledBack = true
+		return err
+	}
 
 	numClients, err := dec.ReadVarUint()
 	if err != nil {
@@ -541,11 +547,7 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
-	unresolvableDs := ds.applyToPartial(txn)
-	if len(unresolvableDs.clients) > 0 {
-		if err := checkParkedDeletes(txn.doc, unresolvableDs); err != nil {
-			return err
-		}
+	if unresolvableDs := ds.applyToPartial(txn); len(unresolvableDs.clients) > 0 {
 		parkDeletes(txn, unresolvableDs)
 	}
 
@@ -729,26 +731,53 @@ func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	return nil
 }
 
-// checkParkedDeletes refuses an update whose delete ranges, ds, the store
-// cannot apply yet, when parking them would grow the parked delete ranges past
-// the cap the pending queue has for parked items (WithMaxPendingItems): the
-// same ErrInvalidUpdate at the same point, before anything is parked, as
-// resolveWithinUpdatePending gives for parked items. The count is taken after
-// the merge, and an update that adds no range is never refused: a delete set
-// sent again, as a peer that synced the parked ranges sends them back, or one
-// that joins parked ranges, passes even on a document that holds more than the
-// cap because it loaded a stored state with the cap lifted (SetMaxPendingItems).
-func checkParkedDeletes(doc *Doc, ds DeleteSet) error {
+// checkParkedDeletes refuses a remote update, V1 or V2, when its delete set
+// would grow the parked delete ranges past the cap the pending queue has for
+// parked items (WithMaxPendingItems). It runs before the apply changes
+// anything, so a refused update leaves every document as it was, with or
+// without a scan bound: no struct is integrated, no delete applied and no
+// observer told. sv is the store's state vector as the apply begins, size the
+// update's length in bytes, and scanner starts a scan of the update.
+//
+// The ranges an update parks are the parts of its delete set past the store's
+// next clock for their client once the update's structs are in
+// (applyToPartial). The count is taken after the merge, and an update that
+// adds no range is never refused: a delete set sent again, as a peer that
+// synced the parked ranges sends them back, or one that joins parked ranges,
+// passes even on a document that holds more than the cap because it loaded a
+// stored state with the cap lifted (SetMaxPendingItems).
+//
+// It costs what the update can do. Each range of a delete set takes two bytes
+// of the update at least, its clock and its length, so an update too short to
+// carry more ranges than the cap has room for costs a comparison: a keystroke
+// on a document below the cap is never read twice. A longer one is read past
+// its structs for its delete set, and only when more of its ranges reach past
+// the store than the cap has room for are the clocks its structs leave
+// resolved (structClocksOf).
+func checkParkedDeletes(doc *Doc, sv StateVector, size int, scanner func() *pendingScanner, v2 bool) error {
+	limit := doc.maxPendingItemsLimit()
 	pending := doc.store.pendingDs
-	after := parkedDeleteRangesAfter(pending, ds)
-	if after <= doc.maxPendingItemsLimit() {
-		return nil
-	}
 	before := 0
 	for _, ranges := range pending.clients {
 		before += len(ranges)
 	}
-	if after <= before {
+	room := max(limit-before, 0)
+	if size/2 <= room {
+		return nil
+	}
+	ds, err := deleteSetOf(scanner(), v2)
+	if err != nil {
+		return wrapUpdateErr(err)
+	}
+	if n := parkingRanges(ds, sv); n == 0 || n <= room {
+		return nil
+	}
+	clocks, err := structClocksOf(sv, scanner())
+	if err != nil {
+		return wrapUpdateErr(err)
+	}
+	after := parkedDeleteRangesAfter(pending, parkedPartsOf(ds, clocks))
+	if after <= limit || after <= before {
 		return nil
 	}
 	return wrapUpdateErr(ErrInvalidUpdate)
