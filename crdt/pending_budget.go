@@ -49,49 +49,45 @@ func (b *pendingBudget) scanner() *pendingScanner {
 	return &pendingScanner{v2: &v2, rest: &rest}
 }
 
-// checkBeforeApply refuses the update, before the apply integrates any of it,
-// when its structs would leave more items parked than the pending cap has
-// room for: the check that once ran when the deferred items reached the room
-// left, after the items before them had integrated, runs whole before the
-// first. size is the update's length in bytes. An update with no more structs
-// than the room left cannot pass it and is not checked further: a V1 struct
-// takes two bytes of the update at least, so a V1 update of at most twice the
-// room costs a comparison; a V2 update, whose columns can hold many structs in
-// a few bytes, has its structs counted from its group headers first
-// (v2StructCount), which reads no origin, parent or text.
-func (b *pendingBudget) checkBeforeApply(size int) error {
-	if !b.v2 && size/2 <= b.remaining {
-		return nil
+// mayParkPastRoom is whether the update's structs may leave more items parked
+// than the pending cap has room for, by a bound that costs nothing to read:
+// a V1 struct takes two bytes of the update at least, so a V1 update of at
+// most twice the room cannot; a V2 update, whose columns can hold many structs
+// in a few bytes, cannot when its group headers hold no more structs than the
+// room (v2StructCount, which for an update of one group, as a keystroke is,
+// reads two numbers). size is the update's length in bytes.
+func (b *pendingBudget) mayParkPastRoom(size int) bool {
+	if !b.v2 {
+		return size/2 > b.remaining
 	}
-	if b.v2 && b.v2Start != nil {
-		// The count reads a copy of the update's own column cursors, on the
-		// stack, and the apply's own rest cursor, which has read nothing yet
-		// and is put back where it began, so it allocates nothing. An update
-		// whose headers do not read is checked by check, which returns the
-		// error.
-		v2 := *b.v2Start
-		n, ok := v2StructCount(&v2)
-		*v2.restDec = b.v2Rest
-		if ok && n <= b.remaining {
-			return nil
-		}
+	if b.v2Start == nil {
+		return true
 	}
-	return b.check(b.remaining)
+	// The count reads a copy of the update's own column cursors, on the
+	// stack, and the apply's own rest cursor, which has read nothing yet and
+	// is put back where it began, so it allocates nothing. Headers that do not
+	// read leave the question to the exact check, which returns the error.
+	v2 := *b.v2Start
+	n, ok := v2StructCount(&v2, false)
+	*v2.restDec = b.v2Rest
+	return !ok || n > b.remaining
 }
 
 // v2StructCount is how many structs the V2 update d decodes holds, skips
 // included, read from its group headers on the rest cursor, and whether it
 // read them. It is a bound on what the update can park, not a count of it.
 // The first group's header follows the update's group count, so an update of
-// one group, as a keystroke is, costs two numbers. A later group's header
-// follows the rest content of the groups before it, so for every group but
-// the last the info column is read run by run (ReadRun), and only the rest
+// one group, as a keystroke is, costs two numbers unless toEnd asks for the
+// rest cursor to be left at the delete set. A later group's header follows the
+// rest content of the groups before it, so for every group but the last (and
+// for the last too under toEnd) the info column is read run by run (ReadRun),
+// and only the rest
 // content a struct's kind carries is stepped over: a skip's length, binary
 // bytes, an embed's, format's or subdocument's value, the values of an Any
 // (whose number is on the length column, which GC, Deleted and JSON lengths
 // share and which is read only up to an Any) and a move's three numbers.
 // Origins, parents, keys and strings are on other columns and are not read.
-func v2StructCount(d *v2Decoder) (int, bool) {
+func v2StructCount(d *v2Decoder, toEnd bool) (int, bool) {
 	s := pendingScanner{v2: d, rest: d.restDec}
 	clients := s.uint()
 	if s.err != nil || clients > maxV2Items {
@@ -105,7 +101,7 @@ func v2StructCount(d *v2Decoder) (int, bool) {
 		if s.err != nil || total > maxV2Items {
 			return 0, false
 		}
-		if i == clients-1 {
+		if i == clients-1 && !toEnd {
 			break
 		}
 		s.uint() // the group's first clock; its client is on the client column

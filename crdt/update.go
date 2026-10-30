@@ -791,63 +791,92 @@ func parkDeferredItem(txn *Transaction, item *Item) error {
 
 // refuseBeforeApply is where a remote apply refuses an update for the pending
 // cap (WithMaxPendingItems), before it changes anything: when the update's
-// structs would park more items than the cap has room for (budget,
-// pendingBudget.checkBeforeApply) or its delete set would grow the parked
-// delete ranges past it (checkParkedDeletes). A refused apply is marked rolled
-// back, so its commit tells no observer: the document, with or without a scan
-// bound, is as it was, and nothing of the update is persisted or relayed. sv
-// is the store's state vector as the apply begins and size the update's length
-// in bytes.
+// structs would park more items than the cap has room for, or its delete set
+// would grow the parked delete ranges past it (checkPendingCap). A refused
+// apply is marked rolled back, so its commit tells no observer: the document,
+// with or without a scan bound, is as it was, and nothing of the update is
+// persisted or relayed. sv is the store's state vector as the apply begins
+// and size the update's length in bytes.
 func refuseBeforeApply(txn *Transaction, sv StateVector, size int, budget *pendingBudget) error {
-	err := budget.checkBeforeApply(size)
-	if err == nil {
-		err = checkParkedDeletes(txn.doc, sv, size, budget.scanner, budget.v2)
-	}
+	err := checkPendingCap(txn.doc, sv, size, budget)
 	if err != nil {
 		txn.rolledBack = true
 	}
 	return err
 }
 
+// checkPendingCap is refuseBeforeApply's decision. It costs what the update
+// can do. Two bounds that cost nothing to read come first: whether the
+// update's structs may park more items than the room left
+// (pendingBudget.mayParkPastRoom), and whether it is long enough to carry more
+// delete ranges than the room left for them (each range takes two bytes at
+// least). An update that passes neither, as every keystroke on a document
+// below the cap does, is not read. Otherwise one walk of its struct section
+// (frameStructs) bounds its structs and leaves the scan at its delete set,
+// whose ranges that could park are counted as they are read
+// (parkingRangesBound). Only a bound past its room runs the exact check: the
+// pending budget's preflight for items (pendingBudget.check), and for delete
+// ranges checkParkedDeletes.
+func checkPendingCap(doc *Doc, sv StateVector, size int, b *pendingBudget) error {
+	limit := doc.maxPendingItemsLimit()
+	before := 0
+	for _, ranges := range doc.store.pendingDs.clients {
+		before += len(ranges)
+	}
+	rangeRoom := max(limit-before, 0)
+	items, ranges := b.mayParkPastRoom(size), size/2 > rangeRoom
+	if !items && !ranges {
+		return nil
+	}
+	s := b.scanner()
+	n, err := frameStructs(s)
+	if err != nil {
+		return wrapUpdateErr(err)
+	}
+	if items && n > b.remaining {
+		if err := b.check(b.remaining); err != nil {
+			return err
+		}
+	}
+	if !ranges {
+		return nil
+	}
+	if p, err := parkingRangesBound(s, sv); err != nil {
+		return wrapUpdateErr(err)
+	} else if p <= rangeRoom {
+		return nil
+	}
+	return checkParkedDeletes(doc, sv, b.scanner, b.v2)
+}
+
 // checkParkedDeletes refuses a remote update, V1 or V2, when its delete set
 // would grow the parked delete ranges past the cap the pending queue has for
 // parked items (WithMaxPendingItems). It runs before the apply changes
-// anything, so a refused update leaves every document as it was, with or
-// without a scan bound: no struct is integrated, no delete applied and no
-// observer told. sv is the store's state vector as the apply begins, size the
-// update's length in bytes, and scanner starts a scan of the update.
+// anything (checkPendingCap), so a refused update leaves every document as it
+// was, with or without a scan bound: no struct is integrated, no delete
+// applied and no observer told. sv is the store's state vector as the apply
+// begins, and scanner starts a scan of the update.
 //
 // The ranges an update parks are the parts of its delete set past the store's
 // next clock for their client once the update's structs are in
-// (applyToPartial). The count is taken after the merge, and an update that
-// adds no range is never refused: a delete set sent again, as a peer that
-// synced the parked ranges sends them back, or one that joins parked ranges,
-// passes even on a document that holds more than the cap because it loaded a
-// stored state with the cap lifted (SetMaxPendingItems).
-//
-// It costs what the update can do. Each range of a delete set takes two bytes
-// of the update at least, its clock and its length, so an update too short to
-// carry more ranges than the cap has room for costs a comparison: a keystroke
-// on a document below the cap is never read twice. A longer one is read past
-// its structs for its delete set, and only when more of its ranges reach past
-// the store than the cap has room for are the clocks its structs leave
-// resolved (structClocksOf).
-func checkParkedDeletes(doc *Doc, sv StateVector, size int, scanner func() *pendingScanner, v2 bool) error {
+// (applyToPartial), the clocks its structs leave (structClocksOf). The count
+// is taken after the merge, and an update that adds no range is never refused:
+// a delete set sent again, as a peer that synced the parked ranges sends them
+// back, or one that joins parked ranges, passes even on a document that holds
+// more than the cap because it loaded a stored state with the cap lifted
+// (SetMaxPendingItems).
+func checkParkedDeletes(doc *Doc, sv StateVector, scanner func() *pendingScanner, v2 bool) error {
 	limit := doc.maxPendingItemsLimit()
 	pending := doc.store.pendingDs
 	before := 0
 	for _, ranges := range pending.clients {
 		before += len(ranges)
 	}
-	room := max(limit-before, 0)
-	if size/2 <= room {
-		return nil
-	}
 	ds, err := deleteSetOf(scanner(), v2)
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
-	if n := parkingRanges(ds, sv); n == 0 || n <= room {
+	if n := parkingRanges(ds, sv); n == 0 || n <= max(limit-before, 0) {
 		return nil
 	}
 	clocks, err := structClocksOf(sv, scanner())

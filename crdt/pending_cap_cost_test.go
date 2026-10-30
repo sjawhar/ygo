@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"math/rand/v2"
+	"reflect"
 	"testing"
 )
 
@@ -29,7 +30,7 @@ func TestThePendingCapCheckAllocatesNothingForAKeystroke(t *testing.T) {
 
 	v1 := newPendingBudget(doc, docSV, keystroke, false)
 	if n := testing.AllocsPerRun(100, func() {
-		if err := v1.checkBeforeApply(len(keystroke)); err != nil {
+		if err := checkPendingCap(doc, docSV, len(keystroke), &v1); err != nil {
 			t.Fatal(err)
 		}
 	}); n != 0 {
@@ -44,7 +45,7 @@ func TestThePendingCapCheckAllocatesNothingForAKeystroke(t *testing.T) {
 	v2 := newPendingBudget(doc, docSV, keystrokeV2, true)
 	v2.v2Start, v2.v2Rest = &initial, *dec.restDec
 	if n := testing.AllocsPerRun(100, func() {
-		if err := v2.checkBeforeApply(len(keystrokeV2)); err != nil {
+		if err := checkPendingCap(doc, docSV, len(keystrokeV2), &v2); err != nil {
 			t.Fatal(err)
 		}
 	}); n != 0 {
@@ -93,8 +94,47 @@ func TestV2StructCountIsTheScannedCount(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got, ok := v2StructCount(d); !ok || got != want {
+		if got, ok := v2StructCount(d, false); !ok || got != want {
 			t.Fatalf("v2StructCount = %d, %v; the scan reads %d structs", got, ok, want)
+		}
+		// The walk to the end of the struct section, V1 and V2, counts the
+		// same structs and leaves the scan where the full scan leaves it: at
+		// the delete set, which reads the same from both.
+		for _, isV2 := range []bool{false, true} {
+			update := v1
+			if isV2 {
+				update = v2
+			}
+			full := newPendingScanner(update, isV2)
+			for range full.uint() {
+				n := full.uint()
+				full.client()
+				full.uint()
+				for range n {
+					full.item()
+				}
+			}
+			f := newPendingScanner(update, isV2)
+			got, err := frameStructs(f)
+			if err != nil || got != want {
+				t.Fatalf("frameStructs (V2 %v) = %d, %v; the scan reads %d structs", isV2, got, err, want)
+			}
+			read := func(s *pendingScanner) DeleteSet {
+				var ds DeleteSet
+				var err error
+				if isV2 {
+					ds, err = decodeDeleteSetV2(s.v2)
+				} else {
+					ds, err = decodeDeleteSet(s.rest)
+				}
+				if err != nil || s.err != nil {
+					t.Fatalf("V2 %v: %v %v", isV2, err, s.err)
+				}
+				return ds
+			}
+			if gotDS, wantDS := read(f), read(full); !reflect.DeepEqual(gotDS.clients, wantDS.clients) {
+				t.Fatalf("the delete set read after the walk (V2 %v) is %v, after the full scan %v", isV2, gotDS.clients, wantDS.clients)
+			}
 		}
 	}
 	rng := rand.New(rand.NewPCG(340, 2526))
