@@ -87,8 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rolls the apply back, a malformed update included, is returned as a
   `*RefusedUpdateError`. A caller using `errors.Is` or `errors.As` needs no
   change; one that type-asserts the concrete error type must now expect the
-  wrapper. A panic in the budget callback refuses the update with an error
-  that names the callback, and the zero `RefusedUpdateError` is safe to print.
+  wrapper. A panic in the budget callback refuses the update before the apply
+  changes anything, with an error that names the callback and no observer
+  told. The zero `RefusedUpdateError` is safe to print.
   The count is exactly what the bound measures: a document bounded
   at the count takes the update, and one bounded one item under it refuses it.
   Decoding a document's whole state into a fresh document is a remote apply
