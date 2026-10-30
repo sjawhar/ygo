@@ -137,8 +137,6 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	if !d.scanBounded() {
 		return
 	}
-	state := txn.beginBoundedApply()
-	state.scanLimit = d.applyScanLimit(txn.Origin)
 	s := d.store
 	j := &applyJournal{start: pointNow(txn, before), drainOwnAllowance: d.integrateScanBudget == nil}
 	j.at = &j.start
@@ -149,7 +147,10 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	}
 	j.pendingDs = s.pendingDs
 	j.pendingMoves = clonePendingMoves(s.pendingMoves)
+	state := txn.beginBoundedApply()
 	state.journal = j
+	// After the journal, so its rollback refuses an apply whose callback panics.
+	state.scanLimit = d.applyScanLimit(txn.Origin)
 }
 
 // clonePendingMoves copies the pending moves, each client's slice included:

@@ -387,6 +387,41 @@ func TestUnit_IntegrateScanBudget_APanicFromTheBudgetCallbackIsReportedAsTheCall
 	}
 }
 
+// A panic from the budget callback is a RefusedUpdateError that hands no
+// observer an update, in V1 and V2.
+func TestUnit_IntegrateScanBudget_APanicFromTheBudgetCallbackTellsNoObserver(t *testing.T) {
+	writer := New(WithClientID(2))
+	written := writer.GetText("t")
+	writer.Transact(func(txn *Transaction) { written.Insert(txn, 0, "hi", nil) })
+	update := EncodeStateAsUpdateV1(writer, nil)
+	updateV2, err := UpdateV1ToV2(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name  string
+		apply func(*Doc) error
+	}{
+		{"V1", func(d *Doc) error { return ApplyUpdateV1(d, update, "peer") }},
+		{"V2", func(d *Doc) error { return ApplyUpdateV2(d, updateV2, "peer") }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			doc := New(WithClientID(1))
+			doc.SetIntegrateScanBudget(func(any) int { panic("boom in the budget") })
+			var handed [][]byte
+			doc.OnUpdate(func(u []byte, _ any) { handed = append(handed, u) })
+			err := c.apply(doc)
+			if len(handed) != 0 {
+				t.Fatalf("the observers were handed %x, want nothing (err %v)", handed, err)
+			}
+			var refused *RefusedUpdateError
+			if !errors.As(err, &refused) {
+				t.Fatalf("apply returned %v, want a RefusedUpdateError", err)
+			}
+		})
+	}
+}
+
 // The zero RefusedUpdateError does not panic in Error, and errors.As onto it
 // reads its fields.
 func TestUnit_IntegrateScanBudget_TheZeroRefusedUpdateErrorIsSafe(t *testing.T) {
