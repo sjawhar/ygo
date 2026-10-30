@@ -19,7 +19,7 @@ upstream v1.51.2. Every change it carries is bound for upstream.
 | The pending cap refuses an update before it changes the document; an update that fails partway drains the queue on what it kept | reearth/ygo#340 | 985d956d |
 | A relay-injected update that fails partway reaches the node's peers with what the room kept | reearth/ygo#341 | 1f0774d1 |
 | `Server.PeerWriteQueueBytes`, a per-peer bound on the bytes waiting in a peer's write queue | reearth/ygo#342 | 68e15217 |
-| Every close the server makes drops the closed peer's buffered input | reearth/ygo#343 | 533d8afd |
+| A peer the server closes while its read loop runs no longer has its buffered input handled | reearth/ygo#343 | 533d8afd |
 | A struct sent again while it waits in the pending queue parks once | reearth/ygo#344 | d64c28d0 |
 
 **What leaves with the v1.51.3-sami.N line.** Each change of that line that is
@@ -342,24 +342,30 @@ peer that applied the relayed part integrated it. A bounded document
 (`WithMaxIntegrateScan`, `WithIntegrateScanBudget`) still rolls such an
 update back whole, so it drains nothing for it.
 
-The cost of this whole release against upstream v1.54.0, measured with
-MEASURE_ME interleaved samples on one pinned core of the benchmarks in
+The cost of this whole release against upstream v1.54.0, measured with 20
+interleaved samples on one pinned core of the benchmarks in
 `crdt/bench_large_update_test.go` and `crdt/bench_test.go`. It is not #340's
 cost alone: every member that changes the apply path is in it.
 `BenchmarkApplyLargeUpdateV1` and `BenchmarkApplyLargeUpdateV2` apply a
-whole-document update (MEASURE_ME MiB in V1, MEASURE_ME MiB in V2, MEASURE_ME
-structs) to an empty document at the default cap of 100,000, which leaves
-less room than the update has structs, so the full check runs. In V2 the
-apply takes MEASURE_ME% longer (MEASURE_ME ms to MEASURE_ME ms,
-p=MEASURE_ME); in V1 it takes MEASURE_ME% longer (MEASURE_ME ms to
-MEASURE_ME ms, p=MEASURE_ME). `BenchmarkApplyLargeUpdateHighCapV1` and
+whole-document update (3.1 MiB in V1, 2.6 MiB in V2, 138,183 structs) to an
+empty document at the default cap of 100,000, which leaves less room than the
+update has structs, so the full check runs. On the shared host the samples
+spread by 6% to 10%, and no time change is above that noise: in V2 the apply
+went from 157.6 ms to 165.2 ms (p=0.678), and in V1 from 186.6 ms to
+185.6 ms (p=0.968). `BenchmarkApplyLargeUpdateHighCapV1` and
 `BenchmarkApplyLargeUpdateHighCapV2` apply the same update at a cap above its
-struct count (Dispatch's, 1<<20), where only the cheap bound runs: MEASURE_ME%
-in V1 (p=MEASURE_ME) and MEASURE_ME% in V2 (MEASURE_ME ms to MEASURE_ME ms,
-p=MEASURE_ME). The small-update benchmarks (`BenchmarkApplyUpdateV1`,
-`BenchmarkApplyUpdateV2` and their `_Bulk` forms) take MEASURE_ME% to
-MEASURE_ME% longer (p from MEASURE_ME to MEASURE_ME). Allocations per apply
-change by MEASURE_ME in count and by MEASURE_ME in bytes.
+struct count (Dispatch's, 1<<20), where only the cheap bound runs: V1 went
+from 181.9 ms to 173.7 ms (p=0.060), and V2 from 161.6 ms to 158.5 ms
+(p=0.565). The small-update benchmarks (`BenchmarkApplyUpdateV1`,
+`BenchmarkApplyUpdateV2` and their `_Bulk` forms) are within noise (p from
+0.478 to 0.952). CPU profiles of 300 applies of each large V2 benchmark show
+where the work is: the one walk of the update's groups before the apply costs
+what upstream's own walk costs (1.20 s against 1.33 s, for 300 applies), and
+at the default cap #340's check adds a first pass of 1.11 s, about 3.7 ms per
+apply. Allocations per apply are unchanged in count for the small updates,
+147 fewer for the large V1 update and 6 more for the large V2 update. Bytes
+per apply change by -2.3% for the large V1 update, +0.04% for the large V2
+update, and +192 bytes (+0.08% to +5.0%) for the small updates.
 
 ### `Server.PeerWriteQueueBytes`, a per-peer bound on the bytes waiting in a peer's write queue (reearth/ygo#342)
 
@@ -397,7 +403,7 @@ handshake and the frame being written.
 Zero, the default, or a negative value means no byte budget: nothing changes
 for a server that does not set it.
 
-### Every close the server makes drops the closed peer's buffered input (reearth/ygo#343)
+### A peer the server closes while its read loop runs no longer has its buffered input handled (reearth/ygo#343)
 
 **Who is affected: a `provider/websocket` server that closes connections
 itself.**
@@ -411,8 +417,8 @@ its read buffer (up to about 4 KiB). A buffered SyncStep1 made the server
 encode the room's full state. A buffered update was applied to the room after
 the close, and stored too after `Shutdown` or `CloseRoom`. The read loop now
 drops that input, as it already did after a queued close, and so does every
-other close the server makes: a failed write (reearth/ygo#339) and the byte
-budget (reearth/ygo#342).
+other close the server makes while the read loop runs: a failed write
+(reearth/ygo#339) and the byte budget (reearth/ygo#342).
 
 **Runtime change: unread buffered input is dropped on a server close.**
 Updates a client sent but the server had not read when it closed the

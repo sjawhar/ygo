@@ -47,7 +47,7 @@ type peer struct {
 	limiter           *rate.Limiter // per-peer inbound-message rate limiter; nil = unlimited (#51)
 	readOnly          bool          // sync updates and awareness do not change the room; awareness gets an empty response
 	hocuspocusFraming bool          // #104: docName-prefixed framing for this connection
-	inputClosed       atomic.Bool   // set before the server closes, or starts to close, the connection (the byte budget included); the read loop drops input from then on
+	inputClosed       atomic.Bool   // set before the server closes, or starts to close, the connection while the read loop runs (the byte budget included); the read loop drops input from then on
 
 	// disconnectOnce runs handleDisconnect's teardown once when callers race,
 	// such as closeConn() waking the read loop during a ctx-cancel teardown.
