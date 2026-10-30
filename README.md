@@ -166,6 +166,15 @@ For a ready-to-run binary — with flags for origins, connection/room limits, an
 go run github.com/reearth/ygo/cmd/ygo-server -store data.db
 ```
 
+### Hocuspocus sync status
+
+With `Server.HocuspocusFraming` set, the server answers every SyncStep2 or Update the client sends under Sync (tag 0) or SyncReply (tag 4) with one SyncStatus (tag 8) frame, in the order the frames arrived, so the `@hocuspocus/provider` unsynced-changes count drops for each update the room applied:
+
+- **1** when the room fully applied the update.
+- **0** when it did not. An update that overflows `MaxPendingItems` is refused before it changes the room. An update that fails to decode partway still sends the part that integrated to the other peers.
+- **Read-only connection:** an Update gets 0, and a SyncStep2 gets 1 only when the room already holds everything in it.
+- **A sync frame that does not decode** gets no SyncStatus: the server closes the connection with 1002 (protocol error) and handles no later frame from it.
+
 ## Server-side document injection
 
 Backend services — AI agents, HTTP handlers, content pipelines — can push
@@ -540,8 +549,9 @@ All hard-capped (semaphore-backed for connection counts):
 - `Server.MaxRooms` — total-room cap (applies to peer upgrades and `Server.Apply`).
 - `Server.MaxUpdateBytes` — per-update size cap (default 64 MiB).
 - `Server.MaxMessageBytes` — per-message size on the WebSocket read path (default 64 MiB).
-- `Server.PeerWriteQueueSize` — per-peer broadcast queue depth (default 256). When the queue fills, the peer is disconnected.
-- `Server.MaxPendingItems` — per-document cap on items parked in the out-of-order pending queue (default 100,000). When the cap is reached, updates that would park additional items return `ErrInvalidUpdate`. Defends against a crafted update full of far-future-clock items that would otherwise grow the queue unboundedly. Same cap is available at the doc level via `crdt.WithMaxPendingItems(n)`.
+- `Server.PeerWriteQueueSize` — per-peer broadcast queue depth (default 512). When the queue fills, the peer is disconnected.
+- `Server.PeerWriteQueueBytes` — per-peer bound on the bytes waiting in a peer's write queue (default 0: no bound). The queue depth alone lets one peer hold that many copies of the room's full state, one for each SyncStep1 it sends without reading. When the waiting frames reach the bound, the next frame closes the peer. The handshake is not counted. Set it above the largest room state the server holds.
+- `Server.MaxPendingItems` — per-document cap on items parked in the out-of-order pending queue (default 100,000), and separately on delete ranges parked waiting for the structs they delete. An update that would park items past the cap, or leave more parked delete ranges than the cap, returns `ErrInvalidUpdate` and leaves the document unchanged: it is refused before any of it integrates. Defends against a crafted update full of far-future-clock items, or a run of delete sets naming clocks nobody holds, that would otherwise grow the queue unboundedly. Same cap is available at the doc level via `crdt.WithMaxPendingItems(n)`.
 - `Server.HandshakeTimeout` — first-read deadline applied after WebSocket upgrade (default 30s). Closes connections that complete the handshake but never send a message (slow-loris defense). Cleared after the first successful read.
 - `Server.MaxAwarenessBytesPerRoom` — cap on the cumulative byte size of awareness state held in one room across all remote clients (default unlimited; suggested production value: 100 MiB). Without this cap, a single peer can claim up to 10,000 clientIDs each holding the 1 MiB per-state maximum. Forwarded to each room's `Awareness` via `awareness.Awareness.SetMaxBytes`.
 - `Server.RoomIdleTimeout` (v1.39.0) — keeps a room resident and warm (durably flushed, in-memory doc intact) for this long after its last peer disconnects, so a quick reconnect skips a full `LoadDoc` reload. Default 0: evict immediately, matching prior releases.
@@ -559,7 +569,7 @@ server.AuthFunc = func(r *http.Request) bool {
 }
 ```
 
-For **read-only connections** (v1.30.0, #59), use `Server.Authorize` instead — it both accepts/rejects and reports per-connection config. A read-only peer receives document and awareness broadcasts but its inbound writes (sync step-2/update and awareness) are dropped server-side; it can still request state (SyncStep1) and query awareness. When set, `Authorize` takes precedence over `AuthFunc`:
+For **read-only connections** (v1.30.0, #59), use `Server.Authorize` instead — it both accepts/rejects and reports per-connection config. A read-only peer receives document and awareness broadcasts. Its sync updates and awareness update do not change the room or reach other peers, and its awareness update gets an empty response; it can still request state (SyncStep1) and query awareness. When set, `Authorize` takes precedence over `AuthFunc`:
 
 ```go
 server.Authorize = func(r *http.Request) (ygws.ConnectionConfig, bool) {

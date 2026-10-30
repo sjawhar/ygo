@@ -36,6 +36,54 @@ const (
 // ErrInvalidUpdate is returned when a binary update cannot be decoded.
 var ErrInvalidUpdate = errors.New("crdt: invalid update")
 
+// ErrIntegrateScanBudget is why a bounded document (WithMaxIntegrateScan,
+// WithIntegrateScanBudget) refuses a remote update whose conflict scans would
+// pass more items than the apply's limit. It wraps ErrInvalidUpdate, and
+// ApplyUpdate returns it inside a RefusedUpdateError: like every remote update
+// a bounded document refuses, the update leaves the document as it was
+// (apply_rollback.go).
+var ErrIntegrateScanBudget = fmt.Errorf("%w: its conflict scans pass more items than the document allows", ErrInvalidUpdate)
+
+// RefusedUpdateError is the error ApplyUpdateV1 and ApplyUpdateV2 return for a
+// remote update a bounded document (WithMaxIntegrateScan,
+// WithIntegrateScanBudget) refused and took back. The refused apply commits no
+// transaction an observer sees, so this error is what reports the work it did.
+//
+// Err is why the update was refused: ErrIntegrateScanBudget when its scans
+// reached the apply's limit, otherwise an error wrapping ErrInvalidUpdate.
+// Unwrap returns it, so errors.Is matches either, and Error is its message.
+// Scanned is the number of items the refused apply's conflict scans passed,
+// counted as Transaction.IntegrateScanned counts them for an apply that
+// commits: never more than the apply's limit, and exactly the limit when the
+// scans reached it.
+type RefusedUpdateError struct {
+	Err     error
+	Scanned int
+}
+
+// Error is the message of the error the update was refused for, or a bare
+// message when the zero value is used (Err nil).
+func (e *RefusedUpdateError) Error() string {
+	if e.Err == nil {
+		return "crdt: update refused"
+	}
+	return e.Err.Error()
+}
+
+// Unwrap is the error the update was refused for.
+func (e *RefusedUpdateError) Unwrap() error { return e.Err }
+
+// integrateScanBudgetExceeded is the panic Item.integrate raises when a remote
+// update's scans reach the apply's limit, before it links the item;
+// applyV1Txn and applyV2Txn recover it as ErrIntegrateScanBudget.
+type integrateScanBudgetExceeded struct{}
+
+// budgetCallbackPanic wraps a panic the WithIntegrateScanBudget callback
+// raised, so recoveredApplyErr names the callback rather than item integration.
+// callIntegrateScanBudget tags it; the apply runs the callback inside its own
+// panic recovery (beginRemoteApply).
+type budgetCallbackPanic struct{ v any }
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 // EncodeStateAsUpdateV1 encodes the part of doc newer than sv as a V1 binary
@@ -43,6 +91,12 @@ var ErrInvalidUpdate = errors.New("crdt: invalid update")
 func EncodeStateAsUpdateV1(doc *Doc, sv StateVector) []byte {
 	doc.mu.Lock()
 	defer doc.mu.Unlock()
+	return encodeStateAsUpdateV1Locked(doc, sv)
+}
+
+// encodeStateAsUpdateV1Locked is EncodeStateAsUpdateV1's body, for a caller
+// that holds doc.mu.
+func encodeStateAsUpdateV1Locked(doc *Doc, sv StateVector) []byte {
 	return withParked(doc, sv, encodeV1Locked(doc, sv), encodeStructStoreV1, MergeUpdatesV1)
 }
 
@@ -59,13 +113,9 @@ func ApplyUpdateV1(doc *Doc, update []byte, origin any) error {
 	return applyErr
 }
 
-// ApplyUpdateV1Landed is ApplyUpdateV1 for a caller that must forward what
-// a failed apply left behind. ApplyUpdateV1 integrates an update item by item,
-// so one it rejects (an update that overflows the pending cap, say) can leave
-// part of itself in doc. When the apply fails, landed is a V1 update of exactly
-// what this call integrated: the structs it added to doc's store and the
-// deletions it made, not structs still parked, nor the rest of the document.
-// landed is nil when the apply succeeds or when nothing integrated.
+// ApplyUpdateV1Landed is ApplyUpdateV1 that, when the apply fails partway, also
+// returns landed, a V1 update of exactly what this call integrated (nil if
+// nothing), for a caller that must forward it.
 func ApplyUpdateV1Landed(doc *Doc, update []byte, origin any) (landed []byte, err error) {
 	doc.Transact(func(txn *Transaction) {
 		txn.Local = false // Yjs readUpdate: transact(..., local=false)
@@ -275,6 +325,32 @@ func (item *Item) isGCOrphan() bool {
 	return item.Parent == nil && item.Origin == nil && item.OriginRight == nil && item.parentID == nil
 }
 
+// dropGCOrigins returns item's effective origins for the wire, without one
+// that names a GC struct in store: a receiver cannot infer a parent from a GC
+// struct, so encodeItem and encodeItemV2 write item's parent in its place.
+// They can only when item has a parent to write (Parent, or a deferred
+// parentID). An item with neither, one still parked on a missing dependency,
+// keeps both origins, so a receiver parks it, or turns it into a GC struct,
+// exactly as the document that holds it does. Clearing them wrote the empty
+// root name instead: the receiver integrated the content into a root type
+// named "", or at another position than the sender's.
+func dropGCOrigins(item *Item, origin, originRight *ID, store *StructStore) (*ID, *ID) {
+	if item.Parent == nil && item.parentID == nil {
+		return origin, originRight
+	}
+	if origin != nil {
+		if oi := store.Find(*origin); oi != nil && oi.isGCOrphan() {
+			origin = nil
+		}
+	}
+	if originRight != nil {
+		if ori := store.Find(*originRight); ori != nil && ori.isGCOrphan() {
+			originRight = nil
+		}
+	}
+	return origin, originRight
+}
+
 // markGCOrphan turns an item whose parent cannot be resolved into the GC struct
 // Yjs integrates it as: deleted, length-only content, and no parent or origins.
 // It then encodes as a GC struct, and nothing can resolve a parent through it,
@@ -354,20 +430,7 @@ func encodeItem(enc *encoding.Encoder, item *Item, offset int, store *StructStor
 		originRight = item.OriginRight
 	}
 
-	// If the origin item is a GC placeholder (no Parent), the receiver can't
-	// infer this item's parent from it. Clear the origin so that explicit
-	// parent info is encoded instead, allowing the receiver to resolve the
-	// parent directly from the named root type or container item ID.
-	if origin != nil {
-		if oi := store.Find(*origin); oi != nil && oi.isGCOrphan() {
-			origin = nil
-		}
-	}
-	if originRight != nil {
-		if ori := store.Find(*originRight); ori != nil && ori.isGCOrphan() {
-			originRight = nil
-		}
-	}
+	origin, originRight = dropGCOrigins(item, origin, originRight, store)
 
 	info := tag
 	if origin != nil {
@@ -549,10 +612,28 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	// (ContentBinary, ContentEmbed, ContentFormat, ContentType, ContentDoc).
 	// A malicious update can encode such a type with a clock offset that forces
 	// a split; without recovery the server would crash instead of returning an error.
+	//
+	// An apply that fails before it starts to change the document (applying
+	// still false), malformed or refused for the pending cap, changed nothing
+	// and started no journal: its transaction is refused, and
+	// refuseRemoteApply returns its error.
+	applying := false
 	defer func() {
 		if r := recover(); r != nil {
-			retErr = fmt.Errorf("%w: panic during item integration: %v", ErrInvalidUpdate, r)
+			retErr = recoveredApplyErr(r)
 		}
+		// An apply that fails before it began to integrate must tell no observer.
+		txn.refused = retErr != nil && !applying
+		if !applying {
+			retErr = refuseRemoteApply(txn, retErr)
+			return
+		}
+		// A bounded document rolls a failed apply back whole, so it drains
+		// only an apply that succeeded.
+		if retErr == nil || txn.journal == nil {
+			retErr = drainAfterApply(txn, retErr)
+		}
+		retErr = endRemoteApply(txn, retErr)
 	}()
 
 	dec := encoding.NewDecoder(update)
@@ -567,11 +648,34 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	if numClients > uint64(len(update)/2) || numClients > maxV2Items {
 		return ErrInvalidUpdate
 	}
+	// The pending cap refuses an update before the apply changes anything,
+	// for its items (checkBeforeApply) or for its delete ranges
+	// (checkParkedDeletes), so on a bounded document too a refusal starts no
+	// journal. Both checks read the update through the apply's one budget.
+	budget := newPendingBudget(txn.doc, sv, update, false)
+	if numClients > 1 {
+		// A later malformed group must not leave earlier, superseded groups
+		// applied. The walk also counts the update's structs, which bounds
+		// the pending-cap check's work.
+		if err := budget.knowSuperseded(); err != nil {
+			return wrapUpdateErr(err)
+		}
+	} else {
+		budget.setSuperseded(nil)
+	}
+	if err := budget.checkBeforeApply(len(update)); err != nil {
+		return err
+	}
+	if err := checkParkedDeletes(txn.doc, &budget); err != nil {
+		return err
+	}
+	applying = true
+	beginRemoteApply(txn, sv)
 
 	// 1. Decode all items, parking any with future-clock deps or same-client gaps.
 	//    Returns the within-update pending list (items whose parent might resolve
 	//    later in this same update).
-	withinUpdatePending, err := decodeAndPark(txn, dec, sv, numClients, update)
+	withinUpdatePending, err := decodeAndPark(txn, dec, sv, numClients, budget.superseded)
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
@@ -585,14 +689,27 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
-	unresolvableDs := ds.applyToPartial(txn)
-	if len(unresolvableDs.clients) > 0 {
-		txn.doc.store.pendingDs.Merge(unresolvableDs)
+	if unresolvableDs := ds.applyToPartial(txn); len(unresolvableDs.clients) > 0 {
+		parkDeletes(txn, unresolvableDs)
+		txn.noteParkedDeletes(unresolvableDs)
 	}
 
-	drainPending(txn)
-
 	return nil
+}
+
+// drainAfterApply drains the pending queue last in every apply that began to
+// integrate, V1 or V2, so one that fails partway drains on what it kept, as a
+// peer applying its update does; a drain panic is its error only when err is
+// nil.
+func drainAfterApply(txn *Transaction, err error) (retErr error) {
+	retErr = err
+	defer func() {
+		if r := recover(); r != nil && retErr == nil {
+			retErr = recoveredApplyErr(r)
+		}
+	}()
+	drainParked(txn, func() { drainPending(txn) })
+	return retErr
 }
 
 // decodeAndPark walks the V1 update's per-client struct groups, decodes each
@@ -605,21 +722,13 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 //	(e) collects items whose parent is unresolved-but-might-be-in-this-update
 //	    into the returned slice for the within-update retry pass.
 //
-// Groups that a later group for the same client supersedes are decoded and
-// dropped (yjs parity). numClients is the count parsed from the header.
-func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numClients uint64, update []byte) ([]*Item, error) {
+// Groups that a later group for the same client supersedes (superseded, which
+// the apply found before it decoded anything) are decoded and dropped (yjs
+// parity). numClients is the count parsed from the header. The apply checked
+// the update against the pending cap before calling it
+// (pendingBudget.checkBeforeApply), so nothing it defers can pass the cap.
+func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numClients uint64, superseded groupSet) ([]*Item, error) {
 	var pending []*Item
-	budget := newPendingBudget(txn.doc, sv, update, false)
-	var superseded groupSet
-	if numClients > 1 {
-		// Fail before integrating anything: a later malformed group must not
-		// leave earlier, superseded groups applied.
-		var err error
-		if superseded, err = supersededGroups(update, nil, encoding.Decoder{}); err != nil {
-			return nil, err
-		}
-	}
-	budget.setSuperseded(superseded)
 
 	totalStructs := uint64(0)
 	for i := uint64(0); i < numClients; i++ {
@@ -682,9 +791,6 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			// the cross-update pending limit.
 			if clock > existingEnd {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return nil, err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -706,9 +812,6 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			// reference to a group not yet decoded) are deferred.
 			if item.Parent == nil {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return nil, err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -725,9 +828,6 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			if offset == 0 && item.OriginRight != nil &&
 				item.OriginRight.Clock >= txn.doc.store.NextClock(item.OriginRight.Client) {
 				pending = append(pending, item)
-				if err := budget.check(len(pending)); err != nil {
-					return nil, err
-				}
 				clock = itemEnd
 				continue
 			}
@@ -783,8 +883,8 @@ func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 // previously-parked delete-set entries (pendingDs), then loops over
 // store.pending as long as progress is being made, integrating items and
 // re-parking those still blocked. A panic-safety closure re-parks any
-// unprocessed items back into store.pending before re-raising, so the
-// outer applyV1Txn recover (v1.1.1) can convert the panic to an error.
+// unprocessed items back into store.pending before re-raising, so
+// drainAfterApply can convert the panic to an error.
 // Also retries pendingDs after each successful integration pass.
 func drainPending(txn *Transaction) {
 	// pendingDs may be drainable even if pending items aren't — integrated
@@ -795,7 +895,7 @@ func drainPending(txn *Transaction) {
 
 	// Drain pending items whose dependencies have been satisfied by
 	// this update. Inline rather than recursive (Go's sync.Mutex is not
-	// reentrant; ApplyUpdateV1 is already under d.mu via doc.Transact).
+	// reentrant; the apply is already under d.mu via doc.Transact).
 	//
 	// Loop until no progress to handle chained dependencies:
 	//   A arriving satisfies B; B (now integrated) satisfies C; etc.
@@ -809,8 +909,8 @@ func drainPending(txn *Transaction) {
 
 		// Process items with panic-safety: if tryIntegrate panics, re-park
 		// every item not yet integrated so a subsequent ApplyUpdate can retry
-		// them. The outer applyV1Txn recover (v1.1.1) then converts the panic
-		// to an error for the caller.
+		// them. drainAfterApply then converts the panic to an error for the
+		// caller.
 		done := make([]bool, len(items))
 		func() {
 			defer func() {
@@ -993,6 +1093,9 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 
 	content, err := decodeContent(dec, doc, tag)
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseOnBoundedDoc(doc, content); err != nil {
 		return nil, err
 	}
 
@@ -1300,6 +1403,20 @@ func clientsSorted[T any](m map[ClientID]T) []ClientID {
 	return out
 }
 
+// recoveredApplyErr is the error an apply returns for a panic it recovered:
+// ErrIntegrateScanBudget for the scan bound's own panic, a message naming the
+// WithIntegrateScanBudget callback for a panic it raised, otherwise
+// ErrInvalidUpdate naming the panic from integrating the update.
+func recoveredApplyErr(r any) error {
+	switch r := r.(type) {
+	case integrateScanBudgetExceeded:
+		return ErrIntegrateScanBudget
+	case budgetCallbackPanic:
+		return fmt.Errorf("%w: panic in the WithIntegrateScanBudget callback: %v", ErrInvalidUpdate, r.v)
+	}
+	return fmt.Errorf("%w: panic during item integration: %v", ErrInvalidUpdate, r)
+}
+
 func wrapUpdateErr(err error) error {
 	if err == nil {
 		return nil
@@ -1467,6 +1584,12 @@ func tryIntegrate(txn *Transaction, item *Item) bool {
 	// Fully covered ranges need no further integration.
 	if item.ID.Clock+uint64(item.Content.Len()) <= existingEnd {
 		return true
+	}
+
+	// From here the item is resolved, trimmed or integrated in place; a drain
+	// taken back parks it again as it was (drainParked).
+	if j := txn.journal; j != nil {
+		j.keepParked(item)
 	}
 
 	// GC-orphan path (no parent, deleted): store without integration, trimmed
