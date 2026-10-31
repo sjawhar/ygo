@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.54.1-sami.3] — 2026-10-31
+
+Fork release: 1.54.1-sami.2 plus one change, reearth/ygo#369. No other code
+changes; every other change is as in 1.54.1-sami.2.
+
+### Added
+
+- **`crdt`: `WithFormatCleanup(bool)` and `Doc.SetFormatCleanup(bool)`.** A
+  document built with `WithFormatCleanup(false)`, or switched off with
+  `SetFormatCleanup(false)`, runs no format cleanup after a remote apply, so
+  it makes no commit of its own. A document that replays another document's
+  updates uses it to hold the same state as the document it replays, whose
+  own cleanup commits are already in those updates. The default is on, which
+  is the Yjs behaviour. (reearth/ygo#369)
+
 ## [1.54.1-sami.2] — 2026-10-31
 
 Fork release: 1.54.1-sami.1 plus one change, reearth/ygo#351. No other code

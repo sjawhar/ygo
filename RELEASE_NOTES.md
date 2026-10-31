@@ -1,3 +1,30 @@
+## v1.54.1-sami.3
+
+A fork release of `github.com/reearth/ygo`: v1.54.1-sami.2 plus one change,
+reearth/ygo#369. No other code changes. The changes that v1.54.1-sami.2 and
+v1.54.1-sami.1 carry, and the notes on the `mobile` module, apply to this
+release as they are written in the sections below.
+
+| Change | Upstream pull request | Commit carried |
+|---|---|---|
+| `WithFormatCleanup` and `Doc.SetFormatCleanup`: turn off the format cleanup after a remote apply | reearth/ygo#369 | 980a4a88 |
+
+### `WithFormatCleanup` and `Doc.SetFormatCleanup` (reearth/ygo#369)
+
+**Who is affected: nobody, unless you choose to be.** The default is on, so
+every document behaves as before.
+
+After a remote apply that changes formatted text, a document runs a format
+cleanup and commits it with a nil origin, as Yjs does. A document that
+replays another document's updates in order (a replica, or a fold of stored
+history) already gets that document's own cleanup commits in the updates, so
+its extra cleanup can make its state differ. Build such a document with
+`crdt.WithFormatCleanup(false)`, or call `doc.SetFormatCleanup(false)` while
+it replays and `doc.SetFormatCleanup(true)` after.
+
+reearth/ygo#369 is open and not merged upstream, so the option's name or
+behaviour can still change in review before upstream ships it.
+
 ## v1.54.1-sami.2
 
 A fork release of `github.com/reearth/ygo`: v1.54.1-sami.1 plus one change,
