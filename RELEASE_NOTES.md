@@ -1,3 +1,26 @@
+## v1.54.1-sami.2
+
+A fork release of `github.com/reearth/ygo`: v1.54.1-sami.1 plus one change,
+reearth/ygo#351. No other code changes. The changes that v1.54.1-sami.1
+carries, and its notes on the `mobile` module, apply to this release as they
+are written in the v1.54.1-sami.1 section below.
+
+| Change | Upstream pull request | Commit carried |
+|---|---|---|
+| `Server.OnTokenAuthContext`: `OnTokenAuth` with the connection's request context | reearth/ygo#351 | 96eea609 |
+
+### `Server.OnTokenAuthContext` (reearth/ygo#351)
+
+**Who is affected: nobody, unless you choose to be.** Servers that set only
+`OnTokenAuth` see no change.
+
+`OnTokenAuth` receives the room and the token, and nothing that says which
+connection sent it, so a server could not give two connections that send the
+same token different answers. The new `Server.OnTokenAuthContext` hook takes
+the connection's request context as well: put a value on it before
+`ServeHTTP` (for example with `r.WithContext`) and read it in the hook. When
+both hooks are set, only `OnTokenAuthContext` is called.
+
 ## v1.54.1-sami.1
 
 A fork release of `github.com/reearth/ygo`, built on upstream v1.54.0
