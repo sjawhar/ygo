@@ -44,7 +44,7 @@ func applyUpdateV2Landed(doc *Doc, update []byte) (landed []byte, err error) {
 // applies, the landed bytes when it fails partway, nothing when nothing landed.
 // It returns why a peer that held the room's state before and applies the
 // relay differs from the room, or "" when they are equal.
-func relayCase(t *testing.T, update []byte, limit, preload int) (diverged string, applyErr error, landed []byte) {
+func relayCase(t *testing.T, update []byte, limit, preload int) (diverged string, landed []byte, applyErr error) {
 	t.Helper()
 	room := New(WithClientID(77))
 	peer := New(WithClientID(78))
@@ -79,7 +79,7 @@ func relayCase(t *testing.T, update []byte, limit, preload int) (diverged string
 			why = append(why, parkedNotRelayed)
 		}
 	}
-	return strings.Join(why, "; "), applyErr, landed
+	return strings.Join(why, "; "), landed, applyErr
 }
 
 // parkedNotRelayed marks a divergence in which the room parked items of the
@@ -116,7 +116,7 @@ func TestMalformedV2_RelayedLandedBytesConvergeThePeer(t *testing.T) {
 			t.Fatal(err)
 		}
 		cases++
-		why, applyErr, landed := relayCase(t, update, limit, preload)
+		why, landed, applyErr := relayCase(t, update, limit, preload)
 		switch {
 		case applyErr == nil:
 			applied++
