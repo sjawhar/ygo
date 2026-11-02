@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.54.1-sami.4] — 2026-11-02
+
+Fork release: 1.54.1-sami.3 plus one change, which has no upstream pull
+request yet. No other code changes; every other change is as in
+1.54.1-sami.3.
+
+### Added
+
+- **`crdt`: `Doc.Clone(opts ...DocOption) *Doc`.** It returns a new document
+  holding an independent copy of the state of the one it is called on, built
+  by copying the structures themselves: no update is encoded, no bytes are
+  parsed, and no struct is integrated. It is the copy
+  `nd := New(opts...); ApplyUpdateV1(nd, EncodeStateAsUpdateV1(d, nil), nil)`
+  makes, for a caller that wants a document to write to and not a wire
+  message — a server copying a live room to serve one write. On a 395 KB
+  XmlFragment document of 400 paragraphs with marks, `Clone` allocated
+  1.74 MB in 12,037 allocations against the encode-and-apply copy's 6.5-7.0
+  MB in about 74,435, and took 5-13 ms against 31-56 ms: a quarter of the
+  bytes, a sixth of the allocations, and four to six times faster (`go test
+  ./crdt/ -run '^$' -bench DocCopy -benchmem -count=5`, three runs on a
+  shared 2-core Xeon at 2.20 GHz, whose timings vary with the load on it;
+  the byte and allocation counts do not).
+
+  The clone takes New's options and nothing from the source, as the
+  encode-and-apply copy does, so a clone of a document built with
+  `WithGC(false)` or any other option keeps that option only when it is
+  passed to `Clone` too. It copies every struct and every link between
+  structs, the delete state, the pending queue (parked structs, the clocks
+  they wait on, parked delete ranges and deferred moves) and the named root
+  types, each of the class the source holds. It copies no observer, no update
+  log, no undo manager and no cache; a subdocument is copied as an apply
+  builds one, an empty document with the source subdocument's guid and
+  options, since no update of the containing document carries a
+  subdocument's content either. `Clone` takes the document's read lock while
+  it copies and writes nothing to the source, so other readers may read it
+  meanwhile; like every other method that takes that lock it must not be
+  called from inside a `Transact` callback.
+
+  `EncodeStateAsUpdateV1` of a clone is byte-identical to the
+  encode-and-apply copy's, over every document the `crdt` fixture corpora
+  hold and the generated ones the tests add (319 documents). To reach it the
+  clone ends in the form an apply leaves, with the apply's own code: a run of
+  same-client text structs one transaction created is squashed into one
+  (`squashRuns`), and a struct whose parent an update cannot name - its
+  container deleted and collected, so the nested type is gone from the
+  document the bytes build - is collected. Both change tombstones and struct
+  boundaries, never what a document reads, and a document with neither, which
+  is most of them, is copied struct for struct.
+
+  A clone keeps one thing the encode-and-apply copy loses: the content of a
+  deleted struct the source still holds, which a document with an UndoManager
+  attached keeps because auto-GC is suppressed while one is attached. The
+  apply that builds the copy has no UndoManager and collects the deletion at
+  commit; a clone needs none to copy the content. Both read the same and hold
+  the same delete set. With no UndoManager attached the source has collected
+  it already and the two are byte-identical.
+
 ## [1.54.1-sami.3] — 2026-10-31
 
 Fork release: 1.54.1-sami.2 plus one change, reearth/ygo#369. No other code

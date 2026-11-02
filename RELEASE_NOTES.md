@@ -1,3 +1,85 @@
+## v1.54.1-sami.4
+
+A fork release of `github.com/reearth/ygo`: v1.54.1-sami.3 plus one change,
+which has no upstream pull request yet. No other code changes. The changes
+that v1.54.1-sami.3, v1.54.1-sami.2 and v1.54.1-sami.1 carry, and the notes
+on the `mobile` module, apply to this release as they are written in the
+sections below.
+
+| Change | Upstream pull request | Commit carried |
+|---|---|---|
+| `Doc.Clone`: copy a document's state without encoding and decoding it | none yet | made in this release |
+
+### `Doc.Clone` (no upstream pull request yet)
+
+**Who is affected: nobody, unless you choose to be.** `Doc.Clone` is new;
+no document behaves differently without it.
+
+A server that wants a copy of a live document to write to has had to encode
+its whole state and apply it to a fresh document:
+
+```go
+copy := crdt.New(crdt.WithClientID(id))
+err := crdt.ApplyUpdateV1(copy, crdt.EncodeStateAsUpdateV1(doc, nil), nil)
+```
+
+That builds a wire message nobody sends: it allocates the update, parses it
+back, and integrates every struct through the conflict resolution. `Clone`
+copies the structures instead:
+
+```go
+copy := doc.Clone(crdt.WithClientID(id))
+```
+
+On a 395 KB XmlFragment document of 400 paragraphs with marks, the clone
+allocated 1.74 MB in 12,037 allocations and took 5-13 ms, against 6.5-7.0 MB
+in about 74,435 allocations and 31-56 ms for the encode-and-apply copy: a
+quarter of the bytes, a sixth of the allocations, and four to six times
+faster (`go test ./crdt/ -run '^$' -bench DocCopy -benchmem -count=5`, three
+runs on a shared 2-core Xeon at 2.20 GHz, whose timings vary with the load
+on it; the byte and allocation counts do not).
+
+The clone takes `New`'s options and nothing from the source, exactly as the
+encode-and-apply copy does: pass `Clone` the options you passed `New`, such
+as `WithGC(false)`, or the clone starts with the defaults. It holds every
+struct and every link between structs, the delete state, the pending queue
+(parked structs, the clocks they wait on, parked delete ranges and deferred
+moves) and the named root types, each of the class the source holds, so
+`GetXmlFragment("x")` on the clone returns the clone's own fragment. It
+holds no observer, no update log, no undo manager and no cache. A
+subdocument is copied as an apply builds one — an empty document with the
+source subdocument's guid and options — because no update of the containing
+document carries a subdocument's content either; clone a subdocument's own
+state by cloning the subdocument. `Clone` takes the document's read lock
+while it copies and writes nothing to the source, so other goroutines may
+read the source meanwhile; like the other methods that take that lock, it
+must not be called from inside a `Transact` callback.
+
+`crdt.EncodeStateAsUpdateV1` of a clone is byte-identical to the
+encode-and-apply copy's, over every document the `crdt` fixture corpora hold
+and the generated ones the tests add (319 documents), and a clone integrates
+later updates exactly as that copy does. To reach that, the clone ends in the
+form an apply leaves, using the apply's own code: a run of same-client text
+structs that one transaction created is squashed into one (an apply of a
+whole state creates every struct in one transaction, so it squashes every run
+the document holds, while the document those bytes came from squashed only
+each transaction's own), and a struct whose parent an update cannot name —
+its container deleted and collected, so the nested type is gone from the
+document the bytes build — is collected. Both touch tombstones and struct
+boundaries only, never what a document reads, and most documents have
+neither, so a clone usually holds its source's structs one for one.
+
+A clone keeps one thing the encode-and-apply copy loses: the content of a
+deleted struct the source still holds. A document with an `UndoManager`
+attached runs no auto-GC, so it keeps that content to undo with; the apply
+that builds the copy has no `UndoManager` and collects the deletion at
+commit, while a clone needs none to copy the content. The two read the same
+and hold the same delete set, and with no `UndoManager` attached the source
+has collected it already and the two are byte-identical.
+
+The change is not in an upstream pull request yet, so the method's name or
+behaviour can still change before upstream takes it.
+
 ## v1.54.1-sami.3
 
 A fork release of `github.com/reearth/ygo`: v1.54.1-sami.2 plus one change,
