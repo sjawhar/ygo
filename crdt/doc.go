@@ -55,6 +55,10 @@ import (
 // subdocument is embedded again. Create a second Doc with the same guid instead.
 var ErrSubdocAlreadyIntegrated = errors.New("ygo/crdt: subdocument already integrated; create a second instance with the same guid")
 
+// ErrRootTypeMismatch is raised when a named root is accessed as a different
+// shared type than the one already stored in the document.
+var ErrRootTypeMismatch = errors.New("crdt: root type mismatch")
+
 // DocOption configures a Doc at creation time.
 type DocOption func(*Doc)
 
@@ -457,6 +461,13 @@ func (d *Doc) upgradeRawType(raw *rawType, dst sharedType, name string) {
 	d.share[name] = dst
 }
 
+// panicRootTypeMismatch keeps a named root's concrete shared type stable. A
+// root accessor with a different type must not replace the root and discard
+// its contents.
+func panicRootTypeMismatch(name string, existing sharedType, requested string) {
+	panic(fmt.Errorf("%w: root %q has type %T; cannot access it as %s", ErrRootTypeMismatch, name, existing, requested))
+}
+
 // getArrayLocked is the lock-free body of GetArray. Callers must hold d.mu —
 // either Doc.GetArray (takes it) or Transaction.GetArray (Transact holds it).
 func (d *Doc) getArrayLocked(name string) *YArray {
@@ -469,6 +480,7 @@ func (d *Doc) getArrayLocked(name string) *YArray {
 			d.upgradeRawType(raw, arr, name)
 			return arr
 		}
+		panicRootTypeMismatch(name, t, "*crdt.YArray")
 	}
 	arr := &YArray{}
 	arr.doc = d
@@ -480,6 +492,7 @@ func (d *Doc) getArrayLocked(name string) *YArray {
 }
 
 // GetArray returns the named root YArray, creating it if it does not exist.
+// It panics if that name already belongs to a different root type.
 // It takes the document lock — inside a Transact callback use txn.GetArray
 // instead (see Transact and GetText for the locking contract; issue #138).
 func (d *Doc) GetArray(name string) *YArray {
@@ -501,6 +514,7 @@ func (d *Doc) getMapLocked(name string) *YMap {
 			d.upgradeRawType(raw, m, name)
 			return m
 		}
+		panicRootTypeMismatch(name, t, "*crdt.YMap")
 	}
 	m := &YMap{}
 	m.doc = d
@@ -512,6 +526,7 @@ func (d *Doc) getMapLocked(name string) *YMap {
 }
 
 // GetMap returns the named root YMap, creating it if it does not exist.
+// It panics if that name already belongs to a different root type.
 // It takes the document lock — inside a Transact callback use txn.GetMap
 // instead (see Transact and GetText for the locking contract; issue #138).
 func (d *Doc) GetMap(name string) *YMap {
@@ -533,6 +548,7 @@ func (d *Doc) getTextLocked(name string) *YText {
 			d.upgradeRawType(raw, txt, name)
 			return txt
 		}
+		panicRootTypeMismatch(name, t, "*crdt.YText")
 	}
 	txt := &YText{}
 	txt.doc = d
@@ -544,6 +560,7 @@ func (d *Doc) getTextLocked(name string) *YText {
 }
 
 // GetText returns the named root YText, creating it if it does not exist.
+// It panics if that name already belongs to a different root type.
 //
 // GetText takes the document lock and therefore MUST NOT be called from
 // inside a Transact callback — that self-deadlocks a non-reentrant lock,
@@ -1004,6 +1021,7 @@ func (d *Doc) getXmlFragmentLocked(name string) *YXmlFragment {
 			d.upgradeRawType(raw, f, name)
 			return f
 		}
+		panicRootTypeMismatch(name, t, "*crdt.YXmlFragment")
 	}
 	f := &YXmlFragment{}
 	f.doc = d
@@ -1015,7 +1033,8 @@ func (d *Doc) getXmlFragmentLocked(name string) *YXmlFragment {
 }
 
 // GetXmlFragment returns the named root YXmlFragment, creating it if it does
-// not exist. It takes the document lock — inside a Transact callback use
+// not exist. It panics if that name already belongs to a different root type.
+// It takes the document lock — inside a Transact callback use
 // txn.GetXmlFragment instead (see Transact and GetText for the locking
 // contract; issue #138).
 func (d *Doc) GetXmlFragment(name string) *YXmlFragment {
