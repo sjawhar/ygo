@@ -5,6 +5,614 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.1] — 2026-11-03
+
+Fork release on upstream 1.55.0 (1b3afe00), composed on upstream main
+510c2cf5, which adds only a change to mobile/go.mod. It replaces the
+1.54.1-sami.N line, which was built on upstream 1.54.0. Every change it
+carries is one of the open upstream pull requests named below, or the
+per-apply scan budget, whose pull request is not yet opened. RELEASE_NOTES.md
+lists the members, what each consumer must change, and the four repairs
+that make two members work together.
+
+### Added
+
+- **`crdt`: `Doc.SetMaxPendingItems(n)`** sets the pending cap after
+  construction, so stored state over a cap can load first. (reearth/ygo#340)
+- **`provider/websocket`: `Server.PeerWriteQueueBytes` bounds the bytes
+  waiting in a peer's write queue.** `PeerWriteQueueSize` bounds that queue
+  in frames only, and the server answers each SyncStep1 with the room's full
+  state on the sender's own queue. So a peer that sends SyncStep1 and does not
+  read made the server keep one copy of the document for each message, up to
+  512 copies, while the connection stayed open. With the budget set, when the
+  frames that wait for a peer reach it, the next frame closes the peer, on
+  every enqueue path and whatever `SlowPeerPolicy` is set, and the read loop
+  drops the input the peer already sent. The close is logged at Warn as
+  `peer queued bytes over budget`. The frame that crosses the budget is
+  queued whatever its size, and the connect handshake is not counted. A frame
+  that arrives while the budget or more waits closes even a peer that reads,
+  so set the budget above the largest room state. Zero, the default, or a
+  negative value means no budget. (reearth/ygo#342)
+- **`provider/websocket`: `ErrRoomInUse`, `ErrNotInApply` and
+  `Server.CloseRoomWithin`.** `CloseRoom` returns `ErrRoomInUse` when a caller
+  is inside the room — an `Apply` callback, a relay `Inject`, or a websocket
+  join between the room lookup and peer registration — and keeps the room
+  resident. `CloseRoomWithin(name, doc, force)` is the close a caller makes
+  from inside its own `Apply` on the room, which is how a room is closed
+  without the idle sweeper retiring it in between: `doc` is the document that
+  `Apply` passed to the callback, naming the room instance it is writing, and
+  the one in-flight caller discounted is that `Apply`. It returns
+  `ErrRoomNotFound` when the name holds a different instance by then, and
+  `ErrNotInApply` when nobody is inside the room at all. (reearth/ygo#342)
+- **`crdt.ApplyUpdateV1Held(doc, update, origin)`** applies a V1 update as
+  `ApplyUpdateV1Landed` does and also reports whether the document already
+  held all of it, so that the apply changed and parked nothing. It decides
+  under the lock the apply holds. `provider/websocket` uses it to send a
+  peer's update on unless the room already held it, without decoding the
+  update a second time when the apply changes the document. (reearth/ygo#350)
+- **`crdt`: `Doc.OpenUpdateLog` records committed updates in commit order.**
+  OnUpdate observers run after the transaction releases the document lock, so
+  the observers of two transactions that commit close together on different
+  goroutines run in either order, and nothing they are handed says which
+  committed first. An `UpdateLog` is appended to under the document lock, at
+  the point where the commit already encodes its update for OnUpdate, so an
+  observer that drains it finds its own transaction's update after every
+  update committed before it. The first commit after the log opens also
+  records the document's whole state just before it, parked structs included
+  (the log's base). Each logged update is the very slice its `OnUpdate`
+  observers get, and, in `LoggedUpdate.Parked`, what the commit parked:
+  structs and deletions that wait for something the document lacks, which
+  `OnUpdate` leaves out as Yjs does. A reader that applies the base and then
+  each update's `Update` and `Parked` holds the document as it stood after
+  each commit, what it holds parked included. A remote update's format cleanup is a commit of its own
+  and is logged like one. `Drain`, `Pending`, `Reset` (start again from a
+  fresh base) and `Close` complete it. Without an open log nothing changes: a
+  commit encodes its update only for OnUpdate observers, as before. (reearth/ygo#332)
+- **`crdt`: `WithMaxIntegrateScan`, `Doc.SetMaxIntegrateScan` and
+  `ErrIntegrateScanBudget`: a document can bound the conflict scans of a remote
+  update, and then applies every remote update whole or not at all.** YATA
+  places an item by scanning right from its left origin past every item whose
+  own origin lies in what the scan has passed, so an item naming an early left
+  origin and no right origin scans to the end of a list, and an update of n of
+  them scans n times the list: 2,000 such items (about 12 KB) into a list of
+  20,000 unmerged items took 20.8 s and allocated 2,365,640,192 bytes. With a
+  bound, the scans of one remote update together pass at most that many items;
+  past it, `ApplyUpdateV1` and `ApplyUpdateV2` return `ErrIntegrateScanBudget`
+  (which wraps `ErrInvalidUpdate`). A bounded document takes out what such an
+  update, or any remote update whose apply fails, integrated before it failed,
+  so the document is left as it was and the transaction fires no observer:
+  nothing of the update is persisted or relayed. A bounded document refuses a
+  remote update carrying a subdocument or a move. Local transactions are never
+  bounded. No bound is set by default. The drain of the pending queue that
+  ends an apply has an allowance of its own, the bound again; a drain that
+  would pass it is taken back and the queue is parked again as it was, every
+  peer's items kept, while the update that filled the gap stands. The clocks
+  the queue waits on are raised to the store's, so only an apply that brings
+  one of its clients further drains it again. A bounded remote apply's conflict
+  scans share one map of marks, made by the first scan that needs it and kept
+  until the transaction commits: each mark records which scan, and which step
+  of it, passed the item, so a new scan reuses the map without clearing it.
+  Unbounded transactions keep two maps per scan, as before. (reearth/ygo#333)
+- **`crdt`: a scan allowance for each remote update, and the scans each
+  apply passed, committed or refused.** `WithIntegrateScanBudget(func(origin
+  any) int)` and `Doc.SetIntegrateScanBudget` give a document a budget it asks,
+  under its lock, as each remote apply (`ApplyUpdate`, V1 and V2) begins, with
+  that apply's origin: the apply's conflict scans, the drain of the pending
+  queue it ends with included, may pass at most the number it returns, and
+  zero or negative leaves that one apply unbounded. One fixed bound
+  (`WithMaxIntegrateScan`) has to hold the largest honest update and so lets
+  every update scan as much; a budget lets an owner size each update's
+  allowance from what it knows before applying it - the structs the update
+  carries, who sent it, or what remains of an allowance it keeps for the whole
+  document. An update whose own scans would pass its allowance is refused with
+  `ErrIntegrateScanBudget`; a drain that would pass what the update left of the
+  allowance is taken back while the update stands, and the queue parked again
+  as under a bound, so one apply never scans more than its budget. Under a
+  bound the drain keeps an allowance of its own, the bound again, as before. A
+  document with a budget is bounded whatever the budget returns: it applies
+  every remote update whole or not at all and refuses subdocuments and moves
+  from remote updates, as a document with a bound does, and the budget takes
+  the bound's place while it is set. `(*Transaction).IntegrateScanned()` is the
+  number of items the transaction's conflict scans passed, a drain taken back
+  included, counted on every document, bounded or not, and read from
+  `OnAfterTransaction`, which runs after the document's lock is released and
+  before `ApplyUpdate` returns. An update a bounded document refuses commits no
+  transaction an observer sees, so `ApplyUpdateV1` and `ApplyUpdateV2` now
+  return its error as a `*RefusedUpdateError{Err, Scanned}`: `Scanned` is what
+  the refused apply's scans passed - exactly its limit when the scans reached
+  it - and `Unwrap` returns `Err`, so `errors.Is` matches
+  `ErrIntegrateScanBudget` and `ErrInvalidUpdate` as before, and the message is
+  unchanged. On a bounded document (a budget or `WithMaxIntegrateScan`) this
+  wrapping covers every failed apply, not only a scan refusal: any error that
+  rolls the apply back, a malformed update included, is returned as a
+  `*RefusedUpdateError`. A caller using `errors.Is` or `errors.As` needs no
+  change; one that type-asserts the concrete error type must now expect the
+  wrapper. A panic in the budget callback refuses the update before the apply
+  changes anything, with an error that names the callback and no observer
+  told. The zero `RefusedUpdateError` is safe to print.
+  The count is exactly what the bound measures: a document bounded
+  at the count takes the update, and one bounded one item under it refuses it.
+  Decoding a document's whole state into a fresh document is a remote apply
+  too, so its transaction's count is what a copy of the document pays to load
+  it, and an owner can keep a document's running total from it. (fork member stacked on reearth/ygo#333)
+- **`crdt`: `(*Transaction).ChangedTypes()` and `Parent()` on every shared
+  type.** `ChangedTypes` returns every shared type an item was integrated into
+  or deleted from in the transaction, once per type and in no particular
+  order. It is not the key set of Yjs `transaction.changed`: it also names the
+  types the transaction itself created, the types it deleted, and types
+  deleted earlier that a concurrent remote change still writes into, all of
+  which Yjs leaves out, so a caller that wants only live types that existed
+  before the transaction filters those entries out (a type whose own item is
+  deleted no longer appears among its `Parent()`'s children or values).
+  `Parent()`, on every shared type and on the `SharedType` interface, returns
+  the type that contains it, as Yjs `type.parent` does; a deleted type keeps
+  it also after the garbage collector freed its container item. Neither hands
+  out ygo's internal placeholder for a root nobody has opened by name or for a
+  nested type of a class ygo does not know (a Yjs `YXmlHook`): `ChangedTypes`
+  leaves such a type out, and `Parent()` returns nil for a root, a detached
+  type, or a type whose container is such a placeholder. Once the root is
+  opened by name, `Parent()` and later transactions' `ChangedTypes` name the
+  type the `Get*` call returned. Together they let an owner that applies
+  remote updates learn which nested types an apply changed, and which
+  top-level children they sit in, without a subscription on every node, for
+  example to re-render only the blocks of a document an update touched.
+  Neither takes the document lock: reading `ChangedTypes` from an
+  `OnAfterTransaction` observer, which runs after the transaction released the
+  lock, is safe, but walking `Parent()` there, or anywhere else outside a
+  `Transact` callback, races any other goroutine writing the document. It is
+  safe inside a `Transact` callback, or in an observer of a document no other
+  goroutine writes, for example a copy one goroutine applies updates to. (reearth/ygo#336)
+- **`provider/websocket`: `Server.OnTokenAuthContext`, `OnTokenAuth` with the
+  connection's request context.** The hook receives the `r.Context()` that
+  `ServeHTTP` served the connection on, with the values the embedder put on
+  it, so it can tell apart two connections to one room that send the same
+  token. It is called in place of `OnTokenAuth` when both are set;
+  `OnTokenAuth` alone behaves as before. (reearth/ygo#351)
+- **`crdt.WithFormatCleanup(enabled)` and `Doc.SetFormatCleanup(enabled)`**
+  turn off, for one document, the local transaction that follows a remote
+  transaction changing formatted text and deletes the format markers it left
+  redundant. A document that replays another document's updates, such as a
+  server's copy of a room or a fold of its stored updates, needs it off: the
+  source never cleaned up after its own local transactions, and its updates
+  already hold the cleanups it did run, so the replay otherwise deletes
+  markers the source keeps. The setter lets a room load its stored state
+  without the cleanup and clean up after later peer updates. The default is
+  unchanged. (reearth/ygo#369)
+
+### Changed
+
+- **`crdt` (breaking): a document whose own client's clock is advanced by a
+  non-local transaction takes a new random client ID when that transaction
+  commits.** Anyone who sets `WithClientID` and re-applies their own updates
+  must read `ClientID()` again after doing so. This breaks the documented
+  contract of `WithClientID` (a fixed, deterministic ID) and of `ClientID`
+  (read-only after creation). It is Yjs's `cleanupTransactions` rule, so a
+  local write never continues a clock that another peer set. Before, a peer
+  could send a GC struct over the document's own client, and the next local
+  write continued that clock, past 2^53-1 if the GC struct reached it; this
+  release's clock bound refuses that state. (reearth/ygo#340)
+
+### Fixed
+
+- **`crdt`: an update that would park past `WithMaxPendingItems` is refused
+  before it changes anything.** The cap was checked while the apply
+  integrated, so a refused update could leave part of itself in the document
+  and tell its observers. The check now runs before the first change. For an
+  update cut short before the struct that takes it past the cap, the refusal
+  names the decoder's reason. An apply that fails after it began to integrate
+  drains the pending queue on what it kept. (reearth/ygo#340)
+- **`crdt`: parked delete ranges are capped and refused before any change.**
+  `WithMaxPendingItems` also bounds, separately, the delete ranges waiting for
+  structs the document lacks, and a client's parked ranges are retried only
+  once its structs move past the lowest of them. (reearth/ygo#340)
+- **`crdt`: the pending queue merges a struct sent again as Yjs merges its
+  pending update.** Of the structs that give one clock, the one that Yjs's
+  merge takes first keeps it, and the queue drops or cuts the others. The
+  pending cap counts what the park adds after the merge, and a queue above a
+  lowered cap does not grow. Each struct a park adds, cuts or drops costs, on
+  average, time logarithmic in the queue. (reearth/ygo#340)
+- **`crdt`: a struct the document already holds waits on an origin, right
+  origin or parent of another client that the document lacks, as Yjs
+  `getMissing` does,** and parks with every struct of its client after it. (reearth/ygo#340)
+- **`crdt`: an item whose right origin is a GC struct, or a parked item whose
+  origin is one, integrates as a GC struct, as Yjs `getMissing` makes it.** (reearth/ygo#340)
+- **`crdt`: an item that names a struct of its own client past that client's
+  clock is refused, as Yjs throws for it.** (reearth/ygo#340)
+- **`crdt`: clocks past 2^53-1, and struct, origin and parent clients past
+  2^55-1, are refused.** Both decoders and the merge decoders refuse them, so
+  `EncodeStateAsUpdateV2` cannot meet a struct it cannot write, and encoding
+  parked state keeps every part that merges. The attribution decoders
+  (`DecodeIDSet`, `DecodeIDMap`, `DecodeContentIDs`, `DecodeContentMap`)
+  refuse an `IDMap` client past 2^55-1 and a range whose running clock would
+  pass 2^64-1, so the clock cannot wrap onto a low clock. (reearth/ygo#340)
+- **`crdt`: `ApplyUpdateV1Landed` carries the structs and delete ranges a
+  failed apply parked.** A peer that applies the update it returns parks what
+  the document parks. (reearth/ygo#340)
+- **`provider/websocket`: `Server.Inject` relays to local peers what a partly
+  applied update left in the room** before it returns the apply's error. (reearth/ygo#340)
+- **`crdt`: a parked struct that panics in the drain is dropped, not the
+  structs after it.** The apply returns the panic as its error. (reearth/ygo#340)
+- **`crdt`: an item that continues its client's GC struct is refused, as in
+  Yjs.** (reearth/ygo#340)
+- **`crdt`: the deletions read before a cut in the delete set, or before a
+  range that reaches a clock past 2^53-1, stay applied, as in Yjs for a cut,
+  whatever the pending cap,** and the delete-set decoders no longer cap the
+  client and range counts. The apply returns its error, and
+  `ApplyUpdateV1Landed` carries those deletions. (reearth/ygo#340)
+- **`crdt`: an item that arrives with deleted content is deleted when it
+  integrates, as in Yjs,** and a V2 GC struct adds nothing to the
+  transaction's delete set. (reearth/ygo#340)
+- **`crdt`: `EncodeStateVectorFromUpdate` and `EncodeStateVectorFromUpdateV2`
+  return the state vector Yjs returns,** and a V1 subdocument whose guid is
+  not UTF-8 is an error rather than a panic. (reearth/ygo#340)
+- **`crdt`: an update's structs integrate in Yjs's order,** and the
+  integration stops at the first refused struct, as Yjs stops. (reearth/ygo#340)
+- **`crdt`: every struct of an update decodes before one integrates,** so a
+  struct that does not decode leaves the document unchanged. (reearth/ygo#340)
+- **`crdt`: `WithClientID` panics for a client ID past 2^55-1,** the largest
+  a V2 update can carry. (reearth/ygo#340)
+- **`crdt`: a type ref above 6 is refused before any change,** as Yjs
+  refuses it. (reearth/ygo#340)
+- **`crdt`: `YArray.Insert` and `YArray.Push` with no values make no item,**
+  as in Yjs. They made an item of length zero, which the full state of the
+  document then carried. (reearth/ygo#340)
+- **`crdt`: an item or GC struct of length zero is refused before any
+  change.** Yjs never writes one. When Yjs applies a zero-length map item, it
+  deletes the key's value and breaks that document's later encoding. The
+  apply also refuses an update from an older ygo that holds one. The merge
+  and conversion functions drop such a struct, and the bundled persistence
+  adapters merge a room's records on load, so a state that ygo 1.55.0 or
+  earlier stored with one still loads. (reearth/ygo#340)
+- **`crdt`: a delete set read from an update allocates in proportion to its
+  bytes.** A counting first pass lets the decoders size the map, the order
+  list and each client's ranges once, from counts that the bytes bound. The
+  apply no longer copies the ranges it only reads. In tests with seven
+  crafted delete sets of about 1 MiB, 1.55.0 allocated up to 137.3 times
+  their bytes. This release allocates at most 17.2 times at the default cap, and
+  30.3 times with the cap lifted, where the document keeps its own copy. (reearth/ygo#340)
+- **`provider/websocket`: a failed write closes the peer's connection.** When
+  a write to a peer failed, for example because its 10-second write deadline
+  expired, the peer's writer stopped but the connection stayed open. A peer
+  that kept sending stayed in its room, `OnLastPeer` did not fire, and its
+  replies queued with no writer until the queue overflowed. The writer now
+  closes the connection, and the read loop removes the peer without handling
+  the frames left in its read buffer. (reearth/ygo#342)
+- **`provider/websocket`: when the server closes a peer while its read loop
+  runs, the loop drops the input it has not handled.** This applies to a full
+  write queue (on a direct send, or on a broadcast under
+  `SlowPeerDisconnect`), a Hocuspocus close message, a cancelled request
+  context without a close code, `Shutdown` and `CloseRoom(name, true)`.
+  Before, the read loop still handled the messages in its read buffer (up to
+  about 4 KiB): it encoded the room's full state for each buffered SyncStep1,
+  and it applied each buffered update after the close, and stored it too after
+  `Shutdown` or `CloseRoom`. Updates that the server had not read when it
+  closed the connection are not saved. A client that reconnects sends them
+  again. (reearth/ygo#342)
+- **`provider/websocket`: a joining peer receives the room's state once.** On
+  connect the server sent SyncStep1, a SyncStep2 with the room's full state
+  and awareness, then answered the peer's own SyncStep1 with a second full
+  SyncStep2, so every join downloaded the document twice. The server now
+  sends SyncStep1 on connect, awareness only when the room holds awareness
+  states, and the room's state only in answer to the peer's SyncStep1, as the
+  y-websocket and Hocuspocus servers do. This holds on both framings and for
+  read-only peers. A client that never sends SyncStep1 now gets no snapshot
+  of the room's state, only the updates broadcast after it joins. A client
+  that sends a Hocuspocus token `OnTokenAuth` rejects before its SyncStep1 no
+  longer gets the snapshot either, but updates broadcast before the rejection
+  can still reach it: withhold content with `AuthFunc` or `Authorize`. (reearth/ygo#342)
+- **`provider/websocket`: `Shutdown` waits for the connections it serves.**
+  Its doc said it waits for the peers' goroutines to exit, but it closed each
+  connection and waited only for the persistence workers, stranded writes and
+  relay workers. A hook on a connection's read loop (`OnTokenAuth`,
+  `OnPeerUpdate`) or in its teardown (`OnLastPeer`, `OnUnloadDocument`) could
+  still run after `Shutdown` returned `nil`. `Shutdown` now also waits, bounded
+  by its `ctx`, until every `ServeHTTP` call in progress has returned, its
+  teardown included. A hook that does not return holds `Shutdown` until `ctx`
+  expires, and `Shutdown` then returns `ctx.Err()`. A hook that calls
+  `Shutdown` must pass a `ctx` that expires, because `Shutdown` waits for that
+  hook's own connection. Once `Shutdown` has begun, the server makes no relay
+  `RoomActivated` or `RoomDeactivated` call, because a relay may wait on the
+  relay context, which `Shutdown` cancels only after this wait. (reearth/ygo#342)
+- **`provider/websocket`: a peer closed for a full write queue or its byte
+  budget is logged once.** Each frame that reached the peer before its
+  teardown logged the Warn again and closed the connection again. Those frames
+  are now dropped without a log, the writer's failed write after a close the
+  server made is logged at Debug, and no full-state resync is built for the
+  peer. (reearth/ygo#342)
+- **`provider/websocket`: the last peer's leave no longer evicts a room an
+  `Apply` is inside.** With the default `RoomIdleTimeout == 0`, the room was
+  evicted as soon as its last peer left, also while an `Apply` callback, a
+  relay `Inject` or a join was inside it, so the callback's later writes went
+  to a document the server no longer held. The room now stays resident until
+  a later last-peer leave or `CloseRoom` evicts it, and `OnUnloadDocument`
+  fires then, not with `OnLastPeer`. (reearth/ygo#342)
+- **`provider/websocket`: `CloseRoom` no longer evicts a room an `Apply` is
+  writing.** `Apply` holds the room's inflight count for the whole of its
+  callback, and the idle sweeper has honoured it since #193, but `CloseRoom`
+  removed the room regardless. Every mutation the callback made after that
+  landed on a document the server no longer held: it reached the adapter only
+  through the retiring worker's stranded-write path, and with no persistence
+  adapter it was lost outright, while `GetDoc` and the next `Apply` saw a room
+  without it. `CloseRoom` now returns `ErrRoomInUse` instead, with `force=true`
+  as well as `force=false` — `force` closes connected peers, which is not the
+  same as interrupting a server-side writer. When the caller is inside before
+  the call, no peer is closed; one that enters while `force` closes the peers
+  leaves those peers closed. The refusal is transient, and the call never
+  waits on the count, so it cannot deadlock. A caller that is itself inside
+  an `Apply` on the room, and so is the writer rather than a racer, calls
+  `CloseRoomWithin`. (reearth/ygo#342)
+- **`crdt`: V1 encoders write clients in descending order, as Yjs does.**
+  The struct groups of a V1 update and the entries of a state vector were
+  written with clients ascending, so a V1 update or state vector with more
+  than one client was not byte-identical to Yjs's. This covers
+  `EncodeStateAsUpdateV1`, the `OnUpdate` update, `MergeUpdatesV1`,
+  `DiffUpdateV1`, `UpdateV2ToV1`, `EncodeStateFromSnapshot`,
+  `EncodeStateVectorV1`, `EncodeStateVectorFromUpdate`,
+  `EncodeStateVectorFromUpdateV2` and `EncodeSnapshot`. The V2 encoders and
+  the delete-set encoders already wrote clients descending. (reearth/ygo#350)
+- **`crdt`: the update `OnUpdate` observers receive carries only the
+  transaction's deletions.** It carried the whole document's delete set, so
+  every update grew with the document's deletion history: after 1,000
+  separate deletions, a one-character insert gave a 2,951-byte update. It now
+  gives 12 bytes, as Yjs's `update` event does.
+  `provider/websocket`'s `Server.Apply` no longer returns `ErrUpdateTooLarge`
+  for a small edit to a room with a long deletion history. (reearth/ygo#350)
+- **`crdt`: a transaction that changes nothing no longer calls `OnUpdate`.**
+  `OnUpdate` observers ran after every transaction, with an update of no
+  structs: an update the document already held, a delete of deleted content,
+  a delete set naming clocks the document lacks (which parks), and an empty
+  `Transact`. They now run only when the transaction adds structs or deletes
+  something, as Yjs emits its `update` event. A refused apply that integrated
+  part of its update still calls them for that part. `provider/websocket`
+  therefore stores and relay-publishes no such update, does not send a peer's
+  update to the room's other peers when the room already held all of it (an
+  update it parks still goes out), and `Server.Apply` returns `ErrNoChanges`
+  when `fn`'s transactions change nothing. `mobile` drops its filter for the
+  empty update. (reearth/ygo#350)
+- **`crdt`: `OnUpdate` receives the update encoded after the transaction's
+  GC, as in Yjs.** ygo encoded the update before its GC, so content that one
+  transaction both inserted and deleted went out in full where Yjs sends a
+  `ContentDeleted` tombstone. A transaction that inserts "abc" and deletes
+  "b" now sends the same 24 bytes as Yjs, not 25. This holds for local
+  transactions and remote applies, also when the remote change is to a text
+  that an observer watches or that has format markers: that change is now
+  collected at commit too, and its format cleanup reads what it needs from
+  before the GC. With GC off, or with an `UndoManager` attached, the update
+  does not change. The update `ApplyUpdateV1Landed` returns for a failed
+  apply is now encoded at commit too, after the GC and the end-of-transaction
+  merges, so it holds the same structs as the `OnUpdate` update. (reearth/ygo#350)
+- **`crdt`: `OnAfterTransaction` fires before `OnUpdate`, as Yjs emits
+  `afterTransaction` before `update`.** A committed transaction now calls
+  per-type observers, deep observers, `OnAfterTransaction`, `OnUpdate`, then
+  `OnSubdocs`, for local and applied updates alike. A transaction started
+  inside an `OnAfterTransaction` callback now emits its update before the
+  outer transaction's update, as one started inside an observer already did.
+  Yjs queues such a transaction until the outer one is done. (reearth/ygo#350)
+- **`crdt`: a panicking observer no longer stops the other observers.** When
+  an observer panicked, no observer after it ran: not the other observers of
+  the same type, not deep observers, and not `OnUpdate`, so the update of the
+  transaction was lost to relays and persistence. Now every per-type, deep,
+  `OnAfterTransaction`, `OnUpdate` and `OnSubdocs` observer runs, and the
+  panic then reaches the caller, as Yjs runs its type and deep observers. If
+  more than one panics, the last panic reaches the caller, as in Yjs. (reearth/ygo#350)
+- **`crdt`: a write into a deleted nested type no longer calls its
+  observers.** A write into a nested type after it was deleted, or in the
+  transaction that deleted it, called that type's `Observe` and `ObserveDeep`
+  callbacks and the `ObserveDeep` callbacks of its ancestors. This happened
+  for a local write through a held handle and, with GC off, for a remote
+  write that a peer made before it saw the deletion. Deleting a type that had
+  children also called its own `Observe` and `ObserveDeep`. Yjs calls none of
+  these, and now ygo does not either. The deletion still calls the observers
+  of the type that lost the entry and the deep observers of its live
+  ancestors. (reearth/ygo#350)
+- **`crdt`: observers of the types one transaction changed fire in a fixed
+  order, the one Yjs uses.** `Observe` callbacks fire in the order the
+  transaction first changed each type, and `ObserveDeep` callbacks in that
+  order with each type's ancestors after it. ygo took this order from a Go
+  map, so it changed from one run to the next. An applied update changes its
+  types in the order its structs integrate, then in the order of its
+  deletions, as in Yjs. (reearth/ygo#350)
+- **`crdt`: a text whose own observer panics no longer starts the remote
+  format cleanup.** After a remote change, ygo deletes the format markers that
+  the change left redundant. A formatted text was cleaned even when its own
+  observer panicked, and a panic in any type observer could skip the cleanup
+  for every text. Now the decision waits for the type observers even when one
+  panics, and leaves out each text whose own observer panicked, as in Yjs. Any
+  other changed text with formatting still starts the cleanup. (reearth/ygo#350)
+- **`crdt`: `YText.Delete` and an `ApplyDelta` delete clean up format markers
+  as Yjs does (#297).** After a deletion, Yjs's `deleteText` looks at the
+  markers from the deleted range to the next character. It deletes each
+  marker that a later marker of the same key overrides, and each marker that
+  sets the value the attribute had before the deleted range. `YText.Delete`
+  used a different rule: it kept some of these markers and deleted some that
+  Yjs keeps. `ApplyDelta`'s delete deleted no markers. So the same edits gave
+  a document with different markers in ygo and in Yjs, and text that a peer
+  inserted next to such a marker at the same time could get different
+  formatting. Both now use Yjs's rule. As in Yjs, the cleanup also compares an
+  object or array attribute value by identity, so a marker that restores such
+  a value matches the marker it was copied from. (reearth/ygo#350)
+- **`crdt`: an item whose origin or right origin is a GC struct becomes a GC
+  struct.** Yjs does this for either neighbour. ygo did it only when the item
+  had no live neighbour. With a GC right origin, ygo showed the item where
+  Yjs shows none. With a GC origin, ygo stored the item without linking it,
+  so a replica loaded from the document's encoded state showed other text
+  than the document, with the same state vector.
+  The item now becomes a GC struct once both neighbours are present, as in
+  Yjs. A GC struct is no longer split, as in Yjs. A move never claims a GC
+  struct, and a move that waits for a target that arrives as a GC struct
+  stops waiting. Waiting moves are indexed by target clock, so an update no
+  longer rescans all of them for every struct it adds, and deleted waiting
+  moves are dropped once they outnumber the live ones. (reearth/ygo#347)
+- **`crdt`: encoders keep an origin that names a GC struct, as Yjs does.**
+  They dropped it, so `MergeUpdatesV1/V2`, `DiffUpdateV1/V2`,
+  `UpdateV1ToV2`/`UpdateV2ToV1` and an encoded state holding a parked item
+  put the item into the text where the original updates make it a GC struct. (reearth/ygo#347)
+- **`crdt`: GC turns the items under a deleted nested type into GC structs.**
+  When the GC collected a deleted item that holds a nested type, it replaced
+  the item's content but kept the type's items, and those of the types nested
+  in it, as deleted items with their parent and origins. Yjs stores a GC
+  struct for each of them. The GC at the end of a transaction and `RunGC` now
+  turn every item under a collected type into a GC struct and empty the type,
+  as Yjs `ContentType.gc` does, so an item that arrives later in that type is
+  a GC struct too. For a map entry that holds an array of 10,000 one-entry
+  maps, the encoded state after the delete goes from 133,510 to 40,023 bytes.
+  Content does not change. A write through a handle to a type inside a
+  collected type no longer fires the deep observers above it, as in Yjs.
+  `Doc.Load` now reads a subdocument's parent from the subdocument under its
+  own lock, so it no longer races with the GC, with attaching the
+  subdocument or with an undo that restores it, and a removed or destroyed
+  subdocument no longer keeps its parent in memory.
+  `RunGC` also merges neighbouring GC structs of one client, as Yjs does at
+  the end of a transaction: after `RunGC`, the same delete keeps one GC
+  struct where it kept 20,000, and the state is 25 bytes. Both GC passes
+  take the contents of the structs they collect from blocks, so collecting n
+  items makes O(log n + n/128) allocations instead of n. (reearth/ygo#347)
+- **`crdt`: a Yjs `Y.XmlHook` keeps its type and hook name, and reads as Yjs
+  reads it.** ygo decoded a hook (type ref 5) to an untyped placeholder and
+  dropped its name, so every update it encoded from the document
+  (`EncodeStateAsUpdateV1`/`V2`, the `OnUpdate` output, `MergeUpdates`,
+  `DiffUpdate`, `UpdateV1ToV2`/`V2ToV1`, an undone delete) wrote the hook as an
+  empty `YArray` (type ref 0). ygo now keeps the hook and writes it back as Yjs
+  does. `ToJSON`, `Entries`, `ToSlice` and observer values give its entries as
+  an object, as Yjs `toJSON` does. `YXmlFragment.Children()` includes a hook,
+  so its indexes match `Len()`, and `ToXML` renders it as `[object Object]`,
+  as Yjs `toString` does. `YMap.Get` and `YArray.Get` return a hook as a
+  `*YMap`. State that an older ygo already stored keeps the hook as a
+  `YArray`. (reearth/ygo#347)
+- **`crdt`: a subdocument's opts are written as Yjs writes them.** Yjs
+  `ContentDoc` writes `gc: false`, `autoLoad: true` and `meta` only when they
+  are set, so a subdocument with GC on writes `{}`. ygo always wrote `gc` and
+  wrote a `collectionId` key that Yjs does not read, so its bytes differed
+  whenever GC was on, autoLoad was set or a collection ID was set. ygo now
+  writes the same keys in the same order and keeps a `meta` value it decodes.
+  A `collectionId` key that an earlier ygo wrote still decodes; the collection
+  ID is no longer sent, and a subdocument without one takes its parent's when
+  it is added, as in Yjs. A subdocument that an undo restores starts with
+  `ShouldLoad()` equal to `AutoLoad()` and takes its parent's collection ID,
+  as Yjs's copy does. (reearth/ygo#347)
+- **`crdt`: an undo that follows restored copies splits only the last one, as
+  Yjs does.** When an undo deleted an item that earlier undos had restored more
+  than once as part of a longer copy, every copy on the way was split at that
+  item. The split parts keep their link to the next copy, so they never merged
+  again, and the document held more structs than Yjs, with other V1 and V2
+  bytes. Undo now carries the offset along the copies and splits only the last
+  one. The content was already the same as in Yjs. (reearth/ygo#359)
+- **`crdt`: undo copies a restored run's content after tracing its neighbours,
+  as Yjs does.** When an undo traced a neighbour's restored copy into a run
+  that the same undo restores, Yjs splits the run there and restores only the
+  part before the split. ygo copied the content before the traces, so it
+  restored the whole run: different content from Yjs after that undo, and
+  other V1 and V2 bytes. A trace that passes through an earlier copy still
+  restores the whole run. An undo after a redo of the same run also leaves
+  the copy in between as one struct, where Yjs splits it, until ygo merges
+  every neighbour at the end of a transaction, as Yjs does. (reearth/ygo#359)
+- **`provider/websocket`: `CloseRoom` no longer leaves a peer that joins while
+  it runs on the room it removes.** `CloseRoom` takes the room's list of
+  peers, closes them and waits for them, makes the room's pending writes
+  durable while the room can still be found, and only then removes the room
+  from the server. A peer that connected after that list was taken and before
+  the room was removed joined the room all the same. `CloseRoom` never closed
+  it, so it stayed on a room the server no longer had and received no update
+  until it reconnected for some other reason. With `force`, `CloseRoom` now
+  closes that peer too before it returns; the peer's disconnect handler, and
+  `OnLastPeer` with it, may still run after `OnUnloadDocument`. Without
+  `force`, `CloseRoom` removed a room that had such a peer and returned nil;
+  it now returns `ErrRoomHasPeers` and leaves the room open, as its doc says. (reearth/ygo#331)
+- **`crdt`: a bounded document's remote apply no longer copies what earlier
+  updates parked.** To restore them when it refuses an update, the apply of a
+  document with a scan bound (`WithMaxIntegrateScan`) copied the pending queue's
+  items, the clocks it waits on and the pending deletes as it began, and the
+  drain copied the pending deletes again, so every remote apply cost time and
+  memory in proportion to what sat parked: one keystroke allocated 2,805,128
+  bytes on a bounded document holding 349,517 parked structs (1,624 unbounded)
+  and 61,515,232 bytes on one holding 524,280 parked delete ranges (44,735,792
+  unbounded). The apply now keeps them by reference: it only appends to the
+  parked items past the length it keeps, copies the map of clocks the queue
+  waits on at its first write to it, and merges a delete range it parks into
+  copies of the clients that range names, so a refused update still leaves the
+  parked items, the clocks they wait on and the pending deletes exactly as they
+  were. The same two keystrokes now allocate 3,208 and 44,737,376 bytes on a
+  bounded document (1,592 and 44,735,760 unbounded). (reearth/ygo#333)
+- **`crdt`: merging split runs back at commit is linear in the run.** An
+  unbounded apply of 20,000 halves into a 40,000-character run allocated
+  440,968,992 bytes before the linear merge. The same unbounded apply allocated
+  11,384,168 bytes with the first linear merge, and 12,565,704 bytes while
+  every transaction kept one map of scan marks. It now allocates 10,200,800
+  bytes, because only a bounded apply keeps scan marks. The same apply on a
+  document bounded at 1<<30 allocates 12,567,400 bytes, because it keeps a
+  rollback journal and one map of scan marks. The halves merge in clock order,
+  each run's text is joined once, and the merged halves leave their store slices
+  in one pass per client. (reearth/ygo#333)
+- **`crdt`: an observed `YText` whose format value is a map no longer panics
+  and locks its document for good.** A `YText.Observe` observer makes the
+  commit build a delta, and `attrDiff` compared format values with `!=`, so a
+  format whose value is a map or a slice (a link mark's attributes, as
+  y-prosemirror and Quill write them) panicked with "comparing uncomparable
+  type map[string]interface {}" on the next local or remote edit of that text.
+  It now compares them as the rest of the formatting code does
+  (`reflect.DeepEqual`). The panic also escaped with the document lock held,
+  because the commit built observer events unguarded when the `Transact`
+  callback had returned normally, so every later call on the document blocked
+  forever. A panic there now releases the lock first, as one in the callback
+  does, and reaches the caller; no observer fires. (reearth/ygo#335)
+- **`provider/websocket`: awareness keeps its sender connected.** A read-write
+  peer's valid update reaches every peer in its room. A read-only peer gets an
+  empty awareness response without changing shared awareness or retaining its
+  input. A lone idle editor or viewer on `@hocuspocus/provider` or the
+  `y-websocket` client now receives a message after its 15-second awareness
+  renewal and does not reconnect after its 30-second no-message timeout. (reearth/ygo#338)
+
+### Performance
+
+- **`crdt`: delete sets sort without allocating.** `DeleteSet.sortAndCompact`
+  and the V1 and V2 delete-set encoders sorted with `sort.Slice`, which
+  allocates three times per call; they now use `slices.SortFunc`. The output
+  is unchanged. (reearth/ygo#350)
+- **`crdt`: the delete set of a full-state encode or snapshot is built in one
+  pass.** Each client's ranges are built in clock order and stored once, as
+  Yjs's `createDeleteSetFromStructStore` does, in place of one map write per
+  deleted item and a sort per client. The bytes do not change. (reearth/ygo#350)
+- **`crdt`: encoding against a state vector skips the items the peer has by
+  binary search.** `EncodeStateAsUpdateV1`, `EncodeStateAsUpdateV2` and each
+  transaction's `OnUpdate` encode called `Content.Len` on every item of every
+  client and copied the matches; a client's items past the state vector are a
+  suffix of its clock-sorted items, now found with `sort.Search`, as Yjs's
+  `writeStructs` does. The bytes do not change. (reearth/ygo#350)
+- **`crdt`: `UndoManager.Undo` and `Redo` no longer copy the stacks.** Each
+  call copied the deletions of every remaining undo and redo stack item, for a
+  map-key check that rarely runs. So each call took time and memory in
+  proportion to the history, and undoing all of a stack of n items took
+  O(n²) time. The check now reads the stacks in place, as Yjs does. An undo
+  and redo pair with 10,000 stack items now allocates 4.6 KiB instead of
+  645 KiB and takes 98% less time (`BenchmarkUndoManager_UndoRedo`). A
+  transaction that merges into the newest stack item no longer copies that
+  item's deletions: 1,000 merged keystrokes allocate 3.0 MiB instead of
+  24.1 MiB and take 78% less time
+  (`BenchmarkUndoManager_CaptureMergedTyping`). A stack item that
+  `Undo`, `Redo`, `Clear` or a new edit removes is no longer kept alive by
+  the stack's backing array. (reearth/ygo#359)
+
+### Composition repairs
+
+- **`crdt`: on a bounded document, a drain past its scan allowance is taken
+  back and keeps every parked struct,** and a parked struct that panics in the
+  drain is dropped while the update that drained it stands. (reearth/ygo#340
+  with reearth/ygo#333)
+- **`crdt`: a type the garbage collector collects keeps its container for
+  `Parent`.** (reearth/ygo#336 with reearth/ygo#347)
+- **`crdt`: the update log takes a commit's update after the GC, with what
+  the commit parked beside it, exactly when `OnUpdate` is called for the
+  commit or the commit parked something,** so a bounded room's apply whose
+  drain is taken back logs every byte the client sent, in `Update` or
+  `Parked`, and a commit that changes and parks nothing is not logged.
+  (reearth/ygo#332 with reearth/ygo#350, reearth/ygo#333 and reearth/ygo#340)
+- **`crdt`: a bounded document's rollback gives back what the pending queue's
+  merge changed in place,** so a refused update leaves the queue as it found
+  it, and a drain taken back parks only the structs the queue holds.
+  (reearth/ygo#340 with reearth/ygo#333) A drain taken back also takes its
+  structs off the park record's list of drained structs, so the bytes a room
+  relays still carry them.
+
 ## [1.55.0] — 2026-10-31
 
 ### Added
