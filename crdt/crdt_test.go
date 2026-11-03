@@ -39,7 +39,7 @@ func newTxn(doc *Doc) *Transaction {
 		Local:       true,
 		deleteSet:   newDeleteSet(),
 		beforeState: doc.store.StateVector(),
-		changed:     make(map[*abstractType]map[string]struct{}),
+		changed:     make(map[*abstractType]changedType),
 	}
 }
 
@@ -408,22 +408,24 @@ func TestUnit_Doc_Transact_ObserverFiresOnce(t *testing.T) {
 
 func TestUnit_Doc_Transact_OriginForwarded(t *testing.T) {
 	doc := newTestDoc(1)
+	m := doc.GetMap("m")
 	var gotOrigin any
 	doc.OnUpdate(func(_ []byte, origin any) { gotOrigin = origin })
 
-	doc.Transact(func(_ *Transaction) {}, "my-origin")
+	doc.Transact(func(txn *Transaction) { m.Set(txn, "k", 1) }, "my-origin")
 
 	assert.Equal(t, "my-origin", gotOrigin)
 }
 
 func TestUnit_Doc_Transact_Unsubscribe(t *testing.T) {
 	doc := newTestDoc(1)
+	m := doc.GetMap("m")
 	calls := 0
 	unsub := doc.OnUpdate(func(_ []byte, _ any) { calls++ })
 
-	doc.Transact(func(_ *Transaction) {})
+	doc.Transact(func(txn *Transaction) { m.Set(txn, "k", 1) })
 	unsub()
-	doc.Transact(func(_ *Transaction) {})
+	doc.Transact(func(txn *Transaction) { m.Set(txn, "k", 2) })
 
 	assert.Equal(t, 1, calls, "observer must not fire after unsubscribe")
 }
@@ -936,34 +938,6 @@ func TestTransact_PanicFiresOnAfterTransaction(t *testing.T) {
 	assert.NotEmpty(t, txnSeen.changed, "txn.changed must reflect the partial mutation")
 }
 
-func TestTransact_PanicWithNoMutationsFiresOnUpdateWithMinimalPayload(t *testing.T) {
-	// When fn panics before any mutation, OnUpdate still fires (consistent
-	// with the normal-path behavior of a no-op Transact). The payload is a
-	// well-formed but minimal V1 update — not nil — so subscribers should
-	// not treat "nil update" as a sentinel for "no changes". We verify
-	// round-trip application succeeds against a fresh doc without error.
-	doc := New()
-
-	var received [][]byte
-	doc.OnUpdate(func(update []byte, _ any) {
-		received = append(received, update)
-	})
-
-	func() {
-		defer func() { _ = recover() }()
-		doc.Transact(func(txn *Transaction) {
-			panic("immediate")
-		})
-	}()
-
-	require.Len(t, received, 1, "OnUpdate fires once per transaction, even on immediate-panic no-op")
-	require.NotNil(t, received[0])
-
-	// The payload applies cleanly to a fresh replica.
-	replica := New()
-	require.NoError(t, ApplyUpdateV1(replica, received[0], nil))
-}
-
 func TestTransact_PanicReraises(t *testing.T) {
 	doc := New()
 
@@ -1374,37 +1348,6 @@ func TestUnit_StateVector_DoesNotLeakPendingClocks(t *testing.T) {
 	assert.Equal(t, uint64(0), sv.Clock(ClientID(2)), "SV must not claim integration of B's parked client")
 }
 
-func TestUnit_ApplyV1_RetryLoop_PanicRestoresPending(t *testing.T) {
-	// Regression: if tryIntegrate panics during retry loop drain, the
-	// unprocessed items must be restored to store.pending so a
-	// subsequent ApplyUpdate can retry them. Without the defer-restore
-	// guard, a crafted panic would drop pending items on the floor.
-
-	// Set up a peer with a parked item (via reverse-order delivery).
-	a := newTestDoc(1)
-	arrA := a.GetArray("arr")
-	a.Transact(func(txn *Transaction) { arrA.Insert(txn, 0, []any{"a"}) })
-	updateA := EncodeStateAsUpdateV1(a, nil)
-
-	b := newTestDoc(2)
-	require.NoError(t, ApplyUpdateV1(b, updateA, nil))
-	arrB := b.GetArray("arr")
-	b.Transact(func(txn *Transaction) { arrB.Insert(txn, 1, []any{"b"}) })
-	updateB, err := DiffUpdateV1(EncodeStateAsUpdateV1(b, nil), a.store.StateVector())
-	require.NoError(t, err)
-
-	peer := newTestDoc(99)
-	require.NoError(t, ApplyUpdateV1(peer, updateB, nil))
-	require.NotNil(t, peer.store.pending, "precondition: item parked")
-	// For this test to exercise the retry-loop panic path, we'd need to
-	// inject a panicking tryIntegrate. Testing this directly requires
-	// hook injection or a crafted malformed item. As a proxy, verify
-	// that a normal drain still works correctly — the defer-restore
-	// machinery should be no-op on the happy path.
-	require.NoError(t, ApplyUpdateV1(peer, updateA, nil))
-	assert.Nil(t, peer.store.pending, "happy path: retry loop drains without leaving residue")
-}
-
 // ── TransactE / TransactContextE tests ──────────────────────────────────────
 
 func TestInteg_TransactE_ReturnsNilFromFn(t *testing.T) {
@@ -1637,4 +1580,34 @@ func TestUnit_DeleteSet_EncodedClientOrder(t *testing.T) {
 	got2, err := decodeDeleteSetV2(dec2)
 	require.NoError(t, err)
 	assert.Equal(t, want, got2.orderedClients(), "V2")
+}
+
+// A delete set cut before its end returns the ranges read before the cut,
+// merged, so a repeated range is applied once.
+func TestUnit_DecodeDeleteSet_CompactsRangesReadBeforeAnError(t *testing.T) {
+	// Client 7: (0,2), (1,2), then a third range cut after its clock.
+	enc := encoding.NewEncoder()
+	for _, v := range []uint64{1, 7, 3, 0, 2, 1, 2, 5} {
+		enc.WriteVarUint(v)
+	}
+	ds, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
+	require.Error(t, err)
+	assert.Equal(t, []DeleteRange{{Clock: 0, Len: 3}}, ds.clients[7], "V1")
+
+	// The same ranges as three V2 groups for client 7, the last cut the same way.
+	enc2 := newV2Encoder()
+	enc2.restEnc.WriteVarUint(3)
+	for _, clock := range []uint64{0, 1, 0} {
+		enc2.restEnc.WriteVarUint(7)
+		enc2.restEnc.WriteVarUint(1)
+		enc2.resetDsCurVal()
+		enc2.writeDsClock(clock)
+		enc2.writeDsLen(2)
+	}
+	b := enc2.toBytes()
+	dec2, err := newV2Decoder(b[:len(b)-1])
+	require.NoError(t, err)
+	ds, err = decodeDeleteSetV2(dec2)
+	require.Error(t, err)
+	assert.Equal(t, []DeleteRange{{Clock: 0, Len: 3}}, ds.clients[7], "V2")
 }

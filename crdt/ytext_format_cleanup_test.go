@@ -152,7 +152,7 @@ func TestUnit_YText_RemoteCleanupPanicUnlocks(t *testing.T) {
 	assert.Equal(t, 1, countLiveContentFormat(c), "the cleanup's deletion reached the peer")
 }
 
-// The cleanup and the remote change's GC run even when an observer of the
+// The cleanup and the remote change's GC run even when a deep observer of the
 // change panics, as Yjs runs every cleanup step; the panic then reaches the
 // caller with the document unlocked.
 func TestUnit_YText_FormatCleanup_AfterObserverPanic(t *testing.T) {
@@ -164,8 +164,8 @@ func TestUnit_YText_FormatCleanup_AfterObserverPanic(t *testing.T) {
 	b.Transact(func(txn *Transaction) { bt.Format(txn, 2, 1, Attributes{"bold": true}) })
 	var origins []any
 	b.OnUpdate(func(_ []byte, origin any) { origins = append(origins, origin) })
-	bt.Observe(func(e YTextEvent) {
-		if !e.Txn.Local {
+	bt.ObserveDeep(func(txn *Transaction) {
+		if !txn.Local {
 			assert.Equal(t, 2, countLiveContentFormat(b), "the observer runs before the cleanup")
 			panic("observer")
 		}
@@ -173,7 +173,7 @@ func TestUnit_YText_FormatCleanup_AfterObserverPanic(t *testing.T) {
 
 	assert.PanicsWithValue(t, "observer", func() { syncText(t, a, b, "remote") })
 	assert.Equal(t, 1, countLiveContentFormat(b))
-	assert.Equal(t, []any{nil}, origins, "the cleanup's update; the panic skipped the remote one's")
+	assert.Equal(t, []any{"remote", nil}, origins, "the remote change's update, then the cleanup's")
 	for _, it := range b.store.clients[1] {
 		assert.IsType(t, &ContentDeleted{}, it.Content, "the remote deletion is GC'd")
 	}
@@ -255,7 +255,9 @@ func TestUnit_YText_FormatCleanup_LazyRoot(t *testing.T) {
 // Parked deletions are retried clients descending, as Yjs re-reads its
 // encoded pending delete set. Here the higher client's marker deletions are
 // visited first and queue the full cleanup, which skips the contextless
-// cleanup the lower client's character deletion would otherwise run.
+// cleanup the lower client's character deletion would otherwise run. With the
+// character typed by a client above the markers' client, its deletion is
+// visited first and that contextless cleanup runs, deleting one opener.
 func TestUnit_YText_FormatCleanup_PendingDeleteOrder(t *testing.T) {
 	rec := func(d *Doc, fn func(*YText, *Transaction)) []byte {
 		sv := d.StateVector()
@@ -274,51 +276,113 @@ func TestUnit_YText_FormatCleanup_PendingDeleteOrder(t *testing.T) {
 	fb, fd := rec(peer(2), bold), rec(peer(5), bold) // duplicate openers before "a"
 	c := peer(3)
 	fc := rec(c, bold)
-	x := rec(peer(1), func(t *YText, txn *Transaction) { t.Insert(txn, 1, "x", nil) })
-	ds := newDeleteSet()
-	ds.add(ID{1, 0}, 1)
-	ds.add(ID{3, 0}, int(c.StateVector()[3]))
-	enc := encoding.NewEncoder()
-	enc.WriteVarUint(0)
-	encodeDeleteSet(enc, ds)
-	late, err := MergeUpdatesV1(fc, x)
-	require.NoError(t, err)
 
-	r := newTestDoc(9)
-	r.GetText("t")
-	cleanups := 0
-	r.OnUpdate(func(_ []byte, origin any) {
-		if origin == nil {
-			cleanups++
+	// deliver has client typist type x and delivers the updates with a parked
+	// delete set naming x and client 3's markers; it returns the cleanups and
+	// the live markers.
+	deliver := func(typist ClientID) (cleanups, live int) {
+		x := rec(peer(uint64(typist)), func(t *YText, txn *Transaction) { t.Insert(txn, 1, "x", nil) })
+		ds := newDeleteSet()
+		ds.add(ID{typist, 0}, 1)
+		ds.add(ID{3, 0}, int(c.StateVector()[3]))
+		enc := encoding.NewEncoder()
+		enc.WriteVarUint(0)
+		encodeDeleteSet(enc, ds)
+		late, err := MergeUpdatesV1(fc, x)
+		require.NoError(t, err)
+		r := newTestDoc(9)
+		r.GetText("t")
+		r.OnUpdate(func(_ []byte, origin any) {
+			if origin == nil {
+				cleanups++
+			}
+		})
+		for _, u := range [][]byte{base, fb, fd, enc.Bytes(), late} {
+			require.NoError(t, ApplyUpdateV1(r, u, "remote"))
 		}
-	})
-	for _, u := range [][]byte{base, fb, fd, enc.Bytes(), late} {
-		require.NoError(t, ApplyUpdateV1(r, u, "remote"))
+		require.Empty(t, r.store.pendingDs.clients)
+		return cleanups, countLiveContentFormat(r)
 	}
-	require.Empty(t, r.store.pendingDs.clients)
+	cleanups, live := deliver(1)
 	assert.Equal(t, 0, cleanups)
-	assert.Equal(t, 4, countLiveContentFormat(r))
+	assert.Equal(t, 4, live)
+	cleanups, live = deliver(6)
+	assert.Equal(t, 1, cleanups, "the contextless cleanup ran when the character's deletion came first")
+	assert.Equal(t, 3, live)
+}
+
+// The cleanup visits deleted clients in the order they joined the remote
+// transaction's delete set. An item that arrives with deleted content joins
+// when it integrates, as in Yjs's ContentDeleted.integrate, so here client
+// 10's deleted "e" is visited first and its gap cleanup deletes 11:5. A GC
+// struct in its place joins nothing, so client 11's marker deletion comes
+// first and the full cleanup keeps 11:5. The prior state and the deleted
+// item's update are Yjs's; the GC update swaps that item for a GC struct.
+func TestUnit_YText_FormatCleanup_ArrivedDeletionOrder(t *testing.T) {
+	const (
+		priorV1   = "02060b0006010174066974616c69630474727565840b000164860b01066974616c6963046e756c6c440a00026465c60a000a01066974616c696303227822c60a010b00066974616c6963046e756c6c020a00040101740164840a00016500"
+		priorV2   = "0003000301074b014a020b4a00050002420242030002420d0600840086004400c601040084291f746974616c6963646974616c696364656974616c69636974616c696374646501060106024600410101010000020600787e7701787e020000"
+		deletedV1 = "01010a02410a0001020b0100030a010102"
+		deletedV2 = "0000024a000001000141010000000101010102020b0100020a010101"
+		gcV1      = "01010a020001020b0100030a010102"
+		gcV2      = "0000010a00000100010000000101010102020b0100020a010101"
+	)
+	for _, tc := range []struct {
+		name          string
+		apply         func(*Doc, []byte, any) error
+		prior, update string
+		want          []ID
+	}{
+		{"deleted_v1", ApplyUpdateV1, priorV1, deletedV1, []ID{{11, 6}}},
+		{"deleted_v2", ApplyUpdateV2, priorV2, deletedV2, []ID{{11, 6}}},
+		{"gc_v1", ApplyUpdateV1, priorV1, gcV1, []ID{{11, 5}, {11, 6}}},
+		{"gc_v2", ApplyUpdateV2, priorV2, gcV2, []ID{{11, 5}, {11, 6}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := newTestDoc(2)
+			txt := doc.GetText("t")
+			for _, u := range []string{tc.prior, tc.update} {
+				require.NoError(t, tc.apply(doc, mustHex(t, u), nil))
+			}
+			var live []ID
+			for it := txt.start; it != nil; it = it.Right {
+				if _, ok := it.Content.(*ContentFormat); ok && !it.Deleted {
+					live = append(live, it.ID)
+				}
+			}
+			assert.Equal(t, tc.want, live)
+		})
+	}
 }
 
 // Attribute values compare as JavaScript's === does: scalars by value, and a
-// composite value only to itself, each marker holding its own object as a
-// decoded Yjs marker does.
+// map or slice by identity, so two markers share an object only when one
+// value was copied from the other, as in a local Yjs document.
 func TestUnit_YText_FormatCleanup_ValueIdentity(t *testing.T) {
 	f := func(v any) *ContentFormat { return NewContentFormat("k", v) }
 	buf := []byte{1, 2, 3}
 	m := map[string]any{"a": 1}
+	l := []any{1}
 	same := f([]any{})
+	emptyBytes := f([]byte{})
 	for _, tc := range []struct {
 		name string
 		a, b *ContentFormat
 		want bool
 	}{
-		{"byte views of one buffer", f(buf[:2]), f(buf[:2]), false},
+		{"one byte view in two markers", f(buf[:2]), f(buf[:2]), true},
+		{"two views of one buffer", f(buf[:2]), f(buf[:3]), false},
+		{"equal byte slices", f([]byte{1}), f([]byte{1}), false},
 		{"empty slices", f([]any{}), f([]any{}), false},
 		{"empty byte slices", f([]byte{}), f([]byte{}), false},
 		{"empty maps", f(map[string]any{}), f(map[string]any{}), false},
-		{"one map in two markers", f(m), f(m), false},
+		{"equal maps", f(map[string]any{"a": 1}), f(map[string]any{"a": 1}), false},
+		{"one map in two markers", f(m), f(m), true},
+		{"one slice in two markers", f(l), f(l), true},
 		{"one marker", same, same, true},
+		{"a marker made from another's empty slice", same, f(same.Val), true},
+		{"a marker made from another's empty byte slice", emptyBytes, f(emptyBytes.Val), true},
+		{"nil slices", f([]any(nil)), f([]any(nil)), false},
 		{"integer and float", f(int64(1)), f(1.0), true},
 		{"NaN", f(math.NaN()), f(math.NaN()), false},
 		{"strings", f("x"), f("x"), true},

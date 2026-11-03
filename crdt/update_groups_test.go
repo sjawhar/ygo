@@ -63,8 +63,9 @@ func TestUnit_SupersededGroups_MatchLastGroupPerClient(t *testing.T) {
 					require.NoError(t, err)
 					rest = *v2.restDec
 				}
-				set, err := supersededGroups(update, v2, rest)
+				set, structs, _, err := supersededGroups(update, v2, rest)
 				require.NoError(t, err)
+				require.Equal(t, 3*len(clients), structs, "the scan counts every group's three structs")
 				last := map[ClientID]int{}
 				for i, c := range clients {
 					last[c] = i
@@ -102,12 +103,12 @@ func repeatedGroupsUpdate(t *testing.T, version int, malformed bool) []byte {
 		enc.WriteVarUint(9)
 		enc.WriteVarUint(0)
 		for _, it := range items {
-			encodeItem(enc, it, 0, src.store)
+			encodeItem(enc, it, 0)
 		}
 		enc.WriteVarUint(1)
 		enc.WriteVarUint(9)
 		enc.WriteVarUint(0)
-		encodeItem(enc, items[0], 0, src.store)
+		encodeItem(enc, items[0], 0)
 		if malformed {
 			enc.WriteVarUint(1)
 			enc.WriteVarUint(10)
@@ -125,12 +126,12 @@ func repeatedGroupsUpdate(t *testing.T, version int, malformed bool) []byte {
 	e2.writeClient(9)
 	e2.restEnc.WriteVarUint(0)
 	for _, it := range items {
-		encodeItemV2(e2, it, 0, src.store)
+		encodeItemV2(e2, it, 0)
 	}
 	e2.restEnc.WriteVarUint(1)
 	e2.writeClient(9)
 	e2.restEnc.WriteVarUint(0)
-	encodeItemV2(e2, items[0], 0, src.store)
+	encodeItemV2(e2, items[0], 0)
 	if malformed {
 		e2.restEnc.WriteVarUint(1)
 		e2.writeClient(10)
@@ -182,9 +183,7 @@ func TestUnit_SupersededGroups_StateVectorFromUpdate(t *testing.T) {
 		}
 		raw, err := encode(update)
 		require.NoError(t, err)
-		sv, err := DecodeStateVectorV1(raw)
-		require.NoError(t, err)
-		require.Equal(t, StateVector{9: 1}, sv, "V%d", version)
+		require.Equal(t, []byte{1, 9, 1}, raw, "V%d", version)
 	}
 }
 

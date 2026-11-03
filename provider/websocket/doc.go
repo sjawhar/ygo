@@ -29,26 +29,21 @@
 // a nil error accepts the connection (replying Authenticated with a
 // "read-write" or "readonly" scope, per the returned ConnectionConfig); a
 // non-nil error replies PermissionDenied and closes the connection with the
-// Hocuspocus 4401 code. When OnTokenAuth is nil (the default), Auth (tag 2)
-// frames are ignored — the legacy y-websocket behavior, preserved for
-// backward compatibility with clients that never send them.
+// Hocuspocus 4401 code. Set Server.OnTokenAuthContext instead when the hook
+// needs the connection's request context: with a key the embedder puts on it,
+// the hook can tell apart two connections that send the same token. When both
+// are nil (the default), Auth (tag 2) frames are ignored — the legacy
+// y-websocket behavior, preserved for backward compatibility with clients
+// that never send them.
 //
 // Set Server.HocuspocusFraming to true to additionally read and write the
 // Hocuspocus docName-prefixed wire framing (VarString(docName) + frame),
 // enabling real interop with an unmodified @hocuspocus/provider client.
 // Leave it false (the default) for native y-websocket clients.
 //
-// On a Hocuspocus-framed connection the server answers every SyncStep2 or
-// Update the client sends, under Sync (tag 0) or SyncReply (tag 4), with
-// exactly one SyncStatus (tag 8) frame, in the order the frames arrived, so
-// the provider's unsynced-changes count drops for every update the room
-// applied (1), and stays up for one it did not (0): 0 when the room did not
-// fully apply it (it does not decode, or it overflows MaxPendingItems; the
-// part that did integrate still reaches the other peers); for a read-only
-// connection, 0 for an Update, and for a SyncStep2 1 when the room already
-// holds everything in it and 0 otherwise. A sync frame that does not decode
-// gets no SyncStatus: the server closes the connection with 1002 (protocol
-// error) and handles no later frame from it.
+// On a Hocuspocus-framed connection the server answers each SyncStep2 or
+// Update with one SyncStatus frame so the provider's unsynced-changes count
+// stays accurate; README.md ("Hocuspocus sync status") lists each status.
 //
 // # Stability
 //

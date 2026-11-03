@@ -78,11 +78,7 @@ func (a *YArray) prepareFire(txn *Transaction, _ map[string]struct{}) func() {
 	snap := make([]arraySub, len(a.observers))
 	copy(snap, a.observers)
 	e := YArrayEvent{Target: a, Txn: txn, Delta: delta}
-	return func() {
-		for _, s := range snap {
-			s.fn(e)
-		}
-	}
+	return func() { callAll(snap, func(s arraySub) { s.fn(e) }) }
 }
 
 // computeDelta builds a Quill-compatible delta for the array changes in
@@ -213,6 +209,9 @@ func rejectSharedVals(vals []any) {
 
 // Insert inserts vals at logical position index (0 = prepend, Len() = append).
 func (a *YArray) Insert(txn *Transaction, index int, vals []any) {
+	if len(vals) == 0 {
+		return // Yjs makes no item for no values.
+	}
 	for i, v := range vals {
 		checkAnyUTF8("YArray.Insert", fmt.Sprintf("value[%d]", i), v)
 	}
@@ -291,6 +290,9 @@ func (a *YArray) insertContentAfterItem(txn *Transaction, left *Item, content Co
 // a Yjs peer would order the two results differently — a convergence divergence
 // surfaced by the #70 cross-impl fuzz oracle.
 func (a *YArray) Push(txn *Transaction, vals []any) {
+	if len(vals) == 0 {
+		return // Yjs makes no item for no values.
+	}
 	for i, v := range vals {
 		checkAnyUTF8("YArray.Push", fmt.Sprintf("value[%d]", i), v)
 	}
@@ -363,7 +365,7 @@ func (a *YArray) Get(index int) any {
 	}
 	switch c := valItem.Content.(type) {
 	case *ContentType:
-		return c.Type.owner
+		return readOwner(c.Type.owner)
 	}
 	return nil
 }
@@ -726,7 +728,7 @@ func (a *YArray) Move(txn *Transaction, fromIndex, toIndex int) {
 	moveItem.integrate(txn, 0)
 }
 
-// deleteRange is shared by YArray and YText to delete a logical range.
+// deleteRange deletes a logical range of a YArray.
 func deleteRange(t *abstractType, txn *Transaction, index, length int) {
 	if length <= 0 {
 		return
@@ -794,7 +796,8 @@ func deleteRange(t *abstractType, txn *Transaction, index, length int) {
 			// Winning ContentMove: the rendered values come from the moved TARGET
 			// (renderAt), not from this ContentMove item. TargetLen is always 1
 			// (Move() forces single-element targets; resolveMovedItem trims remote
-			// moves to it), so n == 1 — the moved element is atomic and can only be
+			// moves to it, except a GC target, which is deleted and never renders),
+			// so n == 1 — the moved element is atomic and can only be
 			// fully within the deletion range here (counted >= index, since an
 			// integer index cannot land strictly inside a width-1 rendered step).
 			// Deleting the target makes BOTH the target's origin slot and this
@@ -805,8 +808,8 @@ func deleteRange(t *abstractType, txn *Transaction, index, length int) {
 			//
 			// Defensive guard (#181 follow-up): the line above assumes n <= length,
 			// which today always holds because n == 1 (TargetLen is forced to 1 by
-			// Move() and resolveMovedItem only ever clamps a remote target DOWN to
-			// <= TargetLen, never merges multiple items up to it) and length >= 1
+			// Move() and resolveMovedItem only ever clamps a live remote target DOWN
+			// to <= TargetLen, never merges multiple items up to it) and length >= 1
 			// here (the loop guard). But TargetLen travels over the wire
 			// (update.go/update_v2.go encode it verbatim), so a hand-built or
 			// foreign update could carry TargetLen > 1 against an item that is

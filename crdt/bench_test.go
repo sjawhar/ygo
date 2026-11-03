@@ -1,7 +1,9 @@
 package crdt
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -100,6 +102,38 @@ func BenchmarkYText_Delete(b *testing.B) {
 		for txt.Len() > 0 {
 			doc.Transact(func(txn *Transaction) {
 				txt.Delete(txn, 0, 1)
+			})
+		}
+	}
+}
+
+// BenchmarkYText_DeleteFormatted builds a 1000-character text in which every
+// third five-character word is bold and every fifth italic, then deletes it
+// one character at a time at random positions, so some deletions leave format
+// markers to clean up.
+func BenchmarkYText_DeleteFormatted(b *testing.B) {
+	b.ReportAllocs()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		doc := newTestDoc(1)
+		txt := doc.GetText("text")
+		doc.Transact(func(txn *Transaction) {
+			txt.Insert(txn, 0, strings.Repeat("abcde", 200), nil)
+			for w := 0; w < 200; w += 3 {
+				txt.Format(txn, w*5, 5, Attributes{"bold": true})
+			}
+			for w := 0; w < 200; w += 5 {
+				txt.Format(txn, w*5, 5, Attributes{"italic": true})
+			}
+		})
+		rng := rand.New(rand.NewSource(1))
+		b.StartTimer()
+
+		for txt.Len() > 0 {
+			doc.Transact(func(txn *Transaction) {
+				txt.Delete(txn, rng.Intn(txt.Len()), 1)
 			})
 		}
 	}
@@ -257,6 +291,102 @@ func BenchmarkApplyUpdateV2_Bulk(b *testing.B) {
 	}
 }
 
+// BenchmarkApplyUpdateV1_Small applies a one-keystroke V1 update, a single
+// one-character struct, to a fresh document on every iteration.
+func BenchmarkApplyUpdateV1_Small(b *testing.B) {
+	src, _ := buildTextDocBulk(1)
+	benchApplyUpdate(b, EncodeStateAsUpdateV1(src, nil), ApplyUpdateV1)
+}
+
+// BenchmarkApplyUpdateV2_Small is BenchmarkApplyUpdateV1_Small in V2.
+func BenchmarkApplyUpdateV2_Small(b *testing.B) {
+	src, _ := buildTextDocBulk(1)
+	benchApplyUpdate(b, EncodeStateAsUpdateV2(src, nil), ApplyUpdateV2)
+}
+
+// BenchmarkApplyUpdateV1_Large applies a V1 update of 200,000 one-character
+// structs from one client, twice the default pending cap, to a fresh document
+// on every iteration.
+func BenchmarkApplyUpdateV1_Large(b *testing.B) {
+	src, _ := buildTextDoc(200_000)
+	benchApplyUpdate(b, EncodeStateAsUpdateV1(src, nil), ApplyUpdateV1)
+}
+
+// BenchmarkApplyUpdateV2_Large is BenchmarkApplyUpdateV1_Large in V2.
+func BenchmarkApplyUpdateV2_Large(b *testing.B) {
+	src, _ := buildTextDoc(200_000)
+	benchApplyUpdate(b, EncodeStateAsUpdateV2(src, nil), ApplyUpdateV2)
+}
+
+// buildDeletedEveryOther is a text of 2n characters with every second one
+// deleted, whose state carries n delete ranges.
+func buildDeletedEveryOther(n int) *Doc {
+	src, txt := buildTextDocBulk(2 * n)
+	src.Transact(func(txn *Transaction) {
+		for i := range n {
+			txt.Delete(txn, i+1, 1)
+		}
+	})
+	return src
+}
+
+// BenchmarkApplyUpdateV1_DeleteSetOverTheCap applies a state of 5,000 delete
+// ranges to a document whose pending cap is far smaller, so the parked-range
+// check reads the delete set before the apply.
+func BenchmarkApplyUpdateV1_DeleteSetOverTheCap(b *testing.B) {
+	update := EncodeStateAsUpdateV1(buildDeletedEveryOther(5_000), nil)
+	benchApplyUpdate(b, update, func(_ *Doc, u []byte, origin any) error {
+		return ApplyUpdateV1(New(WithClientID(2), WithMaxPendingItems(100)), u, origin)
+	})
+}
+
+// BenchmarkApplyUpdateV2_DeleteSetOverTheCap is
+// BenchmarkApplyUpdateV1_DeleteSetOverTheCap in V2.
+func BenchmarkApplyUpdateV2_DeleteSetOverTheCap(b *testing.B) {
+	update := EncodeStateAsUpdateV2(buildDeletedEveryOther(5_000), nil)
+	benchApplyUpdate(b, update, func(_ *Doc, u []byte, origin any) error {
+		return ApplyUpdateV2(New(WithClientID(2), WithMaxPendingItems(100)), u, origin)
+	})
+}
+
+// BenchmarkApplyUpdate_CraftedDeleteSet applies each of craftedDeleteSets at
+// the default cap, which refuses or parks it, and with the cap lifted, which
+// parks it whole; B/op over the update's bytes is what a delete set costs.
+func BenchmarkApplyUpdate_CraftedDeleteSet(b *testing.B) {
+	for _, format := range applyFormats {
+		for _, shape := range craftedDeleteSets(format.v2) {
+			update, apply := encodeRawDeleteSet(shape.entries, format.v2), ApplyUpdateV1
+			if format.v2 {
+				apply = ApplyUpdateV2
+			}
+			for _, lifted := range []bool{false, true} {
+				name, opts := shape.name+"/"+format.name+"/default_cap", []DocOption{WithClientID(1)}
+				if lifted {
+					name, opts = shape.name+"/"+format.name+"/cap_lifted", append(opts, WithMaxPendingItems(math.MaxInt))
+				}
+				b.Run(name, func(b *testing.B) {
+					b.ReportAllocs()
+					for range b.N {
+						if err := apply(New(opts...), update, nil); err != nil && (lifted && !shape.cut || !errors.Is(err, ErrInvalidUpdate)) {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func benchApplyUpdate(b *testing.B, update []byte, apply func(*Doc, []byte, any) error) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := apply(newTestDoc(2), update, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkMergeUpdatesV1 encodes 10 small V1 updates (100 chars each) and
 // then merges them into a single update on each iteration.
 func BenchmarkMergeUpdatesV1(b *testing.B) {
@@ -280,6 +410,42 @@ func BenchmarkMergeUpdatesV1(b *testing.B) {
 			b.Fatal(err)
 		}
 		_ = merged
+	}
+}
+
+// BenchmarkEncodeStateVectorFromUpdate reads the state vector of 10 clients'
+// merged updates (100 chars each).
+func BenchmarkEncodeStateVectorFromUpdate(b *testing.B) {
+	var v1, v2 [][]byte
+	for i := 0; i < 10; i++ {
+		doc, _ := buildTextDocWithClient(uint64(i+1), 100)
+		v1 = append(v1, EncodeStateAsUpdateV1(doc, nil))
+		v2 = append(v2, EncodeStateAsUpdateV2(doc, nil))
+	}
+	merged1, err := MergeUpdatesV1(v1...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	merged2, err := MergeUpdatesV2(v2...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, bc := range []struct {
+		name   string
+		update []byte
+		encode func([]byte) ([]byte, error)
+	}{
+		{"V1", merged1, EncodeStateVectorFromUpdate},
+		{"V2", merged2, EncodeStateVectorFromUpdateV2},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := bc.encode(bc.update); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
@@ -971,6 +1137,82 @@ func benchObservedTxn(b *testing.B, withObserver bool) {
 func BenchmarkObservedTxn_Apply(b *testing.B)         { benchObservedTxn(b, true) }
 func BenchmarkObservedTxn_ApplyBaseline(b *testing.B) { benchObservedTxn(b, false) }
 
+// BenchmarkObservedTxn_EveryObserverKind measures a single-character append
+// with two type observers, a deep observer, an OnUpdate and an
+// OnAfterTransaction observer. A fresh document every 256 appends keeps the
+// time per append independent of b.N.
+func BenchmarkObservedTxn_EveryObserverKind(b *testing.B) {
+	var doc *Doc
+	var txt *YText
+	fresh := func() {
+		doc = newTestDoc(1)
+		txt = doc.GetText("t")
+		doc.Transact(func(txn *Transaction) { txt.Insert(txn, 0, "seed", nil) })
+		txt.Observe(func(YTextEvent) {})
+		txt.Observe(func(YTextEvent) {})
+		txt.ObserveDeep(func(*Transaction) {})
+		doc.OnUpdate(func([]byte, any) {})
+		doc.OnAfterTransaction(func(*Transaction) {})
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if i%256 == 0 {
+			b.StopTimer()
+			fresh()
+			b.StartTimer()
+		}
+		doc.Transact(func(txn *Transaction) { txt.Insert(txn, txt.Len(), "x", nil) })
+	}
+}
+
+// BenchmarkObservedTxn_RemoteFormatted measures applying a one-character
+// remote insert to a formatted text, with and without a type observer, which
+// is where the remote format cleanup is decided. A fresh pair of documents
+// every 256 updates keeps the time per update independent of b.N.
+func BenchmarkObservedTxn_RemoteFormatted(b *testing.B) {
+	for _, observed := range []bool{false, true} {
+		b.Run(fmt.Sprintf("observed=%t", observed), func(b *testing.B) {
+			const batch = 256
+			var peer *Doc
+			updates := make([][]byte, 0, batch)
+			fresh := func() {
+				src := newTestDoc(1)
+				txt := src.GetText("t")
+				src.Transact(func(txn *Transaction) { txt.Insert(txn, 0, "seed", Attributes{"bold": true}) })
+				peer = newTestDoc(2)
+				ptxt := peer.GetText("t") // a typed root, not a placeholder, so it gets the cleanup
+				if observed {
+					ptxt.Observe(func(YTextEvent) {})
+				}
+				if err := ApplyUpdateV1(peer, EncodeStateAsUpdateV1(src, nil), nil); err != nil {
+					b.Fatal(err)
+				}
+				updates = updates[:0]
+				for range batch {
+					sv := src.StateVector()
+					src.Transact(func(txn *Transaction) { txt.Insert(txn, txt.Len(), "x", nil) })
+					updates = append(updates, EncodeStateAsUpdateV1(src, sv))
+				}
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := range b.N {
+				if i%batch == 0 {
+					b.StopTimer()
+					fresh()
+					b.StartTimer()
+				}
+				if err := ApplyUpdateV1(peer, updates[i%batch], nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkUndoManager_UndoMapClear undoes the deletion of every key of a
 // 10k-key map, restoring each entry.
 func BenchmarkUndoManager_UndoMapClear(b *testing.B) {
@@ -997,6 +1239,75 @@ func BenchmarkUndoManager_UndoMapClear(b *testing.B) {
 		b.StartTimer()
 		if !um.Undo() {
 			b.Fatal("nothing undone")
+		}
+	}
+}
+
+// BenchmarkUndoManager_UndoInsertsThroughRedoneCopies undoes 1k one-element
+// inserts whose elements two earlier undos restored as one run each, so every
+// undo follows a redone chain into the middle of both copies.
+func BenchmarkUndoManager_UndoInsertsThroughRedoneCopies(b *testing.B) {
+	const n = 1_000
+	for range b.N {
+		b.StopTimer()
+		doc := New(WithClientID(1))
+		a := doc.GetArray("a")
+		um := NewUndoManager(doc, []SharedType{a})
+		step := func(fn func(*Transaction)) {
+			doc.Transact(fn)
+			um.StopCapturing()
+		}
+		step(func(txn *Transaction) { a.InsertType(txn, 0, NewArrayPrelim()) })
+		nested := a.Get(0).(*YArray)
+		for i := range n {
+			step(func(txn *Transaction) { nested.Insert(txn, i, []any{i}) })
+		}
+		for range 2 {
+			step(func(txn *Transaction) {
+				a.Delete(txn, 0, 1)
+				a.Insert(txn, 0, []any{-1})
+			})
+			um.Undo()
+		}
+		b.StartTimer()
+		for range n {
+			if !um.Undo() {
+				b.Fatal("nothing undone")
+			}
+		}
+	}
+}
+
+// BenchmarkUndoManager_UndoRedo undoes and redoes the newest of depth stack
+// items, so the stack depth stays fixed.
+func BenchmarkUndoManager_UndoRedo(b *testing.B) {
+	for _, depth := range []int{100, 1_000, 10_000} {
+		b.Run(fmt.Sprintf("depth=%d", depth), func(b *testing.B) {
+			um := undoStackOfDepth(depth)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if !um.Undo() || !um.Redo() {
+					b.Fatal("nothing undone")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkUndoManager_CaptureMergedTyping types and backspaces 1,000 times
+// into one stack item, so each capture merges into a growing delete set.
+func BenchmarkUndoManager_CaptureMergedTyping(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		doc := newTestDoc(1)
+		txt := doc.GetText("t")
+		NewUndoManager(doc, []SharedType{txt}, mergeWindow)
+		for range 1_000 {
+			doc.Transact(func(txn *Transaction) {
+				txt.Insert(txn, 0, "ab", nil)
+				txt.Delete(txn, 0, 1)
+			})
 		}
 	}
 }

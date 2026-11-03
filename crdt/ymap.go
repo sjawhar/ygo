@@ -74,11 +74,7 @@ func (m *YMap) prepareFire(txn *Transaction, keysChanged map[string]struct{}) fu
 	snap := make([]mapSub, len(m.observers))
 	copy(snap, m.observers)
 	e := YMapEvent{Target: m, Txn: txn, KeysChanged: keysChanged, Keys: keys}
-	return func() {
-		for _, s := range snap {
-			s.fn(e)
-		}
-	}
+	return func() { callAll(snap, func(s mapSub) { s.fn(e) }) }
 }
 
 // computeKeys derives the per-key KeyChange map (#74 D2) for every key in
@@ -289,7 +285,7 @@ func (m *YMap) Get(key string) (any, bool) {
 	// nested Y.Text/Y.Map/Y.Array reads back as (nil, false) even though the
 	// type is fully materialised and reachable via ToJSON.
 	if ct, ok := item.Content.(*ContentType); ok {
-		return ct.Type.owner, ct.Type.owner != nil
+		return readOwner(ct.Type.owner), ct.Type.owner != nil
 	}
 	return lastPlainVal(item.Content)
 }

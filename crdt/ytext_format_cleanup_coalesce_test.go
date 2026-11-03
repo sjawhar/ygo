@@ -3,45 +3,84 @@ package crdt
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-// fragmentedDeleteTime times applying, to a peer with formatted text, one
-// remote deletion of n adjacent single-character structs.
-func fragmentedDeleteTime(tb testing.TB, n int) time.Duration {
-	a, b := newTestDoc(1), newTestDoc(2)
-	at, bt := a.GetText("t"), b.GetText("t")
-	a.Transact(func(txn *Transaction) { at.Insert(txn, 0, "ab", nil) })
-	for range n {
-		a.Transact(func(txn *Transaction) { at.Insert(txn, 1, "x", nil) })
+// fragmentedDeleteTimes measures with clock, for each of sizes, applying to k
+// peers with formatted text one remote deletion each of n adjacent
+// single-character structs. The sizes are measured back to back, so they see
+// the machine alike. Each peer also bolds one of the deleted characters, so
+// the deletion leaves that character's two markers redundant in the gap
+// before the bold "b", and the time includes the cleanup deleting them: it
+// fails if the cleanup did not run.
+func fragmentedDeleteTimes(tb testing.TB, clock func(func()) time.Duration, sizes ...setSize) []time.Duration {
+	peers, updates := make([][]*Doc, len(sizes)), make([][][]byte, len(sizes))
+	for s, size := range sizes {
+		peers[s], updates[s] = make([]*Doc, size.k), make([][]byte, size.k)
+		for i := range size.k {
+			a, b := newTestDoc(1), newTestDoc(2)
+			at, bt := a.GetText("t"), b.GetText("t")
+			a.Transact(func(txn *Transaction) { at.Insert(txn, 0, "ab", nil) })
+			for range size.n {
+				a.Transact(func(txn *Transaction) { at.Insert(txn, 1, "x", nil) })
+			}
+			require.NoError(tb, ApplyUpdateV1(b, EncodeStateAsUpdateV1(a, nil), nil))
+			b.Transact(func(txn *Transaction) {
+				bt.Format(txn, size.n+1, 1, Attributes{"bold": true})
+				bt.Format(txn, size.n/2+1, 1, Attributes{"bold": true})
+			})
+			require.Equal(tb, 4, countLiveContentFormat(b), "the fixture's markers")
+			sv := a.StateVector()
+			a.Transact(func(txn *Transaction) { at.Delete(txn, 1, size.n) })
+			peers[s][i], updates[s][i] = b, EncodeStateAsUpdateV1(a, sv)
+		}
 	}
-	require.NoError(tb, ApplyUpdateV1(b, EncodeStateAsUpdateV1(a, nil), nil))
-	b.Transact(func(txn *Transaction) { bt.Format(txn, n+1, 1, Attributes{"bold": true}) })
-	sv := a.StateVector()
-	a.Transact(func(txn *Transaction) { at.Delete(txn, 1, n) })
-	u := EncodeStateAsUpdateV1(a, sv)
-	start := time.Now()
-	require.NoError(tb, ApplyUpdateV1(b, u, nil))
-	return time.Since(start)
+	took := make([]time.Duration, len(sizes))
+	var errs []error
+	for s := range sizes {
+		took[s] = clock(func() {
+			for i, b := range peers[s] {
+				if err := ApplyUpdateV1(b, updates[s][i], nil); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		})
+	}
+	require.Empty(tb, errs)
+	for s := range sizes {
+		for _, b := range peers[s] {
+			require.Equal(tb, 2, countLiveContentFormat(b), "the cleanup left the deleted character's markers")
+			require.Equal(tb, []Delta{{Op: DeltaOpInsert, Insert: "a"}, {Op: DeltaOpInsert, Insert: "b", Attributes: Attributes{"bold": true}}}, b.GetText("t").ToDelta())
+		}
+	}
+	return took
 }
 
 func TestPerf_RemoteFragmentedDeleteCleanupIsLinear(t *testing.T) {
 	if testing.Short() || raceEnabled || testing.CoverMode() != "" {
 		t.Skip("timing test")
 	}
-	const small, large = 1000, 8000 // 8×: linear ≈ 8×, quadratic ≈ 64×
-	var s, l time.Duration
-	for range 3 {
-		s += fragmentedDeleteTime(t, small)
-		l += fragmentedDeleteTime(t, large)
+	// Thread CPU time, not wall time, so waits for a core on a loaded machine
+	// do not count. Sixteen small deletions hold as many structs as one large
+	// one, so a struct costs about the same in both when the cleanup is linear,
+	// and sixteen times as much in the large one when it is quadratic. Each
+	// size keeps the fewest of interleaved runs.
+	clock := threadCPUClock(t)
+	const small, large, peers = 500, 8000, 16
+	var s, l time.Duration = math.MaxInt64, math.MaxInt64
+	for range 16 {
+		took := fragmentedDeleteTimes(t, clock, setSize{small, peers}, setSize{large, 1})
+		s, l = min(s, took[0]), min(l, took[1])
 	}
-	t.Logf("%v → %v", s, l)
-	require.Less(t, l, 24*s+20*time.Millisecond, "the contextless cleanup grows superlinearly")
+	t.Logf("%d structs deleted as %d deletions of %d, then as one: %v → %v (%.1f×)", large, peers, small, s, l, float64(l)/float64(s))
+	require.Less(t, l, 3*s, "the contextless cleanup grows superlinearly")
 }
 
 func BenchmarkYText_RemoteFragmentedDelete(b *testing.B) {
@@ -49,7 +88,7 @@ func BenchmarkYText_RemoteFragmentedDelete(b *testing.B) {
 		b.Run(fmt.Sprint(n), func(b *testing.B) {
 			var d time.Duration
 			for range b.N {
-				d += fragmentedDeleteTime(b, n)
+				d += fragmentedDeleteTimes(b, wallTime, setSize{n, 1})[0]
 			}
 			b.ReportMetric(float64(d.Nanoseconds())/float64(b.N), "apply-ns/op")
 		})
@@ -174,7 +213,9 @@ func TestUnit_YText_FormatCleanup_CoalescedMatchesPerItem(t *testing.T) {
 		u := EncodeStateAsUpdateV1(a, sv)
 		state := EncodeStateAsUpdateV1(b, nil)
 
-		run := func(cleanup func(remote, txn *Transaction)) (*Doc, DeleteSet) {
+		// gc runs the cleanup from the record after the GC, as a commit does;
+		// the reference reads the deleted content before it.
+		run := func(cleanup func(remote, txn *Transaction), gc bool) (*Doc, DeleteSet) {
 			d := newTestDoc(3)
 			d.GetText("t")
 			require.NoError(t, ApplyUpdateV1(d, state, nil))
@@ -182,17 +223,48 @@ func TestUnit_YText_FormatCleanup_CoalescedMatchesPerItem(t *testing.T) {
 			d.Transact(func(remote *Transaction) {
 				require.NoError(t, applyV1Txn(remote, u))
 				remote.afterState = d.store.StateVector()
+				recordDeletedFormats(remote)
+				if gc {
+					gcTxnDeleteSet(d, remote)
+				}
 				txn := &Transaction{doc: d, Local: true, deleteSet: newOrderedDeleteSet(),
-					changed: map[*abstractType]map[string]struct{}{}, ctx: context.Background()}
+					changed: map[*abstractType]changedType{}, ctx: context.Background()}
 				cleanup(remote, txn)
 				ds = txn.deleteSet
 			})
 			return d, ds
 		}
-		got, gotDS := run(cleanupYTextAfterTransaction)
-		want, wantDS := run(refCleanupYTextAfterTransaction)
+		got, gotDS := run(cleanupYTextAfterTransaction, true)
+		want, wantDS := run(refCleanupYTextAfterTransaction, false)
 		require.Equal(t, wantDS.orderedClients(), gotDS.orderedClients(), "seed %d", seed)
 		require.Equal(t, wantDS.clients, gotDS.clients, "seed %d", seed)
 		require.Equal(t, EncodeStateAsUpdateV1(want, nil), EncodeStateAsUpdateV1(got, nil), "seed %d", seed)
 	}
+}
+
+// A remote delete of a long text run and a format marker costs one check per
+// struct, not per character: deleting 1,000,000 characters stays far below
+// what one map lookup per character takes.
+func TestPerf_FormatCleanupLongDeletedRunIsPerStruct(t *testing.T) {
+	if testing.Short() || raceEnabled || testing.CoverMode() != "" {
+		t.Skip("timing test")
+	}
+	apply := func(n int) time.Duration {
+		a := newTestDoc(1)
+		at := a.GetText("t")
+		a.Transact(func(txn *Transaction) { at.Insert(txn, 0, strings.Repeat("x", n), nil) })
+		a.Transact(func(txn *Transaction) { at.Insert(txn, n, "y", Attributes{"bold": true}) })
+		b := newTestDoc(2)
+		b.GetText("t")
+		require.NoError(t, ApplyUpdateV1(b, EncodeStateAsUpdateV1(a, nil), nil))
+		sv := a.StateVector()
+		a.Transact(func(txn *Transaction) { at.Delete(txn, 0, n+1) })
+		u := EncodeStateAsUpdateV1(a, sv)
+		start := time.Now()
+		require.NoError(t, ApplyUpdateV1(b, u, nil))
+		return time.Since(start)
+	}
+	small, large := apply(1_000), apply(1_000_000) // 1000x the characters, same structs
+	t.Logf("%v -> %v", small, large)
+	require.Less(t, large, 50*small+5*time.Millisecond, "the cleanup cost grows with the deleted characters")
 }
