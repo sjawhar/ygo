@@ -97,7 +97,7 @@ func TestUnit_PendingQueue_AResendLongerThanTheParkedTailParksItsNewClocks(t *te
 func TestUnit_PendingQueue_ASlicedDeletedStructContinuesTheParkedOne(t *testing.T) {
 	craft := func(n int) []byte {
 		it := &Item{ID: ID{Client: 2, Clock: 0}, Origin: &ID{Client: 9, Clock: 1}, Content: NewContentDeleted(uint64(n)), Deleted: true}
-		return encodeStructStoreV1(map[ClientID][]*Item{2: {it}}, newDeleteSet(), nil, newStructStore())
+		return encodeStructStoreV1(map[ClientID][]*Item{2: {it}}, newDeleteSet(), nil)
 	}
 	other := New(WithClientID(9))
 	other.Transact(func(txn *Transaction) { txn.GetText("t").Insert(txn, 0, "ab", nil) })
@@ -271,7 +271,7 @@ func TestUnit_PendingQueue_ASlicedStructWithOnlyARightOriginContinuesTheParkedOn
 }
 
 func structsV1(m map[ClientID][]*Item) []byte {
-	return encodeStructStoreV1(m, newDeleteSet(), nil, newStructStore())
+	return encodeStructStoreV1(m, newDeleteSet(), nil)
 }
 
 func gcStruct(client ClientID, clock uint64, n int) *Item {

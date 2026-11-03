@@ -1,7 +1,9 @@
 package crdt
 
 import (
+	"cmp"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 
@@ -273,9 +275,10 @@ func (d *v2Decoder) readString() (string, error) {
 
 func (d *v2Decoder) readTypeRef() (byte, error) {
 	v, err := d.typeRefDec.Read()
-	if err == nil && v > maxTypeRef {
-		// Checked before the byte conversion, so that 261 cannot read as 5.
-		return 0, typeRefError(v)
+	if v > math.MaxUint8 {
+		// A ref past a byte names no type; truncating it could alias a known
+		// ref, such as 261 to the hook's 5, and read a name it does not have.
+		return math.MaxUint8, err
 	}
 	return byte(v), err
 }
@@ -363,12 +366,11 @@ func encodeV2Locked(doc *Doc, sv StateVector) []byte {
 	var groups []clientGroup
 	for client, items := range doc.store.clients {
 		svClock := sv.Clock(client)
-		var relevant []*Item
-		for _, item := range items {
-			if item.ID.Clock+item.Content.Len() > svClock {
-				relevant = append(relevant, item)
-			}
-		}
+		// A client's items are clock-sorted and disjoint, so the ones the peer
+		// lacks are a suffix, found by binary search as Yjs writeStructs does.
+		relevant := items[sort.Search(len(items), func(i int) bool {
+			return items[i].ID.Clock+items[i].Content.Len() > svClock
+		}):]
 		if len(relevant) > 0 {
 			groups = append(groups, clientGroup{client, relevant, svClock})
 		}
@@ -386,7 +388,7 @@ func encodeV2Locked(doc *Doc, sv StateVector) []byte {
 			if i == 0 && g.startClock > item.ID.Clock {
 				offset = g.startClock - item.ID.Clock
 			}
-			encodeItemV2(enc, item, offset, doc.store)
+			encodeItemV2(enc, item, offset)
 		}
 	}
 
@@ -394,7 +396,7 @@ func encodeV2Locked(doc *Doc, sv StateVector) []byte {
 	return enc.toBytes()
 }
 
-func encodeItemV2(enc *v2Encoder, item *Item, offset uint64, store *StructStore) {
+func encodeItemV2(enc *v2Encoder, item *Item, offset uint64) {
 	// Orphaned items (no parent) came from GC wire format where the parent
 	// type name is lost. Encode as GC struct for valid clock accounting.
 	//
@@ -427,20 +429,6 @@ func encodeItemV2(enc *v2Encoder, item *Item, offset uint64, store *StructStore)
 	} else {
 		origin = item.Origin
 		originRight = item.OriginRight
-	}
-
-	// If the origin item is a GC placeholder (no Parent), the receiver can't
-	// infer this item's parent from it. Clear the origin so explicit parent
-	// info is encoded instead.
-	if origin != nil {
-		if oi := store.Find(*origin); oi != nil && oi.isGCOrphan() {
-			origin = nil
-		}
-	}
-	if originRight != nil {
-		if ori := store.Find(*originRight); ori != nil && ori.isGCOrphan() {
-			originRight = nil
-		}
 	}
 
 	contentTag := contentTagOf(item.Content)
@@ -476,19 +464,13 @@ func encodeItemV2(enc *v2Encoder, item *Item, offset uint64, store *StructStore)
 			// Deferred parent-by-ID: decoded but not yet integrated (its container
 			// is in a later client group), so Parent is still nil while parentID
 			// holds the container's ID. Re-emit the explicit parent-by-ID so the
-			// receiver can defer and resolve it too, instead of falling through to
-			// the root-named branch and writing an empty name (silent data loss).
-			// Mirrors the V1 encodeItem fix. (#140)
+			// receiver can defer and resolve it too. Mirrors encodeItem.
 			enc.writeParentInfo(false)
 			enc.writeLeftID(*item.parentID)
 		} else {
-			// Root named type.
+			// Root named type; an item with no parent is a GC struct, written above.
 			enc.writeParentInfo(true)
-			name := ""
-			if item.Parent != nil {
-				name = item.Parent.name
-			}
-			enc.writeString(name)
+			enc.writeString(item.Parent.name)
 		}
 		if item.ParentSub != nil {
 			enc.writeString(*item.ParentSub)
@@ -548,10 +530,10 @@ func encodeContentV2(enc *v2Encoder, c Content, offset uint64) {
 		enc.writeKey(ct.Key)
 		enc.restEnc.WriteAny(ct.Val)
 	case *ContentType:
-		tc, nodeName := typeClassOf(ct)
+		tc, name := typeClassOf(ct)
 		enc.writeTypeRef(tc)
-		if tc == 3 { // YXmlElement
-			enc.writeKey(nodeName)
+		if typeRefHasName(tc) {
+			enc.writeKey(name)
 		}
 	case *ContentAny:
 		vals := ct.Vals[offset:]
@@ -565,7 +547,7 @@ func encodeContentV2(enc *v2Encoder, c Content, offset uint64) {
 			guid = ct.Doc.GUID()
 		}
 		enc.writeString(guid)
-		enc.restEnc.WriteAny(subdocOpts(ct.Doc))
+		writeSubdocOpts(enc.restEnc, ct.Doc)
 	case *ContentMove:
 		enc.restEnc.WriteVarUint(uint64(ct.Target.Client))
 		enc.restEnc.WriteVarUint(ct.Target.Clock)
@@ -581,7 +563,7 @@ func encodeDeleteSetV2(enc *v2Encoder, ds DeleteSet) {
 		}
 	}
 	// Yjs V2 writes delete set clients in DESCENDING order.
-	sort.Slice(clients, func(i, j int) bool { return clients[i] > clients[j] })
+	slices.SortFunc(clients, func(a, b ClientID) int { return cmp.Compare(b, a) })
 
 	enc.restEnc.WriteVarUint(uint64(len(clients)))
 	for _, c := range clients {
@@ -623,13 +605,27 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	applying := false
 	defer func() {
 		if r := recover(); r != nil {
-			retErr = integrationPanicErr(r)
+			retErr = recoveredApplyErr(r)
 		}
 		// An apply that fails before it began to integrate must tell no observer.
 		txn.refused = retErr != nil && !applying
-		if applying {
+		if !applying {
+			if txn.applyJournal() == nil {
+				// Refused before the journal began: nothing changed.
+				retErr = refuseRemoteApply(txn, retErr)
+			} else {
+				// Refused while decoding, after the journal began: what the
+				// decode named (a root type) is taken back.
+				retErr = endRemoteApply(txn, retErr)
+			}
+			return
+		}
+		// A bounded document rolls a failed apply back whole, so it drains
+		// only an apply that succeeded.
+		if retErr == nil || txn.applyJournal() == nil {
 			retErr = drainAfterApply(txn, retErr)
 		}
+		retErr = endRemoteApply(txn, retErr)
 	}()
 
 	dec, err := newV2Decoder(update)
@@ -676,6 +672,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		return err
 	}
 	*dec.restDec = peek
+	// The pre-apply checks changed nothing, so on a bounded document the
+	// journal begins only now (apply_rollback.go).
+	beginRemoteApply(txn, sv)
 
 	// Every struct decodes before one integrates, as Yjs reads them all first,
 	// so a struct that does not decode leaves the document unchanged; a
@@ -879,6 +878,9 @@ func decodeItemV2(dec *v2Decoder, doc *Doc, client ClientID, clock uint64, info 
 	if err != nil {
 		return nil, 0, err
 	}
+	if err := refuseOnBoundedDoc(doc, content); err != nil {
+		return nil, 0, err
+	}
 
 	item := &Item{
 		ID:          ID{Client: client, Clock: clock},
@@ -1079,15 +1081,14 @@ func decodeTypeContentV2(dec *v2Decoder, doc *Doc, typeRef byte) (*abstractType,
 		frag.owner = frag
 		return &frag.abstractType, nil
 
-	case 5: // YXmlHook — reads hook name via readKey (discard)
-		if _, err := dec.readKey(); err != nil {
+	case 5: // YXmlHook — reads hook name via readKey
+		hookName, err := dec.readKey()
+		if err != nil {
 			return nil, err
 		}
-		r := &rawType{}
-		r.doc = doc
-		r.itemMap = make(map[string]*Item)
-		r.owner = r
-		return &r.abstractType, nil
+		h := newYXmlHook(hookName)
+		h.doc = doc
+		return &h.abstractType, nil
 
 	case 6: // YXmlText
 		xt := NewYXmlText()

@@ -84,6 +84,30 @@ func WithGC(gc bool) DocOption {
 	return func(d *Doc) { d.gc = gc }
 }
 
+// WithFormatCleanup controls whether a remote transaction that changes
+// formatted text is followed by the local transaction Yjs runs to remove the
+// format markers it left redundant (cleanupYTextAfterTransaction). Default is
+// true. Set to false for a document that replays another document's
+// transactions, such as a server's copy of a room or a fold of its stored
+// updates: the source never ran the cleanup for its own local transactions,
+// and its log already holds the cleanups it did run, so a replay that cleans
+// up makes changes the source never made.
+func WithFormatCleanup(enabled bool) DocOption {
+	return func(d *Doc) { d.noFormatCleanup = !enabled }
+}
+
+// SetFormatCleanup sets WithFormatCleanup after construction, so a document
+// can load stored state without the cleanup and clean up after later remote
+// changes. It applies to transactions that commit after it returns, and to
+// this document only: a subdocument keeps its own setting. Like the other
+// methods that take the document's lock, it must not be called inside a
+// transaction.
+func (d *Doc) SetFormatCleanup(enabled bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.noFormatCleanup = !enabled
+}
+
 // WithGUID sets the document's subdocument identifier. When a Doc is embedded
 // inside another Doc via ContentDoc, the GUID identifies it across peers.
 func WithGUID(guid string) DocOption {
@@ -97,7 +121,7 @@ func WithGUID(guid string) DocOption {
 func WithAutoLoad(v bool) DocOption { return func(d *Doc) { d.autoLoad = v } }
 
 // WithShouldLoad controls whether a provider should sync this doc now. Default
-// true; a decoded/remote subdocument starts false until Load().
+// true; a decoded subdocument starts with its autoLoad value, as in Yjs.
 func WithShouldLoad(v bool) DocOption { return func(d *Doc) { d.shouldLoad = v } }
 
 // WithCollectionID sets an optional subdocument collection identifier.
@@ -127,6 +151,79 @@ func (d *Doc) SetMaxPendingItems(n int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.maxPendingItems = n
+}
+
+// WithMaxIntegrateScan bounds the items the conflict scans of one remote
+// update (ApplyUpdate and its V1 and V2 forms) may pass, all of its items
+// together, and makes the document apply a remote update whole or not at all
+// (apply_rollback.go). Integrating an item scans the items between its left
+// origin and its right origin (Item.integrate). An item an editor sends scans
+// only what other peers inserted concurrently at the same place, so a remote
+// update's scans pass a handful of items; an item that names a left origin
+// early in a list and no right origin scans to the list's end instead, and an
+// update of n such items scans n times the list - 2,000 of them, about 12 KB,
+// took 20.8 s against a list of 20,000 unmerged items. An update whose scans
+// would pass the bound is refused with ErrIntegrateScanBudget, and like every
+// remote update the bounded document refuses, it leaves the document as it was,
+// fires no observer, and is returned as a RefusedUpdateError reporting what its
+// scans passed. The drain of the pending queue an update's apply ends with has
+// an allowance of its own, the bound again; a drain that would pass it is taken
+// back and the queue parked again as it was, while the update stands, and the
+// queue is drained again once an apply brings a clock it waits on further
+// (apply_rollback.go). Such a document refuses a remote update carrying a
+// subdocument or a move. Zero or negative, the default, sets no bound. Local
+// transactions are never bounded: their inserts name both neighbours. A budget
+// (WithIntegrateScanBudget) takes the bound's place while it is set.
+func WithMaxIntegrateScan(n int) DocOption {
+	return func(d *Doc) { d.maxIntegrateScan = n }
+}
+
+// SetMaxIntegrateScan sets the bound of WithMaxIntegrateScan on a document
+// already made, for an owner that loads trusted state first and bounds what
+// arrives after it. It takes the document lock.
+func (d *Doc) SetMaxIntegrateScan(n int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.maxIntegrateScan = n
+}
+
+// WithIntegrateScanBudget bounds the conflict scans of each remote update by an
+// allowance of its own: as each remote apply (ApplyUpdate and its V1 and V2
+// forms) begins, the document calls budget with the apply's origin, and the
+// items that apply's scans pass, the drain of the pending queue it ends with
+// included, may number at most what budget returns; zero or negative leaves
+// that one apply's scans unbounded. One fixed bound has to hold the largest
+// honest update - a peer handing over a whole state edited offline scans what
+// others wrote meanwhile at every place it wrote too - so it lets a small
+// update scan as much; a budget lets the owner size each update's allowance by
+// what it can see of the update before applying it, such as the structs it
+// carries, keyed by the origin it applies it with. An update whose own scans
+// would pass its allowance is refused, with ErrIntegrateScanBudget, as under
+// WithMaxIntegrateScan; a drain whose scans would pass what the update left of
+// it is taken back and the queue parked again as it was, while the update
+// stands, and the queue is drained again once an apply brings a clock it waits
+// on further (apply_rollback.go).
+//
+// An owner keeping an account of scans learns what each apply cost from
+// Transaction.IntegrateScanned in an OnAfterTransaction observer when the
+// apply commits, and from RefusedUpdateError.Scanned when the document
+// refused it; either is at most what budget returned for it, when positive.
+//
+// A document with a budget is a bounded document whatever budget returns: it
+// applies every remote update whole or not at all, and refuses a remote update
+// carrying a subdocument or a move. While a budget is set, the bound of
+// WithMaxIntegrateScan is not used. budget runs under the document's lock, so
+// it must not call the document. Local transactions are never bounded.
+func WithIntegrateScanBudget(budget func(origin any) int) DocOption {
+	return func(d *Doc) { d.integrateScanBudget = budget }
+}
+
+// SetIntegrateScanBudget sets the budget of WithIntegrateScanBudget on a
+// document already made, or with nil removes it. It takes the document lock.
+func (d *Doc) SetIntegrateScanBudget(budget func(origin any) int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.integrateScanBudget = budget
 }
 
 // updateSub pairs a unique subscription ID with its callback so that
@@ -160,17 +257,30 @@ type subdocsSub struct {
 // Doc is the root of a Yjs collaborative document.
 // All shared types (YArray, YMap, YText, …) live inside a Doc.
 type Doc struct {
-	clientID        ClientID      // read and written under mu, or before the doc is shared
-	sharedClientID  atomic.Uint64 // clientID's copy for ClientID, read without mu
-	gc              bool
-	guid            string // guid identifies this document (for subdocument embedding). Defaults to a random uuidv4 (see New) unless set with WithGUID.
+	clientID       ClientID      // read and written under mu, or before the doc is shared
+	sharedClientID atomic.Uint64 // clientID's copy for ClientID, read without mu
+	gc             bool
+	guid           string // guid identifies this document (for subdocument embedding). Defaults to a random uuidv4 (see New) unless set with WithGUID.
+	// linkMu guards shouldLoad, collectionID, item, parent and detached. It is a leaf lock:
+	// no other lock is taken while it is held, so a parent's transaction can
+	// take it, also for a document embedded in itself.
+	linkMu          sync.Mutex
 	shouldLoad      bool
 	autoLoad        bool
 	collectionID    string
+	meta            any   // subdocument meta from Yjs opts, written back unchanged
 	item            *Item // set on integrate when this Doc is embedded as a subdocument (#63)
+	parent          *Doc  // document that owns item
+	detached        bool  // true once an embedded Doc is removed or destroyed
 	subdocs         map[string]*Doc
 	onSubdocs       []subdocsSub
-	maxPendingItems int // 0 = use defaultMaxPendingItems; see WithMaxPendingItems and #46
+	maxPendingItems int  // 0 = use defaultMaxPendingItems; see WithMaxPendingItems and #46
+	noFormatCleanup bool // see WithFormatCleanup
+	// maxIntegrateScan is the scan bound of WithMaxIntegrateScan; zero or
+	// negative for none. integrateScanBudget is the budget of
+	// WithIntegrateScanBudget, which takes the bound's place while set.
+	maxIntegrateScan    int
+	integrateScanBudget func(origin any) int
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -185,8 +295,9 @@ type Doc struct {
 	// to each observer subscription, enabling correct out-of-order unsubscribe.
 	subIDGen uint64
 
-	// onUpdate observers fire after each committed transaction with the encoded
-	// incremental V1 update bytes and the transaction origin.
+	// onUpdate observers fire after each committed transaction that adds or
+	// deletes something, with the encoded incremental V1 update bytes and the
+	// transaction origin.
 	onUpdate []updateSub
 
 	// onAfterTxn observers fire after each committed transaction with the full
@@ -201,6 +312,11 @@ type Doc struct {
 	// Deleted=false on items it captured — which requires their original
 	// Content to still be present. Mutated under d.mu.
 	undoManagerCount int
+
+	// updateLogs are the open update logs (OpenUpdateLog). A committing
+	// transaction appends its update to each under d.mu; a closed log is
+	// dropped at the next commit.
+	updateLogs []*UpdateLog
 }
 
 // ClientID returns the document's client identifier. A remote transaction
@@ -229,45 +345,108 @@ func (d *Doc) AutoLoad() bool {
 
 // ShouldLoad returns whether a provider should sync this doc now.
 func (d *Doc) ShouldLoad() bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
 	return d.shouldLoad
 }
 
-// CollectionID returns the optional subdocument collection identifier.
+// CollectionID returns the optional subdocument collection identifier. A
+// subdocument without one takes its parent's when it is added, as in Yjs.
 func (d *Doc) CollectionID() string {
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
 	return d.collectionID
+}
+
+// inheritCollectionID gives d the collection ID id when d has none, as Yjs
+// cleanupTransactions does for each added subdocument.
+func (d *Doc) inheritCollectionID(id string) {
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
+	if d.collectionID == "" {
+		d.collectionID = id
+	}
 }
 
 // Load signals that this subdocument's data should be synced. On a subdocument
 // it sets shouldLoad=true and emits a subdocs "loaded" event on the parent; on a
 // root doc it just sets shouldLoad=true. Safe to call multiple times.
 //
-// Load opens a transaction on the PARENT document, so it MUST NOT be called from
-// inside a Transact closure (re-entrant lock — same footgun as GetText-in-Transact).
+// On an embedded subdocument, Load opens a transaction on the PARENT document,
+// so it MUST NOT be called from inside the parent's Transact closure
+// (re-entrant lock — same footgun as GetText-in-Transact).
 func (d *Doc) Load() {
-	d.mu.Lock()
+	d.linkMu.Lock()
 	if d.shouldLoad {
-		d.mu.Unlock()
+		d.linkMu.Unlock()
 		return
 	}
 	d.shouldLoad = true
-	item := d.item
-	d.mu.Unlock()
-	if item == nil || item.Parent == nil {
+	item, parent := d.item, d.parent
+	d.linkMu.Unlock()
+	if item == nil {
 		return
 	}
-	item.Parent.doc.Transact(func(txn *Transaction) {
-		// A detached/overwritten subdoc leaves item tombstoned but d.item still
-		// pointing at it; reporting it as loaded would be spurious (the doc is
-		// no longer resident in the parent's registry). item.Deleted is read
-		// here — inside the parent's transaction — so the parent lock guards it.
-		// Mirrors Yjs, where a removed subdoc is destroyed and load() is a no-op.
+	parent.Transact(func(txn *Transaction) {
+		// item can be deleted after Load copied it under linkMu and before this
+		// parent transaction starts. Do not report a loaded event for that
+		// removed item. A detached subdocument clears d.item and returns above.
 		if item.Deleted {
 			return
 		}
 		txn.addSubdocLoaded(d)
 	})
+}
+
+// attachSubdoc records the item and parent together under linkMu and returns
+// the load request that integration must report.
+func (d *Doc) attachSubdoc(item *Item, parent *Doc) bool {
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
+	if d.item != nil || d.detached {
+		panic(ErrSubdocAlreadyIntegrated)
+	}
+	d.item, d.parent = item, parent
+	return d.shouldLoad
+}
+
+// detachSubdoc drops links that would otherwise retain the former parent.
+func (d *Doc) detachSubdoc(item *Item) {
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
+	if d.item == item {
+		d.item, d.parent, d.detached = nil, nil, true
+	}
+}
+
+// scanBounded is whether d bounds the conflict scans of its remote updates, by
+// a bound (WithMaxIntegrateScan) or a budget (WithIntegrateScanBudget), and so
+// applies each whole or not at all. Its caller holds d.mu.
+func (d *Doc) scanBounded() bool {
+	return d.integrateScanBudget != nil || d.maxIntegrateScan > 0
+}
+
+// applyScanLimit is the most items the conflict scans of a remote apply with
+// origin may pass on d, or 0 for no limit: what d's budget returns for origin
+// when it has one, otherwise its bound. Its caller holds d.mu.
+func (d *Doc) applyScanLimit(origin any) int {
+	if d.integrateScanBudget != nil {
+		return max(d.callIntegrateScanBudget(origin), 0)
+	}
+	return max(d.maxIntegrateScan, 0)
+}
+
+// callIntegrateScanBudget calls the WithIntegrateScanBudget callback and tags a
+// panic it raises as budgetCallbackPanic, so the apply's recovery names the
+// callback (recoveredApplyErr) rather than item integration. The caller holds
+// d.mu, as the callback contract requires.
+func (d *Doc) callIntegrateScanBudget(origin any) (n int) {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{r})
+		}
+	}()
+	return d.integrateScanBudget(origin)
 }
 
 // maxPendingItemsLimit returns the effective cap on the pending queue depth.
@@ -494,41 +673,53 @@ func (d *Doc) GetText(name string) *YText {
 // and returns a closure that fires all observers in the correct order.
 // The closure must be invoked OUTSIDE d.mu — observers may re-enter Doc
 // methods that acquire d.mu, which would deadlock under the lock.
+// The closure takes the update collectAndEncodeLocked returned; OnUpdate
+// observers run only when it is not nil.
 //
-// Returns nil when there is nothing to fire: no observers, or a refused remote
-// apply (Transaction.refused).
-func buildPhase2(d *Doc, txn *Transaction) func() {
-	if txn.refused {
+// Returns nil when there is nothing to fire: no observers, or a remote apply
+// rolled back (boundedApplyState.rolledBack) or refused (Transaction.refused).
+func buildPhase2(d *Doc, txn *Transaction) func(update []byte) {
+	// A remote apply rolled back (apply_rollback.go), or refused before it
+	// began to integrate, left the document as it was: there is nothing to
+	// tell any observer.
+	if txn.boundedApply != nil && txn.boundedApply.rolledBack || txn.refused {
 		return nil
 	}
-	// Encode the incremental update and snapshot observer slices while still
-	// holding the lock so we get a consistent view.
-	var updateBytes []byte
-	if len(d.onUpdate) > 0 {
-		updateBytes = encodeV1Locked(d, txn.beforeState)
+	// Snapshot per-type observer closures and deep-observer chains while the
+	// write lock is held. prepareFire copies each type's observer slice and
+	// builds the event struct, so concurrent Observe/Unobserve calls (which also
+	// hold the write lock) cannot race with the fire loop below (N-C1). Walking
+	// up from each changed type in order gives Yjs's changedParentTypes order.
+	// The changed types in the order the transaction first changed each one,
+	// which its entries hold. A transaction that changed up to eight types
+	// orders them in this call's own buffer.
+	var orderBuf [8]*abstractType
+	changed := orderBuf[:0]
+	if len(txn.changed) > len(orderBuf) {
+		changed = make([]*abstractType, 0, len(txn.changed))
 	}
-
-	// Snapshot per-type observer closures while the write lock is held.
-	// prepareFire copies each type's observer slice and builds the event struct,
-	// so concurrent Observe/Unobserve calls (which also hold the write lock)
-	// cannot race with the fire loop below (N-C1).
-	fireFns := make([]func(), 0, len(txn.changed))
-	for t, keys := range txn.changed {
-		if t.owner != nil {
-			if fn := t.owner.prepareFire(txn, keys); fn != nil {
-				fireFns = append(fireFns, fn)
-			}
-		}
+	changed = changed[:len(txn.changed)]
+	for t, c := range txn.changed {
+		changed[c.order] = t
 	}
-	txn.typeObserved = len(fireFns) > 0
-
-	// Snapshot deep-observer chains.
+	fireFns := make([]func(), 0, len(changed))
 	type deepEntry struct {
 		fns []func(*Transaction)
 	}
 	firedDeep := make(map[*abstractType]struct{})
 	var deepSnap []deepEntry
-	for t := range txn.changed {
+	for _, t := range changed {
+		// Yjs calls no observer for a type that is deleted when the
+		// transaction ends, so such a text cannot start the format cleanup.
+		if t.item != nil && t.item.Deleted {
+			txn.skipCleanup(t)
+			continue
+		}
+		if t.owner != nil {
+			if fn := t.owner.prepareFire(txn, txn.changed[t].keys); fn != nil {
+				fireFns = append(fireFns, fn)
+			}
+		}
 		current := t
 		for current != nil {
 			if _, already := firedDeep[current]; already {
@@ -549,8 +740,9 @@ func buildPhase2(d *Doc, txn *Transaction) func() {
 			}
 		}
 	}
+	txn.typeObserved = len(fireFns) > 0
 
-	// Snapshot OnUpdate callbacks.
+	// Snapshot OnUpdate and OnAfterTransaction callbacks.
 	onUpdateSnap := make([]func([]byte, any), len(d.onUpdate))
 	for i, s := range d.onUpdate {
 		onUpdateSnap[i] = s.fn
@@ -566,7 +758,9 @@ func buildPhase2(d *Doc, txn *Transaction) func() {
 	hasSubdocs := len(txn.subdocsAdded)+len(txn.subdocsRemoved)+len(txn.subdocsLoaded) > 0
 	var subdocsEv SubdocsEvent
 	if hasSubdocs {
+		parentCollectionID := d.CollectionID()
 		for sd := range txn.subdocsAdded {
+			sd.inheritCollectionID(parentCollectionID)
 			d.subdocs[sd.guid] = sd
 			subdocsEv.Added = append(subdocsEv.Added, sd)
 		}
@@ -588,30 +782,126 @@ func buildPhase2(d *Doc, txn *Transaction) func() {
 		return nil
 	}
 
-	return func() {
-		for _, fn := range fireFns {
-			fn()
-		}
-		if txn.afterTypeObservers != nil {
-			txn.afterTypeObservers()
-		}
-		for _, de := range deepSnap {
-			for _, fn := range de.fns {
-				fn(txn)
-			}
-		}
-		for _, fn := range onUpdateSnap {
-			fn(updateBytes, txn.Origin)
-		}
-		for _, fn := range onAfterTxnSnap {
-			fn(txn)
-		}
+	return func(update []byte) {
+		// Deferred in reverse of Yjs's order (type and deep observers,
+		// afterTransaction, update, subdocs), so each group still runs when an
+		// earlier one panics, as Yjs runs its type and deep observers.
 		if hasSubdocs {
-			for _, fn := range onSubdocsSnap {
-				fn(subdocsEv)
-			}
+			defer callAll(onSubdocsSnap, func(fn func(SubdocsEvent)) { fn(subdocsEv) })
+		}
+		if update != nil {
+			defer callAll(onUpdateSnap, func(fn func([]byte, any)) { fn(update, txn.Origin) })
+		}
+		defer callAll(onAfterTxnSnap, func(fn func(*Transaction)) { fn(txn) })
+		defer callAll(deepSnap, func(de deepEntry) {
+			callAll(de.fns, func(fn func(*Transaction)) { fn(txn) })
+		})
+		// Deferred, so the format cleanup is decided even when a type observer
+		// panics; a text whose own observer panicked takes no part, as in Yjs.
+		// Read when the closure runs: prepareRemoteCleanup sets it afterwards.
+		if txn.cleanup == cleanupAfterTypeObservers {
+			defer d.decideFormattingCleanup(txn)
+		}
+		callAll(fireFns, func(fn func()) { fn() })
+	}
+}
+
+// callAll calls fn on each element of xs. When a call panics, it makes the
+// remaining calls before the panic goes on, as lib0's callAll does for Yjs
+// observers; a later panic replaces an earlier one, as in Yjs.
+func callAll[T any](xs []T, fn func(T)) {
+	i := 0
+	defer func() {
+		if i < len(xs) {
+			callAll(xs[i+1:], fn)
+		}
+	}()
+	for ; i < len(xs); i++ {
+		fn(xs[i])
+	}
+}
+
+// collectAndEncodeLocked runs txn's GC and then encodes txn's update for the
+// OnUpdate observers, as Yjs cleanupTransactions encodes the update after
+// tryGcDeleteSet, so content txn both inserted and deleted is sent as
+// ContentDeleted. As in Yjs, the update carries only txn's deletions, sorted
+// and merged, and a transaction that adds and deletes nothing has none. The
+// open update logs take the same update, and what txn parked beside it
+// (parkedUpdate), under the lock, so they hold in commit order every commit
+// OnUpdate is called for, and every commit that parked something without
+// changing the document (an empty update beside its parked one, though
+// OnUpdate is not called for it). A commit that changes nothing and parks
+// nothing is not logged, as OnUpdate is not called for it. A remote apply
+// rolled back or refused logs nothing: the document is as it was before it.
+// Caller must hold d.mu.
+//
+// When an UndoManager is attached we skip auto-GC: undoing a deletion
+// re-inserts a COPY of the deleted item's content (applyStackItem →
+// redoItem), which only works if that original content is still present.
+// Yjs handles this with a per-item keep flag; we take the conservative
+// position of disabling auto-GC entirely while any UndoManager is
+// registered. RunGC remains available as the explicit manual entry point.
+func collectAndEncodeLocked(d *Doc, txn *Transaction) (update []byte) {
+	if txn.boundedApply != nil && txn.boundedApply.rolledBack || txn.refused {
+		// The apply left the document as it was: nothing to collect, encode,
+		// log or report as landed.
+		return nil
+	}
+	if d.gc && d.undoManagerCount == 0 {
+		gcTxnDeleteSet(d, txn)
+	}
+	changed := txn.changesDoc()
+	var parked []byte
+	if len(d.updateLogs) > 0 {
+		parked = parkedUpdate(d)
+	}
+	logged := len(d.updateLogs) > 0 && (changed || parked != nil)
+	var encoded []byte
+	if (changed && len(d.onUpdate) > 0) || logged {
+		encoded = encodeV1Locked(d, txn.beforeState, cloneDeleteSet(txn.deleteSet))
+		if changed {
+			update = encoded
 		}
 	}
+	if len(d.updateLogs) > 0 {
+		d.appendUpdateLogs(logged, encoded, parked, txn.Origin)
+	}
+	if txn.landed != nil {
+		*txn.landed = encodeTxnV1Locked(txn)
+	}
+	return update
+}
+
+// commitLocked finishes txn under d.mu: it builds the observer phase, decides
+// a remote transaction's format cleanup, and then runs the GC and the encode,
+// so no goroutine sees a partly collected state and the observer events see
+// the content the GC removes. While a panic unwinds (panicking), a second
+// panic here is dropped; one in the GC or the encode also drops the observer
+// phase, whose update would be missing. Otherwise a panic while the events
+// are built (a type's prepareFire) is returned as built, for the caller to
+// raise once d.mu is released, with no observer phase; the GC, the encode and
+// the update logs still run, since the transaction's changes stand.
+func commitLocked(d *Doc, txn *Transaction, panicking bool) (phase2 func([]byte), update []byte, cleanup bool, built any) {
+	func() {
+		defer func() {
+			if r := recover(); r != nil && !panicking {
+				built = r
+			}
+		}()
+		phase2 = buildPhase2(d, txn)
+	}()
+	cleanup = !panicking && built == nil && d.prepareRemoteCleanup(txn)
+	func() {
+		if panicking {
+			defer func() {
+				if recover() != nil {
+					phase2 = nil
+				}
+			}()
+		}
+		update = collectAndEncodeLocked(d, txn)
+	}()
+	return phase2, update, cleanup, built
 }
 
 // transactInternal is the shared transaction entry point that Transact,
@@ -651,7 +941,7 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 		// added 1 alloc per txn even when no ContentString was inserted, which
 		// hurt array/map-only workloads more than it helped text workloads
 		// (the squashRuns target).
-		changed: make(map[*abstractType]map[string]struct{}, 4),
+		changed: make(map[*abstractType]changedType, 4),
 		ctx:     ctx,
 	}
 
@@ -667,47 +957,12 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 			}()
 		}
 
-		var phase2 func()
-		if r != nil {
-			func() {
-				defer func() { _ = recover() }()
-				phase2 = buildPhase2(d, txn)
-			}()
-		} else {
-			phase2 = buildPhase2(d, txn)
-		}
-
-		// Yjs cleans up the format markers a remote change left redundant
-		// after the change's observers, in a follow-up local transaction,
-		// and GCs the change only then. A type observer may give a text its
-		// first marker, so with type observers to fire the gate waits.
-		deferGC := false
-		if r == nil && !txn.Local {
-			if needsFormattingCleanup(txn) {
-				txn.formatCleanup, deferGC = true, true
-			} else if txn.typeObserved && changedText(txn) {
-				txn.afterTypeObservers = func() {
-					d.mu.Lock()
-					txn.formatCleanup = needsFormattingCleanup(txn)
-					d.mu.Unlock()
-				}
-				deferGC = true
-			}
-		}
-
-		// #78 H1 — Auto-GC at transaction commit. Runs AFTER buildPhase2 so
-		// the observer Deltas have already been computed against the original
-		// content; runs BEFORE Unlock so other goroutines never see partially-
-		// GC'd state. No-op when doc.gc is false.
-		//
-		// When an UndoManager is attached we skip auto-GC: undoing a deletion
-		// re-inserts a COPY of the deleted item's content (applyStackItem →
-		// redoItem), which only works if that original content is still present.
-		// Yjs handles this with a per-item keep flag; we take the conservative
-		// position of disabling auto-GC entirely while any UndoManager is
-		// registered. RunGC remains available as the explicit manual entry point.
-		if d.gc && d.undoManagerCount == 0 && !deferGC {
-			gcTxnDeleteSet(d, txn)
+		phase2, update, cleanup, built := commitLocked(d, txn, r != nil)
+		if built != nil {
+			// A panic while the events were built (a type's prepareFire) is
+			// re-raised below, after the unlock, like a panic in fn, and no
+			// observer fires.
+			r = built
 		}
 
 		// The document's park record drops this transaction's views of the queue.
@@ -729,12 +984,12 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 		txn.done = true
 		d.mu.Unlock()
 
-		if deferGC {
+		if cleanup {
 			// Runs even if an observer panics, as Yjs runs the cleanup.
 			defer d.afterRemoteObservers(txn)
 		}
 		if phase2 != nil {
-			phase2()
+			phase2(update)
 		}
 
 		if r != nil {
@@ -742,7 +997,18 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 		}
 	}()
 
+	// An update log opened (or Reset) since the last commit records the
+	// state as it stands before fn, under the lock: its base.
+	if len(d.updateLogs) > 0 {
+		d.recordUpdateLogBases()
+	}
+
 	retErr = fn(txn)
+	// The scans' marks are the transaction's alone; an observer that keeps the
+	// *Transaction must not keep them.
+	if txn.boundedApply != nil {
+		txn.boundedApply.scanMarks = nil
+	}
 
 	rearbitrateMoves(txn)
 	txn.afterState = d.store.StateVector()
@@ -803,17 +1069,24 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 //   - If fn panics (or any Phase 1 work panics), d.mu is released via defer.
 //   - Observers fire with whatever partial state was committed before the
 //     panic: OnUpdate receives a V1 update describing the mutations that
-//     completed (non-empty if fn mutated; minimal but well-formed if fn
-//     panicked before mutating); per-type, deep, and OnAfterTransaction
-//     observers fire for what was recorded in txn.changed.
-//   - The original panic is re-raised to the caller after observers fire.
+//     completed (and does not fire if fn panicked before mutating);
+//     per-type, deep, and OnAfterTransaction observers fire for what was
+//     recorded in txn.changed, except that per-type and deep observers skip a
+//     type deleted by then.
+//   - The original panic is re-raised to the caller after observers fire,
+//     unless an observer panics too (see below).
 //   - Rollback is NOT supported. The in-memory doc reflects fn's partial
 //     work. Callers who need atomicity must implement it above Transact.
 //     This matches the behavior of Yjs JS and the Rust yrs implementation;
 //     yrs explicitly directs users to UndoManager for transactional undo.
-//   - If fn panics and an observer callback also panics during the partial
-//     firing, the observer's panic reaches the caller and the original
-//     fn panic value is lost.
+//   - A panicking observer does not stop the others: every per-type, deep,
+//     OnUpdate, OnAfterTransaction and OnSubdocs observer still runs, and the
+//     panic reaches the caller afterwards. If more than one panics, or fn
+//     and an observer both panic, the last panic in firing order reaches
+//     the caller, as the last throw does in Yjs.
+//   - If building the observer events panics after fn returned (a type's
+//     event preparation, under the lock), d.mu is released too, no observer
+//     fires, and that panic reaches the caller.
 func (d *Doc) Transact(fn func(*Transaction), origin ...any) {
 	_ = d.transactInternal(context.Background(), func(t *Transaction) error {
 		fn(t)
@@ -838,9 +1111,14 @@ func (d *Doc) TransactE(fn func(*Transaction) error, origin ...any) error {
 	return d.transactInternal(context.Background(), fn, origin...)
 }
 
-// OnUpdate registers a callback that fires after every committed transaction.
-// The callback receives the incremental V1 update bytes for that transaction
-// and the origin value passed to Transact. Returns an unsubscribe function.
+// OnUpdate registers a callback that fires after every committed transaction
+// that adds or deletes something, as the Yjs update event does: an apply of
+// an update the document already holds, or a transaction that changes
+// nothing, does not call it. The callback receives the incremental V1 update
+// bytes for that transaction and the origin value passed to Transact.
+// Returns an unsubscribe function.
+// With GC on, the update is encoded after the transaction's GC, as in Yjs, so
+// content the transaction both inserted and deleted is sent as a tombstone.
 //
 // Callbacks that compare the origin (an echo guard, a per-user filter) do so
 // with Go ==, so the caution on Transact's doc applies: pointer origin
@@ -870,7 +1148,9 @@ func (d *Doc) OnUpdate(fn func(update []byte, origin any)) func() {
 // OnAfterTransaction registers a callback that fires after every committed
 // transaction, receiving the full Transaction object. This provides richer
 // change metadata than OnUpdate (beforeState, afterState, deleteSet, Local
-// flag) and is the hook used by UndoManager. Returns an unsubscribe function.
+// flag) and is the hook used by UndoManager. It fires after the type and deep
+// observers and before OnUpdate, as Yjs emits afterTransaction before update.
+// Returns an unsubscribe function.
 func (d *Doc) OnAfterTransaction(fn func(*Transaction)) func() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1095,6 +1375,10 @@ func (d *Doc) Destroy() {
 	defer d.mu.Unlock()
 	d.onUpdate = nil
 	d.onAfterTxn = nil
+	d.updateLogs = nil
 	d.share = make(map[string]sharedType)
 	d.store = newStructStore()
+	d.linkMu.Lock()
+	d.item, d.parent, d.detached = nil, nil, true
+	d.linkMu.Unlock()
 }

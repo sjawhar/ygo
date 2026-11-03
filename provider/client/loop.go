@@ -546,22 +546,21 @@ func (c *Client) runLoop(ctx context.Context, onSynced func()) error {
 	//
 	// The reply (Authenticated or PermissionDenied) is deliberately NOT
 	// awaited synchronously here with its own read loop: ygo's own server
-	// does not gate its initial sync push on auth at all (see
-	// provider/websocket's OnTokenAuth doc: "the initial sync is served
-	// before any PermissionDenied"), so this client does not need to either.
-	// It sends the token and lets the ordinary frame dispatch in the for/
+	// does not hold sync back for its auth reply (see provider/websocket's
+	// OnTokenAuth doc), so this client does not wait for it either. It
+	// sends the token and lets the ordinary frame dispatch in the for/
 	// select loop below (handleFrame's wireMsgAuth case) react to whatever
 	// comes back, in whatever order it arrives relative to the sync frames
 	// — including a PermissionDenied that arrives AFTER this connection has
-	// already completed a handshake and reported StateSynced, which is the
-	// server's documented behaviour, not a bug in either side. That case
-	// makes handleFrame return ErrAuthRejected, which runReconnectLoop (see
-	// its own doc) treats as terminal rather than something to back off and
-	// retry. The readErr case above this select's frame case recognises the
-	// SAME rejection from the WS close code alone, for the case where this
-	// PermissionDenied frame never arrives at all — see wsCodeUnauthorized's
-	// doc for why that happens and why detecting it only here would not be
-	// enough.
+	// already completed a handshake and reported StateSynced, which a server
+	// that answers SyncStep1 before it checks the token can send, not a bug
+	// in either side. That case makes handleFrame return ErrAuthRejected,
+	// which runReconnectLoop (see its own doc) treats as terminal rather
+	// than something to back off and retry. The readErr case above this
+	// select's frame case recognises the SAME rejection from the WS close
+	// code alone, for the case where this PermissionDenied frame never
+	// arrives at all — see wsCodeUnauthorized's doc for why that happens and
+	// why detecting it only here would not be enough.
 	//
 	// When Token is empty (the default, and the whole of #165 through Task
 	// 8), nothing here executes: this connection sends exactly what it
@@ -577,12 +576,8 @@ func (c *Client) runLoop(ctx context.Context, onSynced func()) error {
 	}
 
 	// Open with our state vector, so the server can send back exactly what
-	// this Doc is missing. Note ygo's own server does not wait to be asked:
-	// it pushes SyncStep1 + a full SyncStep2 + awareness the moment the
-	// upgrade completes (see provider/websocket's ServeHTTP), so in practice
-	// its state usually arrives before this message is even read. Sending it
-	// anyway is what makes this client correct against a y-websocket server
-	// that DOES wait — and it costs one state vector.
+	// this Doc is missing: ygo's own server, like y-websocket's, sends the
+	// room's state only in answer to this message.
 	if err := s.write(encodeEnvelope(wireMsgSync, ygsync.EncodeSyncStep1(c.opts.Doc))); err != nil {
 		return s.classifyWriteErr(fmt.Errorf("client: send sync step 1: %w", err))
 	}
@@ -938,29 +933,11 @@ func (s *session) handleFrame(frame []byte) error {
 			// TWO Heartbeat calls, not one, and this is not a defensive
 			// round number — it is sized for servers OTHER than our own.
 			//
-			// As of #226, ygo's own provider/websocket no longer bumps a
-			// disconnect-synthesised removal's clock (see
-			// encodeAwarenessRemoval, peer.go): it now encodes the removal
-			// at each clientID's CURRENT clock, exactly as the room's
-			// shared Awareness sees it at the moment handleDisconnect
-			// runs — unbumped. Against our own server, a SINGLE Heartbeat
-			// here already clears that removal unconditionally: Heartbeat's
-			// own +1 (from our pre-disconnect clock — under the ORDINARY
-			// interleaving this client's OWN local clock is untouched by a
-			// removal broadcast, because the disconnecting connection is
-			// already torn down by the time handleDisconnect's broadcast
-			// fires, so there is no live socket of ours left to receive it
-			// on. That is not a universal rule, though (#228: an earlier
-			// version of this comment stated it as one): that broadcast's
-			// excludeSelf is false — see peer.go's
-			// broadcastAwarenessFromRoom — so a peer that has already
-			// RECONNECTED under the SAME clientID before the broadcast
-			// fires, a genuine race rather than the ordinary case, IS a
-			// live recipient of its own removal notice) makes our
-			// re-announcement strictly NEWER than any removal our
-			// server could have synthesised from that same base, so
-			// Awareness.ApplyUpdate's ordinary newer-clock path — not the
-			// equal-clock one — admits it every time, regardless of
+			// Against ygo's own server, which encodes a disconnect removal at each
+			// clientID's current clock and sends it to every room peer (so a client
+			// that reconnects under the same clientID before the broadcast receives
+			// its own removal), a single Heartbeat's +1 bump already makes our
+			// re-announcement newer than that removal, so ApplyUpdate admits it in any
 			// arrival order.
 			//
 			// The SECOND call exists for every OTHER WebSocket server this

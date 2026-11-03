@@ -246,6 +246,46 @@ if err := server.CloseRoom("my-room", false); err != nil { /* ... */ }
 // force=true closes connected peers first.
 ```
 
+`CloseRoom` returns `ErrRoomInUse`, with `force=true` as well as
+`force=false`, while a caller is inside the room: an `Apply` callback, a
+relay `Inject`, or a websocket join that has not yet registered its
+peer. The room stays resident. When that caller was inside before the
+call, no peer is disconnected. A caller that enters while `force` is
+closing the peers leaves those peers closed. Evicting such a room would
+take the document away from a caller still mutating it, and `force`
+exists to close connected peers rather than to interrupt a server-side
+writer. The refusal is transient; retry once that caller has returned.
+
+### `CloseRoomWithin(name, doc, force)`
+
+`CloseRoom` for a caller that is inside its own `Apply` on the room,
+which is how a room is closed without the idle sweeper retiring it
+between the decision to close and the close itself — the `Apply` holds
+the room resident for exactly that span:
+
+```go
+err := server.Apply(ctx, "my-room", func(doc *crdt.Doc, transact func(func(*crdt.Transaction))) {
+    // ... inspect doc, decide to close ...
+    closeErr = server.CloseRoomWithin("my-room", doc, true) // last act of fn
+})
+```
+
+`doc` is the document that `Apply` passed to `fn`: it names the room
+instance `fn` is writing, and if the name holds a different one by now —
+evicted and reloaded since — nothing is closed and the call returns
+`ErrRoomNotFound`. The one in-flight caller it discounts is that `Apply`;
+any other caller inside the room still gives `ErrRoomInUse`. The discount
+trusts the caller: a call made outside its `Apply` while another caller
+is inside would evict that caller's room.
+
+Call it from `fn`, not from inside a `transact` callback: a `force` close
+waits for each peer's read loop to exit, and a read loop applying an
+update needs the document lock that `transact` holds. Make it `fn`'s last
+act: the room leaves the server before the call returns, so anything `fn`
+mutates afterwards lands on a detached document. Called where nobody is
+inside the room at all, a call that escaped its `Apply`, it closes
+nothing and returns `ErrNotInApply`.
+
 ### Access control: `Server.OnInject`
 
 An optional hook gates all server-side writes:
@@ -383,7 +423,7 @@ type PersistenceAdapter interface {
 }
 ```
 
-`LoadDoc` is called once when the first peer connects to a room; the result seeds the in-memory doc. `StoreUpdate` is called on every committed transaction. Writes run on a per-room worker goroutine — slow storage doesn't block peers. Wire an adapter in via `NewServerWithPersistence(adapter)`.
+`LoadDoc` is called once when the first peer connects to a room; the result seeds the in-memory doc. `StoreUpdate` is called on every committed transaction that changes the doc. Writes run on a per-room worker goroutine — slow storage doesn't block peers. Wire an adapter in via `NewServerWithPersistence(adapter)`.
 
 By default (v1.36.0) these writes are coalesced: the worker debounces bursts of updates into a single merged `StoreUpdate` call using a 2s window (reset on each new update) capped by a 10s max wait, matching Hocuspocus's default debounce behaviour. Tune it via `Server.PersistCoalesceWindow` / `Server.PersistCoalesceMaxWait`, or set `PersistCoalesceWindow` to a negative value (e.g. `-1`) to disable coalescing and restore strict one-write-per-update persistence.
 
@@ -432,18 +472,21 @@ embedding the same `*Doc` a second time panics with `ErrSubdocAlreadyIntegrated`
 - **`Doc.Load()`** — signals that a subdocument's data should be synced now.
   A locally-created, locally-embedded subdoc loads immediately on integrate
   (`ShouldLoad()` defaults to `true`); a subdoc decoded off the wire starts
-  with `ShouldLoad() == false` until the receiving application decides to
-  page it in and calls `Load()`, which flips `ShouldLoad()` to `true` and
-  emits a `Loaded` event on the **parent**. `Load` opens a transaction on the
-  parent, so — like `GetText` — it must not be called from inside a `Transact`
-  closure.
+  with `ShouldLoad()` equal to its `AutoLoad()`, as in Yjs. One that does not
+  auto-load waits until the receiving application decides to page it in and
+  calls `Load()`, which flips `ShouldLoad()` to `true` and
+  emits a `Loaded` event on the **parent**. On an embedded subdoc, `Load`
+  opens a transaction on the parent, so — like `GetText` — it must not be
+  called from inside the parent's `Transact` closure.
 - **`crdt.WithAutoLoad(bool)`** — marks a subdocument so remote peers/providers
   auto-load it instead of waiting for an explicit `Load()` call. Default `false`.
 - **`crdt.WithShouldLoad(bool)`** — sets the initial `ShouldLoad()` value.
   Default `true` for a doc you create yourself; a doc materialized from a
-  decoded update starts `false` (derived from `autoLoad`) until `Load()`.
+  decoded update starts with its `AutoLoad()` value, as in Yjs.
 - **`crdt.WithCollectionID(string)`** — an optional grouping label
   (`Doc.CollectionID()`), e.g. to batch-load every subdoc in a collection.
+  As in Yjs, it is local: subdocument opts on the wire do not carry it, and a
+  subdocument without one takes its parent's when it is added.
 
 ```go
 child := crdt.New(
@@ -549,7 +592,8 @@ All hard-capped (semaphore-backed for connection counts):
 - `Server.MaxRooms` — total-room cap (applies to peer upgrades and `Server.Apply`).
 - `Server.MaxUpdateBytes` — per-update size cap (default 64 MiB).
 - `Server.MaxMessageBytes` — per-message size on the WebSocket read path (default 64 MiB).
-- `Server.PeerWriteQueueSize` — per-peer broadcast queue depth (default 256). When the queue fills, the peer is disconnected.
+- `Server.PeerWriteQueueSize` — per-peer broadcast queue depth (default 512). When the queue fills, the peer is disconnected.
+- `Server.PeerWriteQueueBytes` — per-peer bound on the bytes waiting in a peer's write queue (default 0: no bound). The queue depth alone lets one peer hold that many copies of the room's full state, one for each SyncStep1 it sends without reading. When the waiting frames reach the bound, the next frame closes the peer. The handshake is not counted. Set it above the largest room state the server holds.
 - `Server.MaxPendingItems` — per-document cap on items parked in the out-of-order pending queue (default 100,000), and separately on delete ranges parked waiting for the structs they delete. An update that would park items past the cap, or leave more parked delete ranges than the cap, returns `ErrInvalidUpdate` and leaves the document unchanged: it is refused before any of it integrates. Defends against a crafted update full of far-future-clock items, or a run of delete sets naming clocks nobody holds, that would otherwise grow the queue unboundedly. Same cap is available at the doc level via `crdt.WithMaxPendingItems(n)`.
 - `Server.HandshakeTimeout` — first-read deadline applied after WebSocket upgrade (default 30s). Closes connections that complete the handshake but never send a message (slow-loris defense). Cleared after the first successful read.
 - `Server.MaxAwarenessBytesPerRoom` — cap on the cumulative byte size of awareness state held in one room across all remote clients (default unlimited; suggested production value: 100 MiB). Without this cap, a single peer can claim up to 10,000 clientIDs each holding the 1 MiB per-state maximum. Forwarded to each room's `Awareness` via `awareness.Awareness.SetMaxBytes`.
@@ -568,7 +612,7 @@ server.AuthFunc = func(r *http.Request) bool {
 }
 ```
 
-For **read-only connections** (v1.30.0, #59), use `Server.Authorize` instead — it both accepts/rejects and reports per-connection config. A read-only peer receives document and awareness broadcasts but its inbound writes (sync step-2/update and awareness) are dropped server-side; it can still request state (SyncStep1) and query awareness. When set, `Authorize` takes precedence over `AuthFunc`:
+For **read-only connections** (v1.30.0, #59), use `Server.Authorize` instead — it both accepts/rejects and reports per-connection config. A read-only peer receives document and awareness broadcasts. Its sync updates and awareness update do not change the room or reach other peers, and its awareness update gets an empty response; it can still request state (SyncStep1) and query awareness. When set, `Authorize` takes precedence over `AuthFunc`:
 
 ```go
 server.Authorize = func(r *http.Request) (ygws.ConnectionConfig, bool) {

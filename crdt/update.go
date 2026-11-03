@@ -39,6 +39,54 @@ const (
 // ErrInvalidUpdate is returned when a binary update cannot be decoded.
 var ErrInvalidUpdate = errors.New("crdt: invalid update")
 
+// ErrIntegrateScanBudget is why a bounded document (WithMaxIntegrateScan,
+// WithIntegrateScanBudget) refuses a remote update whose conflict scans would
+// pass more items than the apply's limit. It wraps ErrInvalidUpdate, and
+// ApplyUpdate returns it inside a RefusedUpdateError: like every remote update
+// a bounded document refuses, the update leaves the document as it was
+// (apply_rollback.go).
+var ErrIntegrateScanBudget = fmt.Errorf("%w: its conflict scans pass more items than the document allows", ErrInvalidUpdate)
+
+// RefusedUpdateError is the error ApplyUpdateV1 and ApplyUpdateV2 return for a
+// remote update a bounded document (WithMaxIntegrateScan,
+// WithIntegrateScanBudget) refused and took back. The refused apply commits no
+// transaction an observer sees, so this error is what reports the work it did.
+//
+// Err is why the update was refused: ErrIntegrateScanBudget when its scans
+// reached the apply's limit, otherwise an error wrapping ErrInvalidUpdate.
+// Unwrap returns it, so errors.Is matches either, and Error is its message.
+// Scanned is the number of items the refused apply's conflict scans passed,
+// counted as Transaction.IntegrateScanned counts them for an apply that
+// commits: never more than the apply's limit, and exactly the limit when the
+// scans reached it.
+type RefusedUpdateError struct {
+	Err     error
+	Scanned int
+}
+
+// Error is the message of the error the update was refused for, or a bare
+// message when the zero value is used (Err nil).
+func (e *RefusedUpdateError) Error() string {
+	if e.Err == nil {
+		return "crdt: update refused"
+	}
+	return e.Err.Error()
+}
+
+// Unwrap is the error the update was refused for.
+func (e *RefusedUpdateError) Unwrap() error { return e.Err }
+
+// integrateScanBudgetExceeded is the panic Item.integrate raises when a remote
+// update's scans reach the apply's limit, before it links the item;
+// applyV1Txn and applyV2Txn recover it as ErrIntegrateScanBudget.
+type integrateScanBudgetExceeded struct{}
+
+// budgetCallbackPanic wraps a panic the WithIntegrateScanBudget callback
+// raised, so recoveredApplyErr names the callback rather than item integration.
+// callIntegrateScanBudget tags it; the apply runs the callback inside its own
+// panic recovery (beginRemoteApply).
+type budgetCallbackPanic struct{ v any }
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 // EncodeStateAsUpdateV1 encodes the part of doc newer than sv as a V1 binary
@@ -46,7 +94,13 @@ var ErrInvalidUpdate = errors.New("crdt: invalid update")
 func EncodeStateAsUpdateV1(doc *Doc, sv StateVector) []byte {
 	doc.mu.Lock()
 	defer doc.mu.Unlock()
-	return withParked(doc, sv, encodeV1Locked(doc, sv), encodeStructStoreV1, MergeUpdatesV1)
+	return encodeStateAsUpdateV1Locked(doc, sv)
+}
+
+// encodeStateAsUpdateV1Locked is EncodeStateAsUpdateV1's body, for a caller
+// that holds doc.mu.
+func encodeStateAsUpdateV1Locked(doc *Doc, sv StateVector) []byte {
+	return withParked(doc, sv, encodeV1Locked(doc, sv, buildDeleteSet(doc.store)), encodeStructStoreV1, MergeUpdatesV1)
 }
 
 // ApplyUpdateV1 decodes and integrates a V1 binary update into doc.
@@ -67,13 +121,34 @@ func ApplyUpdateV1(doc *Doc, update []byte, origin any) error {
 // nothing): what it integrated and the structs and deletions it parked, for a
 // caller that must forward it, so a peer parks what doc parks.
 func ApplyUpdateV1Landed(doc *Doc, update []byte, origin any) (landed []byte, err error) {
+	landed, _, err = ApplyUpdateV1Held(doc, update, origin)
+	return landed, err
+}
+
+// ApplyUpdateV1Held is ApplyUpdateV1Landed that also reports whether doc
+// already held all of update, so the apply changed and parked nothing and a
+// peer that holds the same document needs none of it. It decides under the
+// lock the apply holds, so a concurrent apply cannot change the answer.
+func ApplyUpdateV1Held(doc *Doc, update []byte, origin any) (landed []byte, held bool, err error) {
+	var failed *[]byte
 	doc.Transact(func(txn *Transaction) {
 		txn.Local = false // Yjs readUpdate: transact(..., local=false)
 		if err = applyV1Txn(txn, update); err != nil {
-			landed = encodeTxnV1Locked(txn)
+			// Encoded at commit, after the GC, as OnUpdate's update is. Only a
+			// failed apply allocates the slot, so a successful one stays free.
+			failed = new([]byte)
+			txn.landed = failed
+		} else if !txn.changesDoc() {
+			// An apply that changed nothing either held all of update or parked part of it.
+			if structs, ds, decodeErr := decodeStructsV1(New(), update); decodeErr == nil {
+				held = storeContains(txn.doc.store, structs, ds)
+			}
 		}
 	}, origin)
-	return landed, err
+	if failed != nil {
+		landed = *failed
+	}
+	return landed, held, err
 }
 
 // encodeTxnV1Locked encodes the structs txn has added to the store so far, the
@@ -139,7 +214,7 @@ func encodeTxnV1Locked(txn *Transaction) []byte {
 	if len(perClient) == 0 && len(ds.clients) == 0 {
 		return nil
 	}
-	return encodeStructStoreV1(perClient, ds, sv, store)
+	return encodeStructStoreV1(perClient, ds, sv)
 }
 
 // EncodeStateAsUpdateV2 encodes the document state using the Yjs V2
@@ -158,7 +233,7 @@ func EncodeStateAsUpdateV2(doc *Doc, sv StateVector) []byte {
 // stay transaction-only, as in Yjs. A part that does not merge is left out
 // alone, never the rest of the parked state with it.
 func withParked(doc *Doc, sv StateVector, state []byte,
-	encode func(map[ClientID][]*Item, DeleteSet, StateVector, *StructStore) []byte,
+	encode func(map[ClientID][]*Item, DeleteSet, StateVector) []byte,
 	merge func(...[]byte) ([]byte, error)) []byte {
 	s := doc.store
 	if s.pending == nil && len(s.pendingDs.clients) == 0 {
@@ -168,7 +243,7 @@ func withParked(doc *Doc, sv StateVector, state []byte,
 	if s.pending != nil {
 		// One update per item, so one that does not merge is left out alone.
 		for _, it := range s.pending.heldItems() {
-			parts = append(parts, encode(map[ClientID][]*Item{it.ID.Client: {it}}, newDeleteSet(), sv, s))
+			parts = append(parts, encode(map[ClientID][]*Item{it.ID.Client: {it}}, newDeleteSet(), sv))
 		}
 	}
 	// One update per client's parked ranges, so a bad range costs only its
@@ -176,7 +251,7 @@ func withParked(doc *Doc, sv StateVector, state []byte,
 	for client, ranges := range s.pendingDs.clients {
 		ds := newDeleteSet()
 		ds.clients[client] = ranges
-		parts = append(parts, encode(nil, ds, sv, s))
+		parts = append(parts, encode(nil, ds, sv))
 	}
 	return mergeParts(state, parts, merge)
 }
@@ -222,21 +297,21 @@ func ApplyUpdateV2(doc *Doc, update []byte, origin any) error {
 // update converts intact (integrating into a scratch doc parked such updates
 // and emitted an empty one; yjs convertUpdateFormatV1ToV2 parity).
 func UpdateV1ToV2(v1 []byte) ([]byte, error) {
-	perClient, ds, store, err := buildMergeStore([][]byte{v1}, decodeStructsV1)
+	perClient, ds, err := buildMergeStore([][]byte{v1}, decodeStructsV1)
 	if err != nil {
 		return nil, err
 	}
-	return encodeStructStoreV2(perClient, ds, StateVector{}, store), nil
+	return encodeStructStoreV2(perClient, ds, StateVector{}), nil
 }
 
 // UpdateV2ToV1 converts a real Yjs V2 update to V1 format, at the struct level
 // (see UpdateV1ToV2).
 func UpdateV2ToV1(v2 []byte) ([]byte, error) {
-	perClient, ds, store, err := buildMergeStore([][]byte{v2}, decodeStructsV2)
+	perClient, ds, err := buildMergeStore([][]byte{v2}, decodeStructsV2)
 	if err != nil {
 		return nil, err
 	}
-	return encodeStructStoreV1(perClient, ds, StateVector{}, store), nil
+	return encodeStructStoreV1(perClient, ds, StateVector{}), nil
 }
 
 // MergeUpdatesV1 and DiffUpdateV1 live in merge.go — they operate at the struct
@@ -287,7 +362,9 @@ func DecodeStateVectorV1(data []byte) (StateVector, error) {
 
 // ── V1 encoding ───────────────────────────────────────────────────────────────
 
-func encodeV1Locked(doc *Doc, sv StateVector) []byte {
+// encodeV1Locked encodes the structs of doc newer than sv, and ds, as a V1
+// update. Called with the document lock held.
+func encodeV1Locked(doc *Doc, sv StateVector, ds DeleteSet) []byte {
 	type clientGroup struct {
 		client     ClientID
 		items      []*Item
@@ -297,19 +374,17 @@ func encodeV1Locked(doc *Doc, sv StateVector) []byte {
 	var groups []clientGroup
 	for client, items := range doc.store.clients {
 		svClock := sv.Clock(client)
-		var relevant []*Item
-		for _, item := range items {
-			if item.ID.Clock+item.Content.Len() > svClock {
-				relevant = append(relevant, item)
-			}
-		}
+		// A client's items are clock-sorted and disjoint, so the ones the peer
+		// lacks are a suffix, found by binary search as Yjs writeStructs does.
+		relevant := items[sort.Search(len(items), func(i int) bool {
+			return items[i].ID.Clock+items[i].Content.Len() > svClock
+		}):]
 		if len(relevant) > 0 {
 			groups = append(groups, clientGroup{client, relevant, svClock})
 		}
 	}
-	sort.Slice(groups, func(i, j int) bool { return groups[i].client < groups[j].client })
-
-	deleteSet := buildDeleteSet(doc.store)
+	// Yjs writes clients in descending order.
+	sort.Slice(groups, func(i, j int) bool { return groups[i].client > groups[j].client })
 
 	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
 		enc.WriteVarUint(uint64(len(groups)))
@@ -322,41 +397,48 @@ func encodeV1Locked(doc *Doc, sv StateVector) []byte {
 				if i == 0 && g.startClock > item.ID.Clock {
 					offset = g.startClock - item.ID.Clock
 				}
-				encodeItem(enc, item, offset, doc.store)
+				encodeItem(enc, item, offset)
 			}
 		}
-		encodeDeleteSet(enc, deleteSet)
+		encodeDeleteSet(enc, ds)
 	})
 }
 
-// isGCOrphan reports whether item carries no positional anchors at all — the
-// shape of a garbage-collected/deleted placeholder decoded from the wire GC
-// format, whose parent a receiver cannot infer. An item with a non-nil Origin,
-// OriginRight, or parentID is NOT an orphan even if its Parent is momentarily
-// unresolved (e.g. its anchor lives outside a merge input set): its origin must
-// be preserved on the wire so the receiver can resolve the parent once it has
-// the dependency. Stripping such an origin detaches the item (#149-class merge
-// corruption).
+// isGCOrphan reports whether item is a GC struct: no parent, origins or parent
+// ID. An item whose parent is only unresolved keeps an origin or parent ID.
 func (item *Item) isGCOrphan() bool {
 	return item.Parent == nil && item.Origin == nil && item.OriginRight == nil && item.parentID == nil
 }
 
-// markGCOrphan turns an item whose parent cannot be resolved into the GC struct
-// Yjs integrates it as: deleted, length-only content, and no parent or origins.
-// It then encodes as a GC struct, and nothing can resolve a parent through it,
-// so children that arrive later are orphaned too instead of integrating into a
-// detached type.
+// markGCOrphan turns item into the GC struct Yjs makes when its parent cannot
+// be resolved, a neighbour is a GC struct, or its nested type is collected:
+// deleted, length-only content, and no parent, origins, neighbours or redo
+// link. It then encodes as a GC struct, and nothing can resolve a parent
+// through it, so children that arrive later are orphaned too instead of
+// integrating into a detached type. Without neighbour links, a GC struct that
+// RunGC merges away is not kept in memory by the struct that absorbs it.
 func (item *Item) markGCOrphan() {
+	if _, ok := item.Content.(*ContentDeleted); !ok {
+		item.Content = NewContentDeleted(item.Content.Len())
+	}
+	item.dropGCLinks()
+}
+
+// dropGCLinks makes item deleted and clears what a GC struct does not have:
+// its parent, parent ID, origins, neighbours and redo link.
+func (item *Item) dropGCLinks() {
 	item.Deleted = true
-	item.Content = NewContentDeleted(item.Content.Len())
 	item.Parent = nil
 	item.ParentSub = nil
 	item.parentID = nil
 	item.Origin = nil
 	item.OriginRight = nil
+	item.Left = nil
+	item.Right = nil
+	item.redone = nil
 }
 
-func encodeItem(enc *encoding.Encoder, item *Item, offset uint64, store *StructStore) {
+func encodeItem(enc *encoding.Encoder, item *Item, offset uint64) {
 	// Orphaned items (no parent) came from GC wire format where the parent
 	// type name is lost. Encode them as GC structs so receivers get valid
 	// clock accounting instead of corrupt data.
@@ -420,21 +502,6 @@ func encodeItem(enc *encoding.Encoder, item *Item, offset uint64, store *StructS
 		originRight = item.OriginRight
 	}
 
-	// If the origin item is a GC placeholder (no Parent), the receiver can't
-	// infer this item's parent from it. Clear the origin so that explicit
-	// parent info is encoded instead, allowing the receiver to resolve the
-	// parent directly from the named root type or container item ID.
-	if origin != nil {
-		if oi := store.Find(*origin); oi != nil && oi.isGCOrphan() {
-			origin = nil
-		}
-	}
-	if originRight != nil {
-		if ori := store.Find(*originRight); ori != nil && ori.isGCOrphan() {
-			originRight = nil
-		}
-	}
-
 	info := tag
 	if origin != nil {
 		info |= flagHasOrigin
@@ -474,20 +541,13 @@ func encodeItem(enc *encoding.Encoder, item *Item, offset uint64, store *StructS
 			// integrated (its container is in a later client group), so Parent
 			// is still nil while parentID holds the container's ID. Re-emit the
 			// explicit parent-by-ID so the receiver can defer and resolve it too.
-			// Without this the struct-level MergeUpdatesV1/DiffUpdateV1 encode
-			// path falls through to the root-named-type branch below and writes
-			// an empty name, detaching the child (silent data loss). (#140)
 			enc.WriteUint8(0)
 			enc.WriteVarUint(uint64(item.parentID.Client))
 			enc.WriteVarUint(item.parentID.Clock)
 		} else {
-			// Root named type.
+			// Root named type; an item with no parent is a GC struct, written above.
 			enc.WriteUint8(1)
-			name := ""
-			if item.Parent != nil {
-				name = item.Parent.name
-			}
-			enc.WriteVarString(name)
+			enc.WriteVarString(item.Parent.name)
 		}
 
 		if item.ParentSub != nil {
@@ -526,10 +586,10 @@ func encodeContent(enc *encoding.Encoder, c Content, offset uint64) {
 		enc.WriteVarString(ct.Key)
 		enc.WriteVarString(fmtValToJSON(ct.Val))
 	case *ContentType:
-		tc, nodeName := typeClassOf(ct)
+		tc, name := typeClassOf(ct)
 		enc.WriteUint8(tc)
-		if tc == 3 { // YXmlElement
-			enc.WriteVarString(nodeName)
+		if typeRefHasName(tc) {
+			enc.WriteVarString(name)
 		}
 	case *ContentAny:
 		vals := ct.Vals[offset:]
@@ -543,7 +603,7 @@ func encodeContent(enc *encoding.Encoder, c Content, offset uint64) {
 			guid = ct.Doc.GUID()
 		}
 		enc.WriteVarString(guid)
-		enc.WriteAny(subdocOpts(ct.Doc))
+		writeSubdocOpts(enc, ct.Doc)
 	case *ContentMove:
 		enc.WriteVarUint(uint64(ct.Target.Client))
 		enc.WriteVarUint(ct.Target.Clock)
@@ -566,6 +626,8 @@ func typeClassOf(ct *ContentType) (byte, string) {
 		return 3, v.NodeName
 	case *YXmlFragment:
 		return 4, ""
+	case *yxmlHook:
+		return 5, v.hookName
 	case *YXmlText:
 		return 6, ""
 	default:
@@ -591,17 +653,26 @@ func (e typeRefError) Error() string { return fmt.Sprintf("unknown type ref: %d"
 // content, which loses the key and breaks its later encoding.
 var errZeroLengthStruct = errors.New("zero-length struct")
 
+// A client's items are sorted by clock and do not overlap, so extending the
+// last range with each adjacent deleted item gives sorted, compacted ranges
+// in one pass, as Yjs's createDeleteSetFromStructStore does.
 func buildDeleteSet(store *StructStore) DeleteSet {
 	ds := newDeleteSet()
-	for _, items := range store.clients {
+	for client, items := range store.clients {
+		var ranges []DeleteRange
 		for _, item := range items {
-			if item.Deleted {
-				ds.add(item.ID, item.Content.Len())
+			if !item.Deleted {
+				continue
+			}
+			if last := len(ranges) - 1; last >= 0 && ranges[last].Clock+ranges[last].Len == item.ID.Clock {
+				ranges[last].Len += item.Content.Len()
+			} else {
+				ranges = append(ranges, DeleteRange{Clock: item.ID.Clock, Len: item.Content.Len()})
 			}
 		}
-	}
-	for client := range ds.clients {
-		ds.sortAndCompact(client)
+		if len(ranges) > 0 {
+			ds.clients[client] = ranges
+		}
 	}
 	return ds
 }
@@ -613,7 +684,7 @@ func encodeDeleteSet(enc *encoding.Encoder, ds DeleteSet) {
 	}
 	// Yjs writes delete set clients in descending order, and applies a delete
 	// set in its encoded order.
-	sort.Slice(clients, func(i, j int) bool { return clients[i] > clients[j] })
+	slices.SortFunc(clients, func(a, b ClientID) int { return cmp.Compare(b, a) })
 	enc.WriteVarUint(uint64(len(clients)))
 	for _, c := range clients {
 		ranges := ds.clients[c]
@@ -636,13 +707,27 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	applying := false
 	defer func() {
 		if r := recover(); r != nil {
-			retErr = integrationPanicErr(r)
+			retErr = recoveredApplyErr(r)
 		}
 		// An apply that fails before it began to integrate must tell no observer.
 		txn.refused = retErr != nil && !applying
-		if applying {
+		if !applying {
+			if txn.applyJournal() == nil {
+				// Refused before the journal began: nothing changed.
+				retErr = refuseRemoteApply(txn, retErr)
+			} else {
+				// Refused while decoding, after the journal began: what the
+				// decode named (a root type) is taken back.
+				retErr = endRemoteApply(txn, retErr)
+			}
+			return
+		}
+		// A bounded document rolls a failed apply back whole, so it drains
+		// only an apply that succeeded.
+		if retErr == nil || txn.applyJournal() == nil {
 			retErr = drainAfterApply(txn, retErr)
 		}
+		retErr = endRemoteApply(txn, retErr)
 	}()
 
 	dec := encoding.NewDecoder(update)
@@ -679,6 +764,9 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 
 	// 1. Decode every struct; the structs of several clients all wait in
 	//    pending, and a one-client update's stay in group.
+	// The pre-apply checks changed nothing, so on a bounded document the
+	// journal begins only now (apply_rollback.go).
+	beginRemoteApply(txn, sv)
 	var buf [8]*Item // a keystroke's few structs stay on the stack
 	withinUpdatePending, group, groupClient, err := decodeStructs(txn, dec, sv, numClients, budget.superseded, buf[:0])
 	if err != nil {
@@ -711,14 +799,21 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 // drainAfterApply drains the pending queue last in every apply that began to
 // integrate, so one that fails partway drains on what it kept, as a peer
 // applying its update does; a drain error is its error only when err is nil.
+// On a bounded document the drain is a phase of its own (drainParked).
 func drainAfterApply(txn *Transaction, err error) (retErr error) {
 	retErr = err
 	defer func() {
 		if r := recover(); r != nil && retErr == nil {
-			retErr = integrationPanicErr(r)
+			retErr = recoveredApplyErr(r)
 		}
 	}()
-	if drainErr := drainPending(txn); retErr == nil {
+	var drainErr error
+	drainParked(txn, func() { drainErr = drainPending(txn) })
+	// On a bounded document a struct the drain dropped (drainPending) is not
+	// the update's: refusing the update would roll the drop back too and put
+	// the struct back in the queue, so every later update that fills its gap
+	// would be refused. The update stands, and the struct stays dropped.
+	if retErr == nil && txn.applyJournal() == nil {
 		retErr = drainErr
 	}
 	return retErr
@@ -848,6 +943,8 @@ func integrateGroup(txn *Transaction, group []*Item, existingEnd uint64, pending
 				item.Content = item.Content.Splice(offset)
 			}
 			txn.doc.store.Append(item)
+			// A deferred move whose target is in this GC struct stops waiting.
+			txn.doc.store.resolvePendingMoves(txn, item.ID.Client)
 			existingEnd = itemEnd // track progress so subsequent items in the group are not falsely gapped
 			continue
 		}
@@ -887,6 +984,8 @@ func integrateGroup(txn *Transaction, group []*Item, existingEnd uint64, pending
 			item.Left = nil
 			item.markGCOrphan()
 			appendTrimmed(store, item, existingEnd)
+			// A deferred move whose target is in this GC struct stops waiting.
+			store.resolvePendingMoves(txn, item.ID.Client)
 			existingEnd = itemEnd
 			continue
 		}
@@ -909,6 +1008,24 @@ func resolveDecodedParent(store *StructStore, item *Item) {
 		if ct, ok := container.Content.(*ContentType); ok {
 			item.Parent, item.parentID = ct.Type, nil
 		}
+	}
+}
+
+// parentRef returns the struct whose parent it would inherit.
+func parentRef(store *StructStore, it *Item) *Item {
+	switch {
+	case it.Origin != nil:
+		return store.Find(*it.Origin)
+	case it.OriginRight != nil:
+		return store.Find(*it.OriginRight)
+	}
+	return nil
+}
+
+func inheritParent(it, ref *Item) {
+	it.Parent = ref.Parent
+	if it.ParentSub == nil {
+		it.ParentSub = ref.ParentSub
 	}
 }
 
@@ -1116,9 +1233,9 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 			}
 			parentItem := doc.store.Find(pid)
 			if parentItem == nil {
-				// Container not integrated yet. EncodeStateAsUpdate sorts groups
-				// ascending by client, so a lower-clientID item written into a
-				// higher-clientID peer's nested type decodes before its parent.
+				// Container not integrated yet. EncodeStateAsUpdate writes groups
+				// descending by client, so a higher-clientID item written into a
+				// lower-clientID peer's nested type decodes before its parent.
 				// Defer instead of hard-failing (Yjs pendingStructs parity,
 				// review finding C-3): record the parent ID and let integration
 				// resolve it once the container arrives.
@@ -1154,6 +1271,9 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 
 	content, err := decodeContent(dec, doc, tag)
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseOnBoundedDoc(doc, content); err != nil {
 		return nil, err
 	}
 
@@ -1380,18 +1500,14 @@ func decodeTypeContent(dec *encoding.Decoder, doc *Doc, typeClass byte) (*abstra
 		frag.owner = frag
 		return &frag.abstractType, nil
 
-	case 5: // YXmlHook — ygo has no hook type, but Yjs writes a hookName
-		// string after the ref. We MUST consume it (mirroring decodeTypeContentV2)
-		// or the rest of the update stream desyncs. Degrade to a rawType
-		// placeholder. (#wire-conformance)
-		if _, err := dec.ReadVarString(); err != nil {
+	case 5: // YXmlHook
+		hookName, err := dec.ReadVarString()
+		if err != nil {
 			return nil, err
 		}
-		r := &rawType{}
-		r.doc = doc
-		r.itemMap = make(map[string]*Item)
-		r.owner = r
-		return &r.abstractType, nil
+		h := newYXmlHook(hookName)
+		h.doc = doc
+		return &h.abstractType, nil
 
 	case 6: // YXmlText
 		xt := NewYXmlText()
@@ -1464,12 +1580,14 @@ func readDeleteSet(dec *encoding.Decoder, n uint64, add func(client ClientID, r 
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// clientsSorted returns m's clients in descending order, the order Yjs writes
+// a state vector in.
 func clientsSorted[T any](m map[ClientID]T) []ClientID {
 	out := make([]ClientID, 0, len(m))
 	for c := range m {
 		out = append(out, c)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	sort.Slice(out, func(i, j int) bool { return out[i] > out[j] })
 	return out
 }
 
@@ -1521,6 +1639,20 @@ func structEnd(clock, n uint64) (uint64, error) {
 
 // wrapUpdateErr names err as an invalid update once: an error that already is
 // one is returned as it is.
+// recoveredApplyErr is the error an apply returns for a panic it recovered:
+// ErrIntegrateScanBudget for the scan bound's own panic, a message naming the
+// WithIntegrateScanBudget callback for a panic it raised, otherwise
+// ErrInvalidUpdate naming the panic from integrating the update.
+func recoveredApplyErr(r any) error {
+	switch r := r.(type) {
+	case integrateScanBudgetExceeded:
+		return ErrIntegrateScanBudget
+	case budgetCallbackPanic:
+		return fmt.Errorf("%w: panic in the WithIntegrateScanBudget callback: %v", ErrInvalidUpdate, r.v)
+	}
+	return integrationPanicErr(r)
+}
+
 func wrapUpdateErr(err error) error {
 	if err == nil || errors.Is(err, ErrInvalidUpdate) {
 		return err
@@ -1752,14 +1884,14 @@ func rightIsGC(txn *Transaction, item *Item) bool {
 	return false
 }
 
-// tryIntegrate attempts to integrate item into the doc store. Returns
-// true on success (item is now integrated into the linked list, or
-// stored as an orphan when its parent is truly unresolvable). Returns
-// false if blocked on a future-clock dependency — the caller should
-// leave it in the pending queue — with waitsOn, the client of the first
-// unmet one: item's own client past a gap, then its origin, right origin
-// and parent. An item that continues its client's GC struct also leaves
-// the queue: tryIntegrate returns true and an error.
+// tryIntegrate attempts to integrate item into the doc store. Returns true on
+// success (item is now integrated into the linked list, or stored as a GC
+// struct when its parent is truly unresolvable or a neighbour is a GC struct).
+// Returns false if blocked on a future-clock dependency — the caller should
+// leave it in the pending queue — with waitsOn, the client of the first unmet
+// one: item's own client past a gap, then its origin, right origin and
+// parent. An item that continues its client's GC struct also leaves the
+// queue: tryIntegrate returns true and an error.
 //
 // Used by the inline retry loop to drain pending items that may now
 // be integrable. Parallels the normal decode-loop path but with items
@@ -1795,6 +1927,12 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 		return true, 0, nil
 	}
 
+	// From here the item is resolved, trimmed or integrated in place; a drain
+	// taken back parks it again as it was (drainParked).
+	if j := txn.applyJournal(); j != nil {
+		j.keepParked(item)
+	}
+
 	// GC-orphan path (no parent, deleted): store without integration, trimmed
 	// to the not-yet-integrated suffix exactly as the decode loops do.
 	//
@@ -1807,6 +1945,7 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 	// here, so the offset is never negative.
 	if item.Parent == nil && item.Deleted {
 		appendTrimmed(store, item, existingEnd)
+		store.resolvePendingMoves(txn, item.ID.Client)
 		return true, 0, nil
 	}
 
@@ -1834,9 +1973,13 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 				return false, item.OriginRight.Client, nil
 			}
 			if ori := store.Find(*item.OriginRight); ori != nil {
-				item.Parent = ori.Parent
-				if item.ParentSub == nil {
-					item.ParentSub = ori.ParentSub
+				// An item whose origin is a GC struct keeps no parent, so it
+				// becomes a GC struct below, as in Yjs.
+				if item.Origin == nil {
+					item.Parent = ori.Parent
+					if item.ParentSub == nil {
+						item.ParentSub = ori.ParentSub
+					}
 				}
 			} else if item.OriginRight.Clock >= store.NextClock(item.OriginRight.Client) {
 				return false, item.OriginRight.Client, nil
@@ -1866,6 +2009,7 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 			// struct Yjs integrates it as.
 			item.markGCOrphan()
 			appendTrimmed(store, item, existingEnd)
+			store.resolvePendingMoves(txn, item.ID.Client)
 			return true, 0, nil
 		}
 	}
@@ -1910,19 +2054,32 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 	if item.Origin != nil {
 		item.Left = store.getItemCleanEnd(txn, item.Origin.Client, item.Origin.Clock)
 	}
-
-	// Yjs integrates an item next to a GC struct as a GC struct, also when it
-	// found a parent through its right origin.
-	if (item.Left != nil && item.Left.isGCOrphan()) || rightIsGC(txn, item) {
+	// Yjs resolves an item's neighbours and parent when it integrates the
+	// item. A left or right neighbour that is a GC struct (also when the item
+	// found a parent through its right origin), or a parent type the GC
+	// collected while the item was parked, makes it a GC struct, as an
+	// unresolvable parent does above.
+	if (item.Left != nil && item.Left.isGCOrphan()) || typeCollected(item.Parent) || rightIsGC(txn, item) {
 		item.Left = nil
 		item.markGCOrphan()
 		appendTrimmed(store, item, existingEnd)
+		store.resolvePendingMoves(txn, item.ID.Client)
 		return true, 0, nil
 	}
 
 	// A parked range may now overlap the store; integrate only its new suffix.
 	item.integrate(txn, offset)
 	return true, 0, nil
+}
+
+// typeCollected reports whether the GC collected t: its holder item no longer
+// holds it.
+func typeCollected(t *abstractType) bool {
+	if t == nil || t.item == nil {
+		return false
+	}
+	ct, ok := t.item.Content.(*ContentType)
+	return !ok || ct.Type != t
 }
 
 // itemFutureDep reports whether item is blocked on a future-clock dependency

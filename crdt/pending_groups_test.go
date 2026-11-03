@@ -54,7 +54,7 @@ func pendingDiverseUpdate(version, n int, shape string) []byte {
 	if version == 2 {
 		encode = encodeStructStoreV2
 	}
-	return encode(groups, newDeleteSet(), nil, doc.store)
+	return encode(groups, newDeleteSet(), nil)
 }
 
 func TestUnit_PendingBudget_BoundsDiverseBytes(t *testing.T) {
@@ -144,7 +144,7 @@ func pendingOverlappingGroups(version int) []byte {
 			enc.WriteVarUint(uint64(items[0].ID.Client))
 			enc.WriteVarUint(items[0].ID.Clock)
 			for _, item := range items {
-				encodeItem(enc, item, 0, source.store)
+				encodeItem(enc, item, 0)
 			}
 		}
 		encodeDeleteSet(enc, newDeleteSet())
@@ -157,7 +157,7 @@ func pendingOverlappingGroups(version int) []byte {
 		enc.writeClient(items[0].ID.Client)
 		enc.restEnc.WriteVarUint(items[0].ID.Clock)
 		for _, item := range items {
-			encodeItemV2(enc, item, 0, source.store)
+			encodeItemV2(enc, item, 0)
 		}
 	}
 	encodeDeleteSetV2(enc, newDeleteSet())

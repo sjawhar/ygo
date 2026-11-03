@@ -195,9 +195,14 @@ func (ds *DeleteSet) orderedClients() []ClientID {
 }
 
 // retryPendingDs reapplies the parked deletions that can now apply, in the
-// order Yjs re-reads its pending delete set.
+// order Yjs re-reads its pending delete set. On a bounded document the take
+// writes into a copy of the pending deletes (ownPendingDs), which the journal
+// and the drain keep as they found them.
 func retryPendingDs(txn *Transaction) {
 	store := txn.doc.store
+	if len(store.pendingDsMoved) > 0 {
+		ownPendingDs(txn, nil)
+	}
 	ready := store.takeReadyDeletes()
 	if ready.clients == nil {
 		return
@@ -214,7 +219,7 @@ func applyDecodedDeleteSet(txn *Transaction, ds DeleteSet, err error) error {
 		return wrapUpdateErr(err)
 	}
 	if len(unresolvable.clients) > 0 {
-		txn.doc.store.parkDeletes(unresolvable)
+		parkDeletes(txn, unresolvable)
 		txn.noteParkedDeletes(unresolvable)
 	}
 	return nil
@@ -285,7 +290,8 @@ func (ds *DeleteSet) applyToPartial(txn *Transaction) DeleteSet {
 				if item.ID.Clock >= r.Clock+r.Len {
 					break
 				}
-				// After our boundary splits, item is entirely inside the range.
+				// After our boundary splits, item is inside the range, except a GC
+				// struct, which is never split and is already deleted.
 				end := r.Clock + r.Len
 				itemEnd := item.ID.Clock + item.Content.Len()
 				if itemEnd < end {

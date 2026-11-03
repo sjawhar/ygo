@@ -30,24 +30,37 @@ type peer struct {
 	cidMu      sync.Mutex
 	writeCh    chan []byte   // buffered queue drained by runWriter goroutine
 	writerDone chan struct{} // closed when runWriter exits
+	// Byte-budget accounting under wmu, kept only when writeBudget > 0, with
+	// the handshake numbered handshakeFrom to handshakeTo so it stays uncharged.
+	queuedBytes   int64
+	enqueued      uint64
+	dequeued      uint64
+	handshakeFrom uint64
+	handshakeTo   uint64
+	writeBudget   int64 // Server.PeerWriteQueueBytes when the peer connected
 	// needsResync is set (under wmu) when a broadcast is dropped because writeCh
 	// was full under SlowPeerResync. runWriter clears it and sends a full-state
 	// resync once the queue drains, so the peer converges without a reconnect.
 	needsResync       bool
+	queueClosed       bool          // set under wmu when the frame cap or byte budget closes the peer; later frames are dropped unlogged
 	closeCode         int           // #104: WS close code queued via enqueueClose (0 = none)
 	closeReason       string        // #104: WS close reason accompanying closeCode
 	limiter           *rate.Limiter // per-peer inbound-message rate limiter; nil = unlimited (#51)
-	readOnly          bool          // #59: drop this peer's inbound writes (sync step-2/update + awareness)
+	readOnly          bool          // sync updates and awareness do not change the room; awareness gets an empty response
 	hocuspocusFraming bool          // #104: docName-prefixed framing for this connection
-	inputClosed       atomic.Bool   // a close is queued or sent; the read loop drops input from then on
+	inputClosed       atomic.Bool   // set before the server closes, or starts to close, the connection while the read loop runs; the read loop drops input from then on
+	// ctx is the request context ServeHTTP served this connection on, which
+	// Server.OnTokenAuthContext receives.
+	ctx context.Context
 
-	// disconnectOnce ensures the full teardown sequence in handleDisconnect
-	// runs exactly once, regardless of how many callers race (e.g. broadcast's
-	// conn.Close() triggering the read loop while a ctx-cancel path also calls
-	// handleDisconnect). The closed bool under wmu is still needed for the
-	// per-operation guards in broadcast/write/runWriter.
+	// disconnectOnce runs handleDisconnect's teardown once when callers race,
+	// such as closeConn() waking the read loop during a ctx-cancel teardown.
 	disconnectOnce sync.Once
 }
+
+// readOnlyAwarenessResponse is an awareness frame with no client states that
+// keeps a read-only Hocuspocus provider connected without queuing its payload.
+var readOnlyAwarenessResponse = [...]byte{byte(msgAwareness), 1, 0}
 
 // handleMessage decodes the outer message type and dispatches accordingly.
 func (p *peer) handleMessage(data []byte) {
@@ -98,14 +111,16 @@ func (p *peer) handleMessage(data []byte) {
 		p.sendSync(reply)
 
 	case msgAwareness:
-		if p.readOnly {
-			return // #59: read-only peers' inbound awareness is dropped.
-		}
 		// Awareness payload is VarBytes-wrapped (y-websocket protocol).
 		awBytes, err := dec.ReadVarBytes()
 		if err != nil {
 			p.server.log().Debug("discarded malformed awareness frame",
 				"room", p.roomName, "err", err)
+			return
+		}
+		if p.readOnly {
+			// A viewer cannot change shared awareness, but its provider needs a reply to stay connected.
+			p.write(readOnlyAwarenessResponse[:])
 			return
 		}
 		res, err := p.applyAwareness(awBytes)
@@ -205,7 +220,7 @@ func (p *peer) handleMessage(data []byte) {
 		reason, _ := dec.ReadVarString() // optional; silent on parse error
 		p.server.log().Info("peer requested close",
 			"room", p.roomName, "reason", reason)
-		_ = p.conn.Close()
+		p.closeConn()
 
 	case msgSyncStatus:
 		// Hocuspocus tag 8 (#55). Server→client ack carrying a single
@@ -233,10 +248,10 @@ func (p *peer) handleMessage(data []byte) {
 // applySyncUpdate handles a SyncStep2 or Update (update, the sync payload's
 // content) that a peer sent under Sync (tag 0) or SyncReply (tag 4): it applies
 // the update to the room, through Server.OnPeerUpdate when one is set, and
-// broadcasts payload to the room's other peers once the room has applied it. A
-// read-only peer's update is neither applied nor broadcast (#59). An update the
-// hook refused is not broadcast, and the peer is then closed (see
-// PeerUpdateHook).
+// broadcasts payload to the room's other peers once the room has applied it,
+// unless the room already held all of it. A read-only peer's update is neither
+// applied nor broadcast (#59). An update the hook refused is not broadcast, and
+// the peer is then closed (see PeerUpdateHook).
 //
 // On a connection using Hocuspocus framing it answers every such frame with
 // exactly one SyncStatus (tag 8), in the order the frames arrived, so a client
@@ -260,7 +275,7 @@ func (p *peer) applySyncUpdate(subType int, update, payload []byte) {
 		}
 		return
 	}
-	applied, closeWith := p.applyPeerUpdate(update)
+	applied, held, closeWith := p.applyPeerUpdate(update)
 	if !applied {
 		p.sendSyncStatus(false)
 		if closeWith != nil {
@@ -268,19 +283,22 @@ func (p *peer) applySyncUpdate(subType int, update, payload []byte) {
 		}
 		return
 	}
-	p.broadcastSync(payload)
+	if !held {
+		p.broadcastSync(payload)
+	}
 	p.sendSyncStatus(true)
 }
 
-// applyToRoom applies update to the room's document and, when the apply fails
-// after part of the update integrated or parked, broadcasts that part, and only
-// that part, to the room's other peers, so they hold what the room holds.
-func (p *peer) applyToRoom(update []byte) error {
-	landed, err := crdt.ApplyUpdateV1Landed(p.room.doc, update, p)
+// applyToRoom applies update to the room's document and reports whether the
+// room already held all of it. When the apply fails after part of the update
+// integrated or parked, it broadcasts that part, and only that part, to the
+// room's other peers, so they hold what the room holds.
+func (p *peer) applyToRoom(update []byte) (bool, error) {
+	landed, held, err := crdt.ApplyUpdateV1Held(p.room.doc, update, p)
 	if err != nil && landed != nil {
 		p.broadcastSync(ygsync.EncodeUpdate(landed))
 	}
-	return err
+	return held, err
 }
 
 // roomHolds reports whether the room's document already holds everything the
@@ -331,12 +349,17 @@ func (p *peer) discardMalformedSync(err error) {
 }
 
 // handleAuth processes a Hocuspocus in-band Auth (tag 2) sub-message. No-op
-// when Server.OnTokenAuth is nil (backward compatible with the legacy
-// silent-ignore behavior).
+// when Server.OnTokenAuth and Server.OnTokenAuthContext are both nil
+// (backward compatible with the legacy silent-ignore behavior).
 func (p *peer) handleAuth(dec *encoding.Decoder) {
-	hook := p.server.OnTokenAuth
+	hookName, hook := "OnTokenAuthContext", p.server.OnTokenAuthContext
 	if hook == nil {
-		return
+		legacy := p.server.OnTokenAuth
+		if legacy == nil {
+			return
+		}
+		hookName = "OnTokenAuth"
+		hook = func(_ context.Context, room, token string) (ConnectionConfig, error) { return legacy(room, token) }
 	}
 	subType, err := dec.ReadVarUint()
 	if err != nil || subType != authTypeToken {
@@ -348,7 +371,7 @@ func (p *peer) handleAuth(dec *encoding.Decoder) {
 		return
 	}
 
-	cfg, authErr := p.safeTokenAuth(hook, token)
+	cfg, authErr := p.safeTokenAuth(hookName, hook, token)
 	if authErr != nil {
 		p.write(encodeAuthMessage(authTypePermissionDenied, authErr.Error()))
 		// Full error text goes in the PermissionDenied data frame above; the
@@ -366,16 +389,16 @@ func (p *peer) handleAuth(dec *encoding.Decoder) {
 	p.write(encodeAuthMessage(authTypeAuthenticated, scope))
 }
 
-// safeTokenAuth calls the hook, converting a panic into a denial.
-func (p *peer) safeTokenAuth(hook func(string, string) (ConnectionConfig, error), token string) (cfg ConnectionConfig, err error) {
+// safeTokenAuth calls hook, converting a panic into a denial.
+func (p *peer) safeTokenAuth(hookName string, hook func(context.Context, string, string) (ConnectionConfig, error), token string) (cfg ConnectionConfig, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			p.server.log().Warn("OnTokenAuth panicked; denying", "room", p.roomName, "panic", r)
+			p.server.log().Warn(hookName+" panicked; denying", "room", p.roomName, "panic", r)
 			cfg = ConnectionConfig{}
 			err = fmt.Errorf("authentication error")
 		}
 	}()
-	return hook(p.roomName, token)
+	return hook(p.ctx, p.roomName, token)
 }
 
 // encodeAuthMessage builds a tag-2 auth reply: VarUint(msgAuth) VarUint(sub)
@@ -546,7 +569,7 @@ func awarenessFanout(aw *awareness.Awareness, frame []byte, res awareness.ApplyR
 // removal for all clientIDs the peer owned.
 //
 // disconnectOnce ensures the full teardown body runs at most once even when
-// multiple callers race — e.g. broadcast()'s conn.Close() waking the read loop
+// multiple callers race — e.g. broadcast()'s closeConn() waking the read loop
 // while the ctx-cancel goroutine concurrently reaches this point.
 func (p *peer) handleDisconnect() {
 	p.disconnectOnce.Do(func() {
@@ -639,8 +662,7 @@ func (p *peer) handleDisconnect() {
 		// a flush failure still leaves the room alive exactly as before
 		// (evict stays false), matching pre-#183 behaviour, and does NOT stamp
 		// idleSince — an unflushed room isn't safely idle. RoomIdleTimeout==0
-		// takes the exact pre-#183 branch (evict = stillEmpty && flushOK), so
-		// behaviour for existing callers is byte-identical.
+		// evicts when stillEmpty && flushOK and no caller is inside the room.
 		stillEmpty := false
 		evict := false
 		if empty {
@@ -651,7 +673,8 @@ func (p *peer) handleDisconnect() {
 			if stillEmpty && flushOK {
 				if idleTimeout > 0 {
 					rm.idleSince = time.Now()
-				} else {
+				} else if rm.inflight == 0 {
+					// A caller inside the room would lose its later writes, so the room stays resident.
 					evict = true
 				}
 			}
@@ -726,7 +749,7 @@ func (p *peer) handleDisconnect() {
 		if err := p.room.awareness.ApplyUpdate(removalBytes, nil); err != nil {
 			p.server.log().Warn("apply removal awareness failed", "room", p.roomName, "err", err)
 		}
-		p.broadcastAwarenessFromRoom(removalBytes)
+		p.broadcastAwareness(removalBytes)
 	})
 }
 
@@ -788,21 +811,32 @@ func encodeAwarenessRemoval(aw *awareness.Awareness, clientIDs []uint64) []byte 
 	})
 }
 
-// sendSync writes a sync message (outer type 0, raw payload) to this peer.
-func (p *peer) sendSync(syncMsg []byte) {
-	p.write(encoding.EncodeBytes(func(enc *encoding.Encoder) {
+// syncFrame wraps a sync message as a frame (outer type 0, raw payload).
+func syncFrame(syncMsg []byte) []byte {
+	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
 		enc.WriteVarUint(msgSync)
 		enc.WriteRaw(syncMsg) // sync payload is NOT VarBytes-wrapped
-	}))
+	})
+}
+
+// awarenessFrame wraps an awareness message as a frame (outer type 1,
+// VarBytes payload).
+func awarenessFrame(awMsg []byte) []byte {
+	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
+		enc.WriteVarUint(msgAwareness)
+		enc.WriteVarBytes(awMsg) // awareness payload IS VarBytes-wrapped
+	})
+}
+
+// sendSync writes a sync message (outer type 0, raw payload) to this peer.
+func (p *peer) sendSync(syncMsg []byte) {
+	p.write(syncFrame(syncMsg))
 }
 
 // sendAwareness writes an awareness message (outer type 1, VarBytes payload)
 // to this peer.
 func (p *peer) sendAwareness(awMsg []byte) {
-	p.write(encoding.EncodeBytes(func(enc *encoding.Encoder) {
-		enc.WriteVarUint(msgAwareness)
-		enc.WriteVarBytes(awMsg) // awareness payload IS VarBytes-wrapped
-	}))
+	p.write(awarenessFrame(awMsg))
 }
 
 // broadcastSync sends a sync message to all OTHER peers in the room.
@@ -813,17 +847,8 @@ func (p *peer) broadcastSync(syncMsg []byte) {
 	}), true)
 }
 
-// broadcastAwareness sends an awareness message to all OTHER peers in the room.
+// broadcastAwareness sends an awareness update to every current room peer, including its sender.
 func (p *peer) broadcastAwareness(awMsg []byte) {
-	p.broadcast(encoding.EncodeBytes(func(enc *encoding.Encoder) {
-		enc.WriteVarUint(msgAwareness)
-		enc.WriteVarBytes(awMsg)
-	}), true)
-}
-
-// broadcastAwarenessFromRoom sends an awareness message to ALL peers (called
-// from disconnect handler which has already removed itself from the room).
-func (p *peer) broadcastAwarenessFromRoom(awMsg []byte) {
 	p.broadcast(encoding.EncodeBytes(func(enc *encoding.Encoder) {
 		enc.WriteVarUint(msgAwareness)
 		enc.WriteVarBytes(awMsg)
@@ -840,6 +865,9 @@ func (p *peer) broadcastAwarenessFromRoom(awMsg []byte) {
 // stream that only resolves on the next exchange. Disconnecting forces
 // a reconnect-and-resync flow which the CRDT's pending-structs
 // machinery handles cleanly.
+//
+// A target past Server.PeerWriteQueueBytes is closed before the frame cap is
+// checked (see enqueueLocked).
 func (p *peer) broadcast(data []byte, excludeSelf bool) {
 	p.room.mu.Lock()
 	targets := make([]*peer, 0, len(p.room.peers))
@@ -856,14 +884,11 @@ func (p *peer) broadcast(data []byte, excludeSelf bool) {
 		// wmu before attempting the channel send. handleDisconnect sets closed
 		// under wmu before closing writeCh, so this is race-free.
 		other.wmu.Lock()
-		if other.closed {
+		if other.closed || other.queueClosed {
 			other.wmu.Unlock()
 			continue
 		}
-		select {
-		case other.writeCh <- data:
-			// queued
-		default:
+		if full := other.enqueueLocked(data, "broadcast", false); full {
 			// Queue full.
 			if p.server.SlowPeerPolicy == SlowPeerResync {
 				// Drop this stale delta and flag an in-place resync; runWriter
@@ -878,7 +903,7 @@ func (p *peer) broadcast(data []byte, excludeSelf bool) {
 				p.server.log().Warn("peer write queue full; closing slow peer",
 					"room", other.roomName,
 					"queueSize", cap(other.writeCh))
-				_ = other.conn.Close()
+				other.closeQueueLocked()
 			}
 		}
 		other.wmu.Unlock()
@@ -891,30 +916,46 @@ func (p *peer) broadcast(data []byte, excludeSelf bool) {
 // a dropped handshake reply (sendSync / sendAwareness) leaves the remote
 // peer hung waiting for a response it will never receive. Closing the
 // connection forces a reconnect-and-resync, matching the broadcast contract.
+// A frame over Server.PeerWriteQueueBytes closes it too (see enqueueLocked).
 func (p *peer) write(data []byte) {
 	p.wmu.Lock()
-	if p.closed {
-		p.wmu.Unlock()
+	p.writeLocked(data, false)
+	p.wmu.Unlock()
+}
+
+// writeLocked is write with wmu held, leaving handshake frames outside the
+// byte budget.
+func (p *peer) writeLocked(data []byte, handshake bool) {
+	if p.closed || p.queueClosed {
 		return
 	}
-	select {
-	case p.writeCh <- data:
-	default:
+	if full := p.enqueueLocked(data, "direct send", handshake); full {
 		// Queue full during a direct send (e.g. handshake reply) — disconnect.
 		// Unlike a silent drop, closing the connection lets the CRDT
 		// pending-structs machinery recover via reconnect-and-resync.
 		p.server.log().Warn("peer write queue full during direct send; closing peer",
 			"room", p.roomName,
 			"queueSize", cap(p.writeCh))
-		_ = p.conn.Close()
+		p.closeQueueLocked()
 	}
-	p.wmu.Unlock()
 }
 
-// runWriter is the dedicated per-peer broadcast writer. It drains writeCh
-// and serialises writes to the connection. Exits when writeCh is closed
-// (during teardown) or when a write fails (the connection is then dead;
-// the read loop will tear down the peer).
+// closeConn closes the connection and makes the read loop drop unhandled
+// input, since a reconnecting client sends its updates again.
+func (p *peer) closeConn() {
+	p.inputClosed.Store(true)
+	_ = p.conn.Close()
+}
+
+// closeQueueLocked closes a peer whose write queue overflowed, with wmu held,
+// and marks it so that the overflow is logged once.
+func (p *peer) closeQueueLocked() {
+	p.queueClosed = true
+	p.closeConn()
+}
+
+// runWriter is the dedicated per-peer broadcast writer, serialising writeCh
+// to the connection until writeCh closes or a write fails.
 //
 // This pattern mirrors Rust yrs-warp's per-peer sink task. It replaces
 // the previous "spawn one goroutine per peer per broadcast" model, which
@@ -928,6 +969,11 @@ func (p *peer) runWriter() {
 			// close control frame on this goroutine, then stop.
 			p.sendCloseFrame()
 			return
+		}
+		if p.writeBudget > 0 {
+			p.wmu.Lock()
+			p.creditLocked(len(data))
+			p.wmu.Unlock()
 		}
 		if !p.writeToConn(data) {
 			return
@@ -953,6 +999,9 @@ func (p *peer) runWriter() {
 // through writeCh), and gorilla/websocket permits conn.Close() — used by the
 // disconnect path and teardown — to run concurrently with a write. Returns false
 // when the writer goroutine should exit.
+//
+// A failed write closes the connection with closeConn, because gorilla's read
+// side outlives a write timeout and would keep the peer in its room.
 func (p *peer) writeToConn(data []byte) bool {
 	p.wmu.Lock()
 	closed := p.closed
@@ -967,11 +1016,19 @@ func (p *peer) writeToConn(data []byte) bool {
 		})
 	}
 	if err := p.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-		p.server.log().Debug("set write deadline failed", "err", err)
+		p.server.log().Debug("set write deadline failed; closing", "room", p.roomName, "err", err)
+		p.closeConn()
 		return false
 	}
 	if err := p.conn.WriteMessage(gws.BinaryMessage, data); err != nil {
-		p.server.log().Warn("write to peer failed; closing", "room", p.roomName, "err", err)
+		// A write that fails after the server closed the connection is expected.
+		lg := p.server.log()
+		logf := lg.Warn
+		if p.inputClosed.Load() {
+			logf = lg.Debug
+		}
+		logf("write to peer failed; closing", "room", p.roomName, "err", err)
+		p.closeConn()
 		return false
 	}
 	return true
@@ -990,8 +1047,8 @@ func (p *peer) maybeResync() bool {
 	p.wmu.Lock()
 	// Wait until the backlog has fully drained so the resync is not immediately
 	// followed by now-stale queued deltas.
-	if p.closed || !p.needsResync || len(p.writeCh) > 0 {
-		notClosed := !p.closed
+	if p.closed || p.queueClosed || !p.needsResync || len(p.writeCh) > 0 {
+		notClosed := !p.closed && !p.queueClosed
 		p.wmu.Unlock()
 		return notClosed
 	}
@@ -999,20 +1056,13 @@ func (p *peer) maybeResync() bool {
 	p.wmu.Unlock()
 
 	// Build resync frames without holding wmu: crdt.Doc and Awareness are
-	// internally synchronised (mirrors the initial-sync path).
-	step2 := encodeSyncStep2Msg(crdt.EncodeStateAsUpdateV1(p.room.doc, nil))
-	syncFrame := encoding.EncodeBytes(func(enc *encoding.Encoder) {
-		enc.WriteVarUint(msgSync)
-		enc.WriteRaw(step2)
-	})
-	awFrame := encoding.EncodeBytes(func(enc *encoding.Encoder) {
-		enc.WriteVarUint(msgAwareness)
-		enc.WriteVarBytes(p.room.awareness.EncodeUpdate(nil))
-	})
+	// internally synchronised.
+	step2 := syncFrame(encodeSyncStep2Msg(crdt.EncodeStateAsUpdateV1(p.room.doc, nil)))
+	aw := awarenessFrame(p.room.awareness.EncodeUpdate(nil))
 
 	// Send the frames via the same wmu-free write path as normal broadcasts, so a
 	// slow peer cannot stall broadcast() during the resync either.
-	for _, frame := range [][]byte{syncFrame, awFrame} {
+	for _, frame := range [][]byte{step2, aw} {
 		if !p.writeToConn(frame) {
 			return false
 		}

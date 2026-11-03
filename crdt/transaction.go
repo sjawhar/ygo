@@ -1,7 +1,9 @@
 package crdt
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -10,14 +12,27 @@ import (
 // operation. Observers fire once per transaction, not once per operation,
 // which keeps event handler overhead proportional to transactions not edits.
 type Transaction struct {
-	doc         *Doc
-	Origin      any  // user-supplied tag forwarded to update observers
-	Local       bool // true when the change originated on this peer; false while applying a remote update
+	doc    *Doc
+	Origin any  // user-supplied tag forwarded to update observers
+	Local  bool // true when the change originated on this peer; false while applying a remote update
+	// done is set (under d.mu, just before the commit releases it) once this
+	// transaction has committed. The transaction-scoped root accessors check
+	// it and fail loudly instead of silently mutating d.share without the
+	// lock: the realistic misuses — an OnAfterTransaction observer (which
+	// receives the *Transaction after unlock) or code retaining the txn past
+	// its callback — run on the same goroutine that committed, so program
+	// order guarantees they observe done == true. A transaction smuggled to
+	// another goroutine while still live is unaffected (that is already
+	// undefined for every txn method); for one used cross-goroutine after
+	// commit the check is best-effort. It sits beside Local so the two share
+	// a word.
+	done        bool
 	deleteSet   DeleteSet
 	beforeState StateVector
 	afterState  StateVector
-	// changed tracks which types (and which map keys within them) were modified.
-	changed map[*abstractType]map[string]struct{}
+	// changed tracks which types were modified, and what about each. Add
+	// entries only through addChanged, which records the order too.
+	changed map[*abstractType]changedType
 	// newItems collects ContentString items integrated during this transaction.
 	// Used by squashRuns to merge adjacent same-client runs after observers fire.
 	newItems []*Item
@@ -27,6 +42,14 @@ type Transaction struct {
 	// transient (no item was inserted between them). Mirrors Yjs JS's
 	// `_mergeStructs` and powers gap #78 H2.
 	mergeStructs []*Item
+	// scanned counts the items the conflict scans of this transaction's
+	// integrates have passed (IntegrateScanned), for every transaction of
+	// every document, so it is a field of its own: a bounded apply's limit is
+	// checked against it (boundedApplyState.scanLimit, scanFrom).
+	scanned int
+	// boundedApply holds a bounded remote apply's scan and rollback state, so
+	// other transactions do not carry it.
+	boundedApply *boundedApplyState
 	// rearbitrate queues, per parent, move targets whose winning ContentMove
 	// was tombstoned; rearbitrateMoves resolves them in one pass at commit.
 	rearbitrate map[*abstractType]map[*Item]struct{}
@@ -43,32 +66,30 @@ type Transaction struct {
 	subdocsAdded   map[*Doc]struct{}
 	subdocsRemoved map[*Doc]struct{}
 	subdocsLoaded  map[*Doc]struct{}
-	// done is set (under d.mu, just before the commit releases it) once this
-	// transaction has committed. The transaction-scoped root accessors check
-	// it and fail loudly instead of silently mutating d.share without the
-	// lock: the realistic misuses — an OnAfterTransaction observer (which
-	// receives the *Transaction after unlock) or code retaining the txn past
-	// its callback — run on the same goroutine that committed, so program
-	// order guarantees they observe done == true. A transaction smuggled to
-	// another goroutine while still live is unaffected (that is already
-	// undefined for every txn method); for one used cross-goroutine after
-	// commit the check is best-effort.
-	done bool
 	// ctx is the context associated with this transaction. Set to
 	// context.Background() by Transact and to the caller's ctx by
 	// TransactContext. Exposed via the Ctx() method so fn can poll for
 	// cancellation.
 	ctx context.Context
-	// formatCleanup marks a remote transaction whose format cleanup runs
-	// once its observers have fired; afterTypeObservers, when set, decides
-	// it after the type observers (typeObserved: there are some), where
-	// Yjs does.
-	formatCleanup bool
-	typeObserved  bool
+	// cleanup is a remote transaction's format cleanup decision, which
+	// afterRemoteObservers reads once the observers have fired;
+	// cleanupAfterTypeObservers defers it until the type observers
+	// (typeObserved: there are some) have run, where Yjs makes it.
+	// cleanupSkipped holds the changed types that take no part in it: those
+	// deleted at commit, and texts whose own observers panicked.
+	cleanup        cleanupDecision
+	typeObserved   bool
+	cleanupSkipped map[*abstractType]struct{}
+	// landed, when set, receives ApplyUpdateV1Landed's update of what this
+	// failed apply integrated, encoded after the GC as OnUpdate's update is.
+	landed *[]byte
+	// deletedFormats holds, per client and sorted, the clocks of the format
+	// markers this remote transaction deleted, recorded for the format
+	// cleanup before the GC.
+	deletedFormats map[ClientID][]uint64
 	// refused marks a remote apply that failed before integrating, so the
 	// commit fires nothing.
-	refused            bool
-	afterTypeObservers func()
+	refused bool
 }
 
 // transactionParked is what one transaction parked, which a failed apply's
@@ -108,6 +129,21 @@ func (t *Transaction) noteParkedDeletes(ds DeleteSet) {
 	p.deletes = append(p.deletes, ds)
 }
 
+// changesDoc reports whether t deleted something or added structs, the
+// condition under which Yjs emits a transaction's update. It reads the
+// store, so it holds inside the transaction as well as at commit.
+func (t *Transaction) changesDoc() bool {
+	if len(t.deleteSet.clients) > 0 {
+		return true
+	}
+	for client := range t.doc.store.clients {
+		if t.doc.store.NextClock(client) != t.beforeState.Clock(client) {
+			return true
+		}
+	}
+	return false
+}
+
 // Ctx returns the context associated with this transaction. Transactions
 // started via Transact return context.Background(); transactions started
 // via TransactContext return the caller's ctx. fn can poll Ctx().Err()
@@ -118,6 +154,61 @@ func (t *Transaction) noteParkedDeletes(ds DeleteSet) {
 // and reconcile via sync or recreate the doc from persistence.
 func (t *Transaction) Ctx() context.Context {
 	return t.ctx
+}
+
+// IntegrateScanned is the number of items the conflict scans of the
+// transaction's integrates passed (Item.integrate), the drain of the pending
+// queue included, also when a bounded document took the drain back: what
+// WithMaxIntegrateScan and WithIntegrateScanBudget bound for a remote update,
+// counted for every transaction of every document, bounded or not. Read from
+// an OnAfterTransaction observer, which runs after the document's lock is
+// released and before ApplyUpdate returns, it is the scan work an applied
+// remote update cost: under a budget at most what the budget gave the apply,
+// and under a bound at most the bound for the update and the bound again for
+// its drain. A remote update a bounded document refuses commits no
+// transaction an observer sees; RefusedUpdateError.Scanned reports its scans.
+func (t *Transaction) IntegrateScanned() int {
+	return t.scanned
+}
+
+// ChangedTypes returns the shared types the transaction changed: every type an
+// item was integrated into or deleted from, as that item's direct parent, once
+// per type and in no particular order. A change under a nested type names that
+// type, not the root above it; walk Parent from an entry to find the
+// containers it sits in.
+//
+// It is not the key set of Yjs `transaction.changed`, which leaves out every
+// type the transaction created and every type whose own item is deleted.
+// ChangedTypes names those too: a type the transaction created, whose own
+// content integrates into it; a type it deleted, whose content the delete
+// cascades into; and a type deleted before the transaction that a concurrent
+// remote change still writes into, while the GC has not collected it (once it
+// has, the write integrates as a GC struct, as in Yjs). A caller that wants only live types that
+// existed before the transaction filters these entries out: a type whose own
+// item is deleted no longer appears among its Parent's children or values.
+//
+// It never names an internal placeholder, a root nobody has opened by name
+// (Doc.GetXmlFragment, Doc.GetMap, …): a change to it is left out, and once
+// the root is opened, later transactions name the type its Get* returned. A
+// Yjs YXmlHook is named as the value YXmlFragment.Children lists for it.
+//
+// ChangedTypes does not take the document lock. OnAfterTransaction observers
+// run after the transaction released the lock, and reading ChangedTypes there
+// is safe: it reads only the committed transaction. Walking Parent from an
+// entry there, or anywhere outside a Transact callback, races any other
+// goroutine writing the document; it is safe inside a Transact callback, or in
+// an observer of a document no other goroutine writes (for example a copy one
+// goroutine applies updates to). Each call returns a new slice.
+func (t *Transaction) ChangedTypes() []SharedType {
+	types := make([]SharedType, 0, len(t.changed))
+	for at := range t.changed {
+		switch at.owner.(type) {
+		case nil, *rawType:
+			continue
+		}
+		types = append(types, at.owner)
+	}
+	return types
 }
 
 // Transaction-scoped root accessors (issue #138).
@@ -338,14 +429,26 @@ func squashRuns(txn *Transaction) {
 	}
 }
 
+// changedType is one entry of a transaction's changed map: the map keys the
+// transaction changed in that type, and the type's place in the order the
+// transaction first changed each of its types, which is the order Yjs fires
+// their observers in. An entry is never removed, so the orders of one
+// transaction's entries are 0 to len(changed)-1, which buildPhase2 uses as
+// indices.
+type changedType struct {
+	keys  map[string]struct{}
+	order int
+}
+
 // addChanged records that a type was modified, optionally under a specific key.
+// It is the only writer of changed, which keeps the orders dense.
 func (txn *Transaction) addChanged(t *abstractType, key string) {
-	keys, ok := txn.changed[t]
+	c, ok := txn.changed[t]
 	if !ok {
-		keys = make(map[string]struct{})
-		txn.changed[t] = keys
+		c = changedType{keys: make(map[string]struct{}), order: len(txn.changed)}
+		txn.changed[t] = c
 	}
-	keys[key] = struct{}{}
+	c.keys[key] = struct{}{}
 }
 
 // addSubdocAdded records that d was newly embedded (integrated) during this
@@ -391,10 +494,110 @@ func tryMergeWithLefts(txn *Transaction) {
 	if len(txn.mergeStructs) == 0 {
 		return
 	}
-	store := txn.doc.store
+	// In client and clock order each half merges into the run left of it, so a
+	// run split n times is copied once rather than n times.
+	slices.SortFunc(txn.mergeStructs, func(a, b *Item) int {
+		if c := cmp.Compare(a.ID.Client, b.ID.Client); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.ID.Clock, b.ID.Clock)
+	})
+	merging := mergeRuns{store: txn.doc.store}
 	for _, item := range txn.mergeStructs {
-		tryMergeWithLeft(item, store)
+		tryMergeWithLeft(item, &merging)
 	}
+	merging.finish()
+}
+
+// mergeRuns is the state of tryMergeWithLefts's merges, which take the halves
+// in client and clock order.
+type mergeRuns struct {
+	store *StructStore
+
+	// text is the run the last string merge extended, and joined its text from
+	// the run's second merge on, written back when another run starts.
+	text   *ContentString
+	joined strings.Builder
+
+	// items is client's store slice while merged halves leave it: items[:kept]
+	// is compacted and items[next:] not yet reached.
+	client     ClientID
+	items      []*Item
+	kept, next int
+}
+
+// appendString adds right's text to left's run without copying the whole run
+// at every merge.
+func (m *mergeRuns) appendString(left, right *ContentString) {
+	switch {
+	case left != m.text:
+		m.flushText()
+		m.text = left
+		left.Str += right.Str
+	case m.joined.Len() == 0:
+		m.joined.Grow(len(left.Str) + len(right.Str))
+		m.joined.WriteString(left.Str)
+		m.joined.WriteString(right.Str)
+	default:
+		m.joined.WriteString(right.Str)
+	}
+	left.utf16Len += right.utf16Len
+}
+
+// flushText writes the joined text back to its run.
+func (m *mergeRuns) flushText() {
+	if m.joined.Len() > 0 {
+		m.text.Str = m.joined.String()
+		m.joined.Reset()
+	}
+}
+
+// remove takes item, merged into its left neighbour, out of its client's store
+// slice, moving each item that stays at most once, as a single removal did.
+func (m *mergeRuns) remove(item *Item) {
+	if m.items != nil && item.ID.Client == m.client {
+		// Later halves come in clock order, so this scan passes only items the
+		// compaction moves anyway.
+		for i := m.next; i < len(m.items) && m.items[i].ID.Clock <= item.ID.Clock; i++ {
+			if m.items[i] == item {
+				m.kept += copy(m.items[m.kept:], m.items[m.next:i])
+				m.next = i + 1
+				return
+			}
+		}
+		return
+	}
+	m.flushItems()
+	items := m.store.clients[item.ID.Client]
+	if i, ok := indexOfItem(items, item); ok {
+		m.client, m.items, m.kept, m.next = item.ID.Client, items, i, i+1
+	}
+}
+
+// flushItems closes the gap the merged halves left in the current client's
+// store slice.
+func (m *mergeRuns) flushItems() {
+	if m.items == nil {
+		return
+	}
+	n := m.kept + copy(m.items[m.kept:], m.items[m.next:])
+	clear(m.items[n:])
+	m.store.clients[m.client] = m.items[:n]
+	m.items = nil
+}
+
+// finish writes back the last run's text and the last client's store slice.
+func (m *mergeRuns) finish() {
+	m.flushText()
+	m.flushItems()
+}
+
+// indexOfItem finds item in items, a store slice in clock order.
+func indexOfItem(items []*Item, item *Item) (int, bool) {
+	i, found := slices.BinarySearchFunc(items, item.ID.Clock, func(it *Item, clock uint64) int {
+		return cmp.Compare(it.ID.Clock, clock)
+	})
+	return i, found && items[i] == item
 }
 
 // tryMergeWithLeft attempts to absorb item into item.Left. Returns true when
@@ -409,7 +612,7 @@ func tryMergeWithLefts(txn *Transaction) {
 //
 // On success: left's content is extended in place, the linked list is spliced
 // past item, and item is removed from the store.
-func tryMergeWithLeft(item *Item, store *StructStore) bool {
+func tryMergeWithLeft(item *Item, merging *mergeRuns) bool {
 	left := item.Left
 	if left == nil {
 		return false
@@ -463,8 +666,7 @@ func tryMergeWithLeft(item *Item, store *StructStore) bool {
 		if !ok {
 			return false
 		}
-		lc.Str += rc.Str
-		lc.utf16Len += rc.utf16Len
+		merging.appendString(lc, rc)
 	case *ContentAny:
 		rc, ok := item.Content.(*ContentAny)
 		if !ok {
@@ -506,13 +708,51 @@ func tryMergeWithLeft(item *Item, store *StructStore) bool {
 		left.Parent.clearMarkers()
 	}
 
-	// Remove item from the store's per-client slice.
-	storeItems := store.clients[item.ID.Client]
-	for i, it := range storeItems {
-		if it == item {
-			store.clients[item.ID.Client] = append(storeItems[:i], storeItems[i+1:]...)
-			break
-		}
-	}
+	// Remove item from its client's store slice.
+	merging.remove(item)
 	return true
+}
+
+// scanMark is a conflict scan's mark on an item it passed: which scan of the
+// transaction, and at which step of it (Item.integrate).
+type scanMark struct{ scan, step uint32 }
+
+// boundedApplyState is the scan and rollback state of one remote apply on a
+// document with a scan bound.
+type boundedApplyState struct {
+	// scanLimit is the most a phase of the apply may add to the
+	// transaction's scanned count, set as the apply begins
+	// (beginRemoteApply), and 0 for no limit; scanFrom is scanned as the
+	// phase began: the whole apply is one phase under a budget, and under a
+	// bound the drain of the pending queue is a phase with an allowance of
+	// its own (drainParked).
+	scanLimit, scanFrom int
+	scanMarks           map[*Item]scanMark
+	scanSerial          uint32
+	journal             *applyJournal
+	rolledBack          bool
+}
+
+// beginBoundedApply returns txn's bounded apply state, made on first use.
+func (txn *Transaction) beginBoundedApply() *boundedApplyState {
+	if txn.boundedApply == nil {
+		txn.boundedApply = &boundedApplyState{}
+	}
+	return txn.boundedApply
+}
+
+// applyJournal returns the journal of txn's bounded apply, or nil.
+func (txn *Transaction) applyJournal() *applyJournal {
+	if txn.boundedApply == nil {
+		return nil
+	}
+	return txn.boundedApply.journal
+}
+
+// scanMarkMap returns the bounded apply's scan marks, made on first use.
+func (state *boundedApplyState) scanMarkMap() map[*Item]scanMark {
+	if state.scanMarks == nil {
+		state.scanMarks = make(map[*Item]scanMark)
+	}
+	return state.scanMarks
 }

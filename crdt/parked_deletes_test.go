@@ -30,16 +30,6 @@ func deleteSetUpdate(sets map[ClientID][]DeleteRange) []byte {
 	return append([]byte(nil), enc.Bytes()...)
 }
 
-// parkedDeletes is a struct-free V1 update of n one-clock ranges of client,
-// every other clock from 0.
-func parkedDeletes(client ClientID, n int) []byte {
-	ranges := make([]DeleteRange, n)
-	for i := range n {
-		ranges[i] = DeleteRange{Clock: uint64(2 * i), Len: 1}
-	}
-	return deleteSetUpdate(map[ClientID][]DeleteRange{client: ranges})
-}
-
 // applyIn applies the V1 update to doc as V1, or converted to V2.
 func applyIn(t *testing.T, doc *Doc, v2 bool, update []byte) error {
 	t.Helper()
@@ -385,24 +375,6 @@ func TestUnit_SetMaxPendingItems_ADocumentOverTheItemCapAppliesAnUpdateThatResol
 	}
 }
 
-// parkedBehindAGap is n items of client 99 from clock 1, each with an origin
-// at the start, so every item waits in the pending queue for clock 0.
-func parkedBehindAGap(n int) []byte {
-	enc := encoding.NewEncoder()
-	enc.WriteVarUint(1)
-	enc.WriteVarUint(uint64(n))
-	enc.WriteVarUint(99)
-	enc.WriteVarUint(1)
-	for range n {
-		enc.WriteUint8(wireString | flagHasOrigin)
-		enc.WriteVarUint(5)
-		enc.WriteVarUint(0)
-		enc.WriteVarString("x")
-	}
-	enc.WriteVarUint(0)
-	return append([]byte(nil), enc.Bytes()...)
-}
-
 // A document that loaded more parked items than its cap, with the cap set
 // after the load, still applies an update that parks nothing, such as a
 // keystroke, and an update whose items wait on each other within it and all
@@ -481,28 +453,6 @@ func TestUnit_SetMaxPendingItems_AStoredStateOverTheItemCapStillAppliesWhatResol
 // deleteRangesUpdate is a struct-free V1 update deleting ranges of one client.
 func deleteRangesUpdate(client ClientID, ranges ...DeleteRange) []byte {
 	return deleteSetUpdate(map[ClientID][]DeleteRange{client: ranges})
-}
-
-// observed counts the updates doc's OnUpdate observers are handed.
-func observed(doc *Doc) *int {
-	n := new(int)
-	doc.OnUpdate(func([]byte, any) { *n++ })
-	return n
-}
-
-// requireUnchanged fails unless doc's state, text "t" and OnUpdate observers
-// are untouched.
-func requireUnchanged(t *testing.T, doc *Doc, before []byte, text string, updates *int) {
-	t.Helper()
-	if after := EncodeStateAsUpdateV1(doc, nil); string(after) != string(before) {
-		t.Fatalf("the document's state changed: %d bytes before, %d after", len(before), len(after))
-	}
-	if got := doc.GetText("t").ToString(); got != text {
-		t.Fatalf("the text changed from %q to %q", text, got)
-	}
-	if *updates != 0 {
-		t.Fatalf("the observers were handed %d updates, want none", *updates)
-	}
 }
 
 // A refused over-cap update must leave the document's state, text, parked

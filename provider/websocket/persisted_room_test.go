@@ -153,8 +153,8 @@ func relayedUpdates(t *testing.T, conn *gws.Conn, room string) [][]byte {
 // (not the room's earlier parked entries, not its deletions), and ends with
 // the room's text and parked entries; the room stores the three characters,
 // once, as the update its observers are handed, with no parked entry and no
-// deletion it did not already hold (a stored update carries the room's whole
-// delete set, as every OnUpdate update does).
+// deletion (a stored update carries only its transaction's deletions, as every
+// OnUpdate update does).
 func TestInteg_PersistedRoom_PartlyAppliedUpdateRelaysAndStoresWhatLanded(t *testing.T) {
 	srv, ts, adapter := persistingServer(t, 200)
 	editorDoc := crdt.New(crdt.WithClientID(7))
@@ -179,7 +179,8 @@ func TestInteg_PersistedRoom_PartlyAppliedUpdateRelaysAndStoresWhatLanded(t *tes
 		require.NoError(t, crdt.ApplyUpdateV1(watcherDoc, u, nil))
 	}
 	require.Equal(t, 40, room.PendingStats().Items)
-	require.Eventually(t, func() bool { return len(adapter.stored()) >= 3 }, 5*time.Second, 5*time.Millisecond)
+	// The parked entries change nothing, so they fire no OnUpdate and are not stored.
+	require.Eventually(t, func() bool { return len(adapter.stored()) >= 2 }, 5*time.Second, 5*time.Millisecond)
 	storedBefore := len(adapter.stored())
 
 	author := crdt.New(crdt.WithClientID(1))
@@ -196,8 +197,6 @@ func TestInteg_PersistedRoom_PartlyAppliedUpdateRelaysAndStoresWhatLanded(t *tes
 			nested.Set(txn, "e"+strconv.Itoa(i), i)
 		}
 	})
-	held, err := crdt.ContentIDsFromUpdateV1(crdt.EncodeStateAsUpdateV1(room, nil))
-	require.NoError(t, err)
 	cut := crdt.EncodeStateAsUpdateV1(editorDoc, before)
 	hpSend(t, editor, "room", tagSync, ygsync.EncodeUpdate(cut[:len(cut)-1]))
 	require.Equal(t, []uint64{0}, syncStatuses(t, editor, "room"), "the sender is told the update was not applied")
@@ -222,8 +221,7 @@ func TestInteg_PersistedRoom_PartlyAppliedUpdateRelaysAndStoresWhatLanded(t *tes
 	require.NoError(t, err)
 	assert.Equal(t, ids.Inserts.Clients(), storedIDs.Inserts.Clients(), "the room stores the editor's structs")
 	assert.Equal(t, []crdt.IDRange{{Clock: 200, Len: 3}}, storedIDs.Inserts.Ranges(7), `the room stores "abc", what its observers are handed`)
-	assert.Equal(t, held.Deletes.Clients(), storedIDs.Deletes.Clients(), "the room stores no deletion it did not hold")
-	assert.Equal(t, held.Deletes.Ranges(7), storedIDs.Deletes.Ranges(7), "the room stores no deletion it did not hold")
+	assert.Empty(t, storedIDs.Deletes.Clients(), "the room stores no deletion: the apply deleted nothing")
 	replay := crdt.New()
 	for _, u := range stored {
 		require.NoError(t, crdt.ApplyUpdateV1(replay, u, nil))

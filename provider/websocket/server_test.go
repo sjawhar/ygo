@@ -90,7 +90,7 @@ func wsURL(srv *httptest.Server, room string) string {
 }
 
 // dial opens a WebSocket connection to the test server.
-func dial(t *testing.T, srv *httptest.Server, room string) *gws.Conn {
+func dial(t testing.TB, srv *httptest.Server, room string) *gws.Conn {
 	t.Helper()
 	conn, _, err := gws.DefaultDialer.Dial(wsURL(srv, room), nil)
 	require.NoError(t, err)
@@ -102,7 +102,7 @@ func dial(t *testing.T, srv *httptest.Server, room string) *gws.Conn {
 // Returns the outer type and decoded payload.
 // For sync (type 0), payload is the raw sync bytes (no length prefix).
 // For awareness (type 1), payload is the VarBytes-unwrapped awareness bytes.
-func readOne(t *testing.T, conn *gws.Conn, deadline time.Duration) (outerType uint64, payload []byte) { //nolint:unparam
+func readOne(t testing.TB, conn *gws.Conn, deadline time.Duration) (outerType uint64, payload []byte) { //nolint:unparam
 	t.Helper()
 	_ = conn.SetReadDeadline(time.Now().Add(deadline))
 	_, data, err := conn.ReadMessage()
@@ -122,23 +122,29 @@ func readOne(t *testing.T, conn *gws.Conn, deadline time.Duration) (outerType ui
 	return
 }
 
-// drainHandshake reads the three messages the server always sends on connect
-// (step-1, step-2, awareness) and applies any sync messages to doc.
-// Gorilla's bufio.Reader is permanently broken if a deadline expires, so we
-// read a known count instead of draining by timeout.
-func drainHandshake(t *testing.T, conn *gws.Conn, doc *crdt.Doc) {
+// drainHandshake sends doc's SyncStep1 as a provider does, then reads up to
+// and including the step-2 reply (after step-1 and any awareness on
+// connect), applying the sync messages to doc. Gorilla's bufio.Reader is
+// permanently broken if a deadline expires, so we read to a known frame
+// instead of draining by timeout.
+func drainHandshake(t testing.TB, conn *gws.Conn, doc *crdt.Doc) {
 	t.Helper()
-	for i := 0; i < 3; i++ {
+	sendSync(t, conn, ygsync.EncodeSyncStep1(doc))
+	for {
 		outerType, payload := readOne(t, conn, 2*time.Second)
-		if outerType == 0 { // msgSync
-			_, _ = ygsync.ApplySyncMessage(doc, payload, nil)
+		if outerType != 0 { // msgSync
+			continue
+		}
+		_, _ = ygsync.ApplySyncMessage(doc, payload, nil)
+		if sub, _, err := ygsync.ReadSyncMessage(payload); err == nil && sub == ygsync.MsgSyncStep2 {
+			return
 		}
 	}
 }
 
 // sendSync wraps payload in an outer msgSync message and sends it.
 // Sync payload is NOT VarBytes-wrapped (raw append after type byte).
-func sendSync(t *testing.T, conn *gws.Conn, syncMsg []byte) {
+func sendSync(t testing.TB, conn *gws.Conn, syncMsg []byte) {
 	t.Helper()
 	enc := encoding.NewEncoder()
 	enc.WriteVarUint(0) // msgSync
@@ -161,33 +167,6 @@ func sendAwareness(t *testing.T, conn *gws.Conn, awMsg []byte) {
 func TestUnit_NewServer_GetDoc_ReturnsNilForUnknownRoom(t *testing.T) {
 	srv := ygws.NewServer()
 	assert.Nil(t, srv.GetDoc("no-such-room"))
-}
-
-func TestUnit_ServerHandshake_SendsStep1AndStep2ThenAwareness(t *testing.T) {
-	ts := httptest.NewServer(ygws.NewServer())
-	defer ts.Close()
-
-	conn := dial(t, ts, "room1")
-
-	// Message 1: msgSync + step-1
-	outerType, payload := readOne(t, conn, 2*time.Second)
-	assert.Equal(t, uint64(0), outerType, "first msg should be msgSync")
-	dec := encoding.NewDecoder(payload)
-	syncType, err := dec.ReadVarUint()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(ygsync.MsgSyncStep1), syncType)
-
-	// Message 2: msgSync + step-2
-	outerType, payload = readOne(t, conn, 2*time.Second)
-	assert.Equal(t, uint64(0), outerType, "second msg should be msgSync")
-	dec = encoding.NewDecoder(payload)
-	syncType, err = dec.ReadVarUint()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(ygsync.MsgSyncStep2), syncType)
-
-	// Message 3: msgAwareness
-	outerType, _ = readOne(t, conn, 2*time.Second)
-	assert.Equal(t, uint64(1), outerType, "third msg should be msgAwareness")
 }
 
 func TestUnit_GetDoc_PopulatedAfterFirstConnection(t *testing.T) {
@@ -286,31 +265,29 @@ func TestInteg_IncrementalUpdate_BroadcastToPeer(t *testing.T) {
 	assert.Equal(t, "incremental", docB.GetText("t").ToString())
 }
 
-func TestInteg_AwarenessBroadcast_PeerReceivesState(t *testing.T) {
+func TestInteg_AwarenessBroadcast_SenderReceivesState(t *testing.T) {
 	ts := httptest.NewServer(ygws.NewServer())
 	defer ts.Close()
 
-	// Both peers connect and drain their handshakes.
 	connA := dial(t, ts, "awroom")
 	connB := dial(t, ts, "awroom")
 	drainHandshake(t, connA, crdt.New())
 	drainHandshake(t, connB, crdt.New())
 
-	// A sends an awareness update with clientID=42.
 	aw := awareness.New(42)
 	aw.SetLocalState(map[string]any{"cursor": float64(5)})
 	sendAwareness(t, connA, aw.EncodeUpdate(nil))
 
-	// B should receive the awareness broadcast.
-	outerType, awPayload := readOne(t, connB, 2*time.Second)
-	assert.Equal(t, uint64(1), outerType)
+	for _, conn := range []*gws.Conn{connA, connB} {
+		outerType, awPayload := readOne(t, conn, 2*time.Second)
+		assert.Equal(t, uint64(1), outerType)
 
-	// Parse and verify.
-	awDec := awareness.New(99)
-	require.NoError(t, awDec.ApplyUpdate(awPayload, nil))
-	states := awDec.GetStates()
-	require.Contains(t, states, uint64(42))
-	assert.InEpsilon(t, float64(5), states[42].State["cursor"], 1e-9)
+		received := awareness.New(99)
+		require.NoError(t, received.ApplyUpdate(awPayload, nil))
+		state, found := received.GetStates()[42]
+		require.True(t, found)
+		assert.InEpsilon(t, float64(5), state.State["cursor"], 1e-9)
+	}
 }
 
 func TestInteg_QueryAwareness_ReturnsCurrentState(t *testing.T) {
@@ -397,7 +374,7 @@ func TestServer_SlowPeer_GetsDisconnectedOnQueueOverflow(t *testing.T) {
 	// This makes the writeCh overflow deterministic:
 	//
 	//   1. Both peers connect via net.Pipe().
-	//   2. Both peers drain their 3-message handshake.
+	//   2. Both peers drain their handshake.
 	//   3. Slow peer stops reading; server-side writes to it block immediately.
 	//   4. runWriter for the slow peer blocks on the first broadcast write.
 	//   5. Fast peer sends more messages; broadcasts fill writeCh (cap 4).
@@ -422,13 +399,7 @@ func TestServer_SlowPeer_GetsDisconnectedOnQueueOverflow(t *testing.T) {
 	require.NoError(t, err)
 	defer fastConn.Close()
 	fastDoc := crdt.New(crdt.WithClientID(1))
-	_ = fastConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for i := 0; i < 3; i++ {
-		if _, _, e := fastConn.ReadMessage(); e != nil {
-			break
-		}
-	}
-	_ = fastConn.SetReadDeadline(time.Time{})
+	drainHandshake(t, fastConn, fastDoc)
 	// Start a goroutine that keeps draining from fastConn so the server can
 	// write broadcast messages back without blocking.
 	go func() {
@@ -444,14 +415,9 @@ func TestServer_SlowPeer_GetsDisconnectedOnQueueOverflow(t *testing.T) {
 	require.NoError(t, err)
 	defer slowConn.Close()
 
-	// Drain slow peer's 3-message handshake to free up writeCh capacity.
-	_ = slowConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for i := 0; i < 3; i++ {
-		if _, _, e := slowConn.ReadMessage(); e != nil {
-			break
-		}
-	}
-	_ = slowConn.SetReadDeadline(time.Time{}) // stop reading — writes to slow peer now block
+	// Drain slow peer's handshake to free up writeCh capacity, then stop
+	// reading — writes to slow peer now block.
+	drainHandshake(t, slowConn, crdt.New())
 
 	// Fast peer sends messages; each is broadcast to the slow peer.
 	// runWriter for slow peer blocks on the first write (net.Pipe has no OS
@@ -516,13 +482,7 @@ func TestServer_SlowPeer_ResyncPolicy_StaysConnectedAndConverges(t *testing.T) {
 	require.NoError(t, err)
 	defer fastConn.Close()
 	fastDoc := crdt.New(crdt.WithClientID(1))
-	_ = fastConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for i := 0; i < 3; i++ {
-		if _, _, e := fastConn.ReadMessage(); e != nil {
-			break
-		}
-	}
-	_ = fastConn.SetReadDeadline(time.Time{})
+	drainHandshake(t, fastConn, fastDoc)
 	go func() {
 		for {
 			if _, _, e := fastConn.ReadMessage(); e != nil {
@@ -531,22 +491,13 @@ func TestServer_SlowPeer_ResyncPolicy_StaysConnectedAndConverges(t *testing.T) {
 		}
 	}()
 
-	// Slow peer: connects, drains its 3-message handshake, then stops reading so
-	// the server-side write queue overflows.
+	// Slow peer: connects, drains its handshake, then stops reading so the
+	// server-side write queue overflows.
 	slowConn, _, err := dialer.Dial(wsBase+"/resync-room", nil)
 	require.NoError(t, err)
 	defer slowConn.Close()
 	slowDoc := crdt.New(crdt.WithClientID(2))
-	_ = slowConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for i := 0; i < 3; i++ {
-		if _, data, e := slowConn.ReadMessage(); e == nil {
-			dec := encoding.NewDecoder(data)
-			if ot, e2 := dec.ReadVarUint(); e2 == nil && ot == 0 {
-				_, _ = ygsync.ApplySyncMessage(slowDoc, dec.RemainingBytes(), nil)
-			}
-		}
-	}
-	_ = slowConn.SetReadDeadline(time.Time{}) // stop reading — writes now overflow
+	drainHandshake(t, slowConn, slowDoc)
 
 	// Fast peer bursts updates; broadcasts to the slow peer overflow its queue.
 	const inserts = 20
@@ -785,13 +736,12 @@ func TestServer_HandshakeTimeout_ClosesIdleConnection(t *testing.T) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	// Drain the three server-initiated handshake messages (step1, step2, awareness)
-	// so they don't interfere with the idle-connection detection.
-	for i := 0; i < 3; i++ {
-		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, _, err := c.ReadMessage()
-		require.NoError(t, err, "handshake message %d should arrive cleanly", i+1)
-	}
+	// Drain the one server-initiated handshake message (step1; an empty room
+	// has no awareness) so it does not interfere with the idle-connection
+	// detection.
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = c.ReadMessage()
+	require.NoError(t, err, "the handshake message should arrive cleanly")
 	_ = c.SetReadDeadline(time.Time{})
 
 	// Do not send any message. The server's HandshakeTimeout (300ms) fires and

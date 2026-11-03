@@ -233,13 +233,19 @@ func integrateClientRuns(txn *Transaction, pending []*Item, step int, done []boo
 	return -1, nil
 }
 
-// tryIntegrateOrDrop marks a panicking item done while a drain continues.
+// tryIntegrateOrDrop is tryIntegrate that, with a non-nil dropped, reports a
+// panicking item as integrated so the caller stops retrying it. The scan
+// bound's own panic is not the item's fault and goes on to drainParked, which
+// takes the drain back and keeps the item parked.
 func tryIntegrateOrDrop(txn *Transaction, item *Item, dropped *error) (ok bool, waitsOn ClientID, err error) {
 	if dropped == nil {
 		return tryIntegrate(txn, item)
 	}
 	defer func() {
 		if r := recover(); r != nil {
+			if _, bound := r.(integrateScanBudgetExceeded); bound {
+				panic(r)
+			}
 			*dropped = integrationPanicErr(r)
 			ok, waitsOn, err = true, 0, nil
 		}
@@ -258,6 +264,12 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 		pl := s.pending.plan(refsOf(pending))
 		if s.pending.heldStructs()+pl.growth() > limit {
 			return ErrInvalidUpdate
+		}
+		if j := txn.applyJournal(); j != nil {
+			// The merge changes the queue in place; a bounded apply's journal
+			// keeps what it changes, so a refused update leaves the queue as
+			// it found it.
+			j.keepQueueFor(s.pending, pl)
 		}
 		pending = s.pending.apply(pl, pending, s.parked != nil && len(s.parked.items) > 0)
 	}
@@ -283,10 +295,13 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 		}
 		s.pending.items = append(s.pending.items, item)
 		s.pending.noteTail(item)
+		// parkedMissing copies the map the journal of a bounded document's
+		// apply keeps, so an update the document refuses leaves the clocks its
+		// parked items wait on as they were (apply_rollback.go).
 		if client, parkedAt, future := itemFutureDep(item, s); future {
-			mergePendingMissing(s.pending.missing, client, parkedAt)
+			mergePendingMissing(parkedMissing(txn), client, parkedAt)
 		} else {
-			mergePendingMissing(s.pending.missing, item.ID.Client, s.NextClock(item.ID.Client))
+			mergePendingMissing(parkedMissing(txn), item.ID.Client, s.NextClock(item.ID.Client))
 		}
 	}
 	return nil

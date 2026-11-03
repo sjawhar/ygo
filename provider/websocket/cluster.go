@@ -724,12 +724,18 @@ func (s *Server) teardownRelayRoom(r *room, name string) {
 	// doc explains why a name-only lookup here would be unsafe across the
 	// evict-then-reconnect window.
 	s.stopRelayLane(name, relayLane)
-	s.relay.RoomDeactivated(name)
+	// Skipped once Shutdown has begun: Shutdown joins the connections before it
+	// cancels the relay context, which a relay call may wait on (cluster/redis's
+	// can, while it redials). getOrCreateRoom skips RoomActivated the same way.
+	if !s.shuttingDown() {
+		s.relay.RoomDeactivated(name)
+	}
 }
 
 // Inject applies a relay-delivered change with the sentinel origin so it is not
-// re-published, and fans it out to local peers itself; a sync update that fails
-// partway fans out only what it left in the room (crdt.ApplyUpdateV1Landed).
+// re-published, and fans it out to local peers itself, unless the room already
+// held all of a sync update; a sync update that fails partway fans out only
+// what it left in the room (crdt.ApplyUpdateV1Held).
 //
 // Inject auto-creates the room if it is not yet resident, so a node that has no
 // local peers for a room still materialises the converged state (matching how a
@@ -761,8 +767,8 @@ func (s *Server) Inject(ctx context.Context, in cluster.Inbound) error {
 		rm.clearIdle() // #183: relay activity mutates immediately; no registration delay.
 		// see markIdleIfEmpty
 		defer s.markIdleIfEmpty(rm)
-		landed, err := crdt.ApplyUpdateV1Landed(rm.doc, in.Data, s.relaySentinel)
-		if err != nil {
+		landed, held, err := crdt.ApplyUpdateV1Held(rm.doc, in.Data, s.relaySentinel)
+		if err != nil || held {
 			// The room and its observers already hold landed, so local peers need it too.
 			if landed != nil {
 				if berr := s.broadcastUpdate(ctx, in.Room, landed, false); berr != nil {
