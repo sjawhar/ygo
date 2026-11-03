@@ -1,11 +1,12 @@
 # Malformed V2 updates that now reach the apply at caps 1-30
 
-These 2,760 V2 updates are the ones whose result at a small cap changes when #334's skip uses the V2 rest cursor (`pendingBudget.deleteSetLimit`, #334 commit `09d5fa53`). Before that skip, `checkParkedDeletes` walked to the delete set and refused each of them before any change. Now the walk does not run, and the update fails during the apply. At a cap of 1<<20, where the walk never ran, the result was already the same as now.
+The 2,760 `s` V2 updates are the ones whose result at a small cap changes when #334's skip uses the V2 rest cursor (`pendingBudget.deleteSetLimit`, #334 commit `09d5fa53`). Before that skip, `checkParkedDeletes` walked to the delete set and refused each of them before any change. Now the walk does not run, and the update fails during the apply. At a cap of 1<<20, where the walk never ran, the result was already the same as now. The 24 `ovf-` updates were added later; see "Running clocks past 2^64".
 
 ## Files
 
 - `s<seed>-u<index>-cap<caps>.v2`: one update, as raw V2 bytes. `<seed>` is the generator seed (1, 2 or 3). `<index>` is the 0-based line of the update in that seed's output. `<caps>` lists the caps at which its result changed.
-- `cases.tsv`: one row per case, giving the file, the cap (`WithMaxPendingItems`, set with `SetMaxPendingItems` after the preload) and the preload. The preload is the number of delete ranges parked beforehand: 0, or 2 ranges on clients 500 and 501 at clock 0. There are 5,147 cases.
+- `ovf-<kind>-<width>-<n>.v2`: one update whose running clock passes 2^64 (see "Running clocks past 2^64" below).
+- `cases.tsv`: one row per case, giving the file, the cap (`WithMaxPendingItems`, set with `SetMaxPendingItems` after the preload) and the preload. The preload is the number of delete ranges parked beforehand: 0, or 2 ranges on clients 500 and 501 at clock 0. There are 5,195 cases: 5,147 from the `s` files and 48 from the `ovf-` files.
 
 ## How the set was made
 
@@ -36,11 +37,32 @@ These 2,760 V2 updates are the ones whose result at a small cap changes when #33
    - nothing, when nothing landed.
 2. A peer with the same state applies the relay.
 
-The test then requires `EncodeStateAsUpdateV1` to be byte-equal on room and peer, and `PendingStats` to be equal. As a control, it runs every case again at cap 1<<20 and counts the divergences there.
+The test then requires `EncodeStateAsUpdateV1` to be byte-equal on room and peer, and `PendingStats` to be equal. As a control, it runs every case again at cap 1<<20 and counts the divergences there. It also requires the apply to refuse each `ovf-` case with `ErrInvalidUpdate`.
 
 ```sh
 go test ./crdt -run TestMalformedV2_RelayedLandedBytesConvergeThePeer -v
 ```
+
+## Running clocks past 2^64
+
+A V2 delete set gives each range's clock as a diff from the end of the range before, and a group's skips add their lengths to the group's clock. Both are running sums. `ReadVarUint` refuses a value over 56 bits, so one value cannot take a clock past 2^64, but a sum of many values can wrap it onto a low clock. The `s` files never reach this: their largest update is 491 bytes, and a wrap needs at least 2,048 bytes of 8-byte varuints (128 delete ranges at up to 2^57 each, or 256 skips at up to 2^56).
+
+The 24 `ovf-` updates, each with preload 0 and 2, are four kinds. Their cap is 1,048,576, so that the pending cap, which refuses a delete set of thousands of parked ranges at a small cap, does not refuse them before the clock bound can:
+
+- `ds`: a delete set whose running clock reaches 2^64 and then names a clock below 5.
+- `dsvalid`: the same after a range at clock 0.
+- `structds`: client 30's "q" on root text "t", then such a delete set for client 30.
+- `skips`: a group whose skips bring its clock back to where it started, then "Z" on root text "t".
+
+`<width>` is `safe` for steps of at most 2^53-1, which Yjs reads exactly (about 2,700 per update), or `wide` for steps of at most 2^56-1, the most `ReadVarUint` reads (about 340).
+
+The generator is `TestZZGenOverflowCorpus`, its source under "Overflow generator source" below. It needs only `newV2Encoder`, so it runs in package `crdt` on this branch, and the same seed gives the same bytes:
+
+```sh
+ZZ_OVF_DIR=<dir> go test ./crdt -run TestZZGenOverflowCorpus -count=1
+```
+
+In a probe on upstream main `510c2cf5`, a delete set of 2,049 ranges that wraps back to clock 1 deletes that clock in a document that holds it, and skips that bring a client back to clock 6 make "Z" integrate there. Yjs 13.6.32 refuses the first and parks "Z". A tree with the 2^53-1 clock bound refuses all 24 `ovf-` updates.
 
 ## Generator source
 
@@ -88,3 +110,114 @@ func TestZZGenReviewCorpus(t *testing.T) {
 	}
 }
 ```
+
+## Overflow generator source
+
+```go
+func TestZZGenOverflowCorpus(t *testing.T) {
+	dir := os.Getenv("ZZ_OVF_DIR")
+	if dir == "" {
+		t.Skip()
+	}
+	rng := rand.New(rand.NewPCG(1081, 64))
+	// steps is values of at most most that sum to exactly 2^64.
+	steps := func(most uint64) []uint64 {
+		first := most/2 + rng.Uint64N(most/2+1)
+		out, left := []uint64{first}, -first // left is 2^64 minus the sum
+		for left > most {
+			s := most/2 + rng.Uint64N(most/2+1)
+			out, left = append(out, s), left-s
+		}
+		return append(out, left)
+	}
+	// ds writes one client's delete set whose running clock reaches 2^64, then
+	// a range on a low clock; valid puts a range at clock 0 first.
+	ds := func(e *v2Encoder, client, most uint64, valid bool) {
+		var words []uint64
+		if valid {
+			words = append(words, 0, 0)
+		}
+		for _, s := range steps(most) {
+			l := 1 + rng.Uint64N(min(s, 16))
+			words = append(words, s-l, l-1)
+		}
+		words = append(words, rng.Uint64N(4), rng.Uint64N(3))
+		e.restEnc.WriteVarUint(1)
+		e.restEnc.WriteVarUint(client)
+		e.restEnc.WriteVarUint(uint64(len(words) / 2))
+		for _, w := range words {
+			e.restEnc.WriteVarUint(w)
+		}
+	}
+	str := func(e *v2Encoder, s string) {
+		e.writeInfo(4)
+		e.writeParentInfo(true)
+		e.writeString("t")
+		e.writeString(s)
+	}
+	kinds := []struct {
+		name  string
+		build func(most uint64) []byte
+	}{
+		{"ds", func(most uint64) []byte { // a delete set alone
+			e := newV2Encoder()
+			e.restEnc.WriteVarUint(0)
+			ds(e, 1+rng.Uint64N(8), most, false)
+			return e.toBytes()
+		}},
+		{"dsvalid", func(most uint64) []byte { // after a range that applies
+			e := newV2Encoder()
+			e.restEnc.WriteVarUint(0)
+			ds(e, 1+rng.Uint64N(8), most, true)
+			return e.toBytes()
+		}},
+		{"structds", func(most uint64) []byte { // client 30's "q", then its delete set
+			e := newV2Encoder()
+			e.restEnc.WriteVarUint(1)
+			e.restEnc.WriteVarUint(1)
+			e.writeClient(30)
+			e.restEnc.WriteVarUint(0)
+			str(e, "q")
+			ds(e, 30, most, false)
+			return e.toBytes()
+		}},
+		{"skips", func(most uint64) []byte { // skips back to the group's clock, then "Z"
+			sk := steps(most)
+			e := newV2Encoder()
+			e.restEnc.WriteVarUint(1)
+			e.restEnc.WriteVarUint(uint64(len(sk) + 1))
+			e.writeClient(ClientID(1 + rng.Uint64N(8)))
+			e.restEnc.WriteVarUint(rng.Uint64N(4))
+			for _, s := range sk {
+				e.writeInfo(10)
+				e.restEnc.WriteVarUint(s)
+			}
+			str(e, "Z")
+			e.restEnc.WriteVarUint(0)
+			return e.toBytes()
+		}},
+	}
+	var rows []string
+	for _, most := range []struct {
+		name  string
+		value uint64
+	}{{"safe", 1<<53 - 1}, {"wide", 1<<56 - 1}} { // the most Yjs reads exactly; the most ygo reads
+		for i := range 3 {
+			for _, k := range kinds {
+				name := fmt.Sprintf("ovf-%s-%s-%d.v2", k.name, most.name, i)
+				if err := os.WriteFile(filepath.Join(dir, name), k.build(most.value), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				for _, preload := range []int{0, 2} {
+					rows = append(rows, fmt.Sprintf("%s\t1048576\t%d", name, preload))
+				}
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ovf-cases.tsv"), []byte(strings.Join(rows, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+```
+
+The generator also writes `ovf-cases.tsv`, the 48 rows appended to `cases.tsv`.

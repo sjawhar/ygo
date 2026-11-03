@@ -3,6 +3,7 @@ package crdt
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,7 +91,8 @@ const parkedNotRelayed = "the room parked items the relay does not carry"
 // cap, where before the delete-set walk refused it first. A peer that applies
 // what the room relays must end equal to the room: EncodeStateAsUpdateV1
 // byte-equal and PendingStats equal. The same update at a cap of 1<<20, where
-// the walk never ran, is the control.
+// the walk never ran, is the control. The ovf- updates carry a running clock
+// past 2^64, so the apply must also refuse each of them.
 func TestMalformedV2_RelayedLandedBytesConvergeThePeer(t *testing.T) {
 	dir := filepath.Join("testdata", "malformed_v2")
 	f, err := os.Open(filepath.Join(dir, "cases.tsv"))
@@ -99,7 +101,7 @@ func TestMalformedV2_RelayedLandedBytesConvergeThePeer(t *testing.T) {
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
-	var cases, failedLanded, failedNothing, applied, diverged, controlDiverged int
+	var cases, failedLanded, failedNothing, applied, diverged, controlDiverged, overflow int
 	kinds := map[string]int{}
 	shown := 0
 	for sc.Scan() {
@@ -124,6 +126,12 @@ func TestMalformedV2_RelayedLandedBytesConvergeThePeer(t *testing.T) {
 			failedLanded++
 		default:
 			failedNothing++
+		}
+		if strings.HasPrefix(name, "ovf-") {
+			overflow++
+			if !errors.Is(applyErr, ErrInvalidUpdate) {
+				t.Errorf("%s cap %d preload %d: apply err %v, want ErrInvalidUpdate for a clock past 2^64", name, limit, preload, applyErr)
+			}
 		}
 		if why != "" {
 			diverged++
@@ -150,7 +158,7 @@ func TestMalformedV2_RelayedLandedBytesConvergeThePeer(t *testing.T) {
 	if cases == 0 {
 		t.Fatal("no cases read")
 	}
-	t.Logf("%d cases: %d failed with landed bytes, %d failed with nothing landed, %d applied", cases, failedLanded, failedNothing, applied)
+	t.Logf("%d cases (%d with a clock past 2^64): %d failed with landed bytes, %d failed with nothing landed, %d applied", cases, overflow, failedLanded, failedNothing, applied)
 	t.Logf("diverged at the case's cap: %d %v; at cap 1<<20 (control): %d", diverged, kinds, controlDiverged)
 	if diverged > 0 {
 		t.Errorf("%d of %d cases leave the peer unequal to the room", diverged, cases)
