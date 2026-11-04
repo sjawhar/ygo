@@ -364,10 +364,8 @@ func (c *docCloner) copyStruct(it, cp *Item, integrated bool) {
 	}
 }
 
-// copyContent returns content's copy for the clone. Content.Copy is the copy
-// every other content needs, but its ContentType and ContentDoc copies are
-// made for a re-insert, which must not alias the original's children: a clone
-// wants the children, copied, and the empty subdocument shell an apply builds.
+// copyContent preserves a nested type's copied children instead of the empty
+// type Content.Copy creates for a re-insert; other content uses its own copy.
 func (c *docCloner) copyContent(content Content) Content {
 	switch ct := content.(type) {
 	case *ContentType:
@@ -375,16 +373,6 @@ func (c *docCloner) copyContent(content Content) Content {
 			return &ContentType{}
 		}
 		return &ContentType{Type: c.typeFor(ct.Type)}
-	case *ContentDoc:
-		if ct.Doc == nil {
-			return &ContentDoc{}
-		}
-		copied := New(
-			WithGUID(ct.Doc.guid), WithGC(ct.Doc.gc), WithAutoLoad(ct.Doc.autoLoad),
-			WithShouldLoad(ct.Doc.autoLoad),
-		)
-		copied.meta = ct.Doc.meta
-		return &ContentDoc{Doc: copied}
 	default:
 		return content.Copy()
 	}
