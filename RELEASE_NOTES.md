@@ -3,9 +3,9 @@
 A fork release of `github.com/reearth/ygo`, built on upstream v1.55.0
 (1b3afe00) through upstream main 510c2cf5, which adds only a change to
 `mobile/go.mod`. It replaces the v1.54.1-sami.N line, which was built on
-upstream v1.54.0. Every change it carries is bound for upstream: thirteen open
-upstream pull requests, and the per-apply scan budget, whose pull request is
-not opened yet.
+upstream v1.54.0. Its changes are bound for upstream: thirteen open upstream
+pull requests, the per-apply scan budget, and the published `Doc.Clone` API.
+The scan budget and clone do not yet have upstream pull requests.
 
 **This release has one breaking change:** a document takes a new client ID
 when a non-local transaction advances its own client's clock (#340). See
@@ -27,6 +27,7 @@ when a non-local transaction advances its own client's clock (#340). See
 | Awareness updates reach their sender; a read-only peer gets a fixed empty reply | reearth/ygo#338 | f01266b8, merged in 6e339d00 |
 | `Server.OnTokenAuthContext`: `OnTokenAuth` with the connection's context | reearth/ygo#351 | bd682f95 |
 | `WithFormatCleanup` and `Doc.SetFormatCleanup` | reearth/ygo#369 | 980a4a88 |
+| `Doc.Clone(opts...)` copies a document without encoding or decoding it, retained from v1.54.1-sami.4 | upstream-pending | f1e2ebea, adapted to this release's pending queue and move heaps |
 
 The release also carries the malformed V2 corpus and its relay convergence
 test (`crdt/testdata/malformed_v2`, `crdt/malformed_v2_relay_test.go`), as
@@ -47,6 +48,16 @@ which made one-character deletes 52% slower in CPU time), the fix that merges
 the children of a type an earlier transaction deleted, which needs #363, and
 the comment-only heads the groups kept back.
 
+**Retained from v1.54.1-sami.4:** `Doc.Clone(opts...)`, its tests and benchmarks.
+The composition list was fixed on October 31; v1.54.1-sami.4 added the API on
+November 2, after that list was fixed. Rebuilding only the listed members
+missed that later published delta. The release comparison must include the
+latest published fork tag, not just the baseline named in the plan. The four
+large-update benchmarks from v1.54.1-sami.3 are retained too.
+Its options follow this release's apply semantics: a client ID already in
+the copied state is replaced, and subdocuments inherit the clone's
+collection ID; their metadata is kept.
+
 **Upstream changes this release brings to a v1.54.1-sami.3 user.** Upstream
 v1.55.0 adds:
 
@@ -59,11 +70,17 @@ v1.55.0 adds:
 
 ### What Dispatch gains against v1.54.1-sami.3
 
-- **A refused update changes nothing, on every copy.** An update over the
-  pending cap, cut short, with a struct that does not decode, a type ref above
-  6, a zero-length struct, a clock past 2^53-1 or a client past 2^55-1 is
-  refused before it changes the room; a partly applied relayed update reaches
-  the node's peers with what the room kept and parked (#340).
+- **Pre-integration refusals change nothing.** Updates over the pending cap,
+  undecodable structs, type refs above 6, zero-length structs, and out-of-bound
+  struct clocks or clients are refused before integration (#340). A cut in
+  the delete set can fail after structs and earlier deletions have landed.
+  A document with a scan bound rolls a failed remote apply back; an unbounded
+  document can keep that partial change. Consumers must not infer rollback
+  from an arbitrary apply error: relay or persist the landed and parked bytes
+  returned by the corresponding apply API.
+  `TestUnit_UpdateLog_TruncatedDeleteSetKeepsAnUnboundedPartialApply` applies
+  the same cut to both: the unbounded room keeps "hello", 15 landed bytes
+  and one log entry; the bounded room keeps no text, bytes or log entry.
 - **Smaller, Yjs-shaped updates.** `OnUpdate` fires only for a transaction
   that adds or deletes something, carries only that transaction's deletions,
   sorted and merged, and is encoded after the transaction's GC, so content one
@@ -85,10 +102,15 @@ v1.55.0 adds:
   collected nested type become GC structs, an item next to a GC struct is one,
   a Yjs `YXmlHook` survives a round trip, and undo and redo restore what Yjs
   restores without copying the stacks (#347, #359).
-- **The update log is lossless across a bounded room's taken-back drain.** A
-  logged entry's `Update` holds exactly what the room integrated and `Parked`
-  exactly what it did not, so the two hold every byte the client sent, and a
-  room rebuilt from the log holds everything the live room held.
+- **The update log preserves a bounded room's taken-back drain.** A logged
+  entry's `Update` carries the committed change and `Parked` carries the
+  transaction's parked structs and deletions. They are not disjoint: a
+  deletion parked and drained in the same apply can occur in both; replay is
+  idempotent. Rebuild from the base and each entry's `Update`, then `Parked`,
+  including entries that only parked; see the bounded-replica caveat below.
+  `TestUnit_UpdateLog_AParkedThenDrainedDeletionIsInBothPayloads` observes
+  deletion 2@0+1 in both payloads and rebuilds the room's text "a" after
+  applying both.
 
 ### What each consumer must change
 
@@ -292,6 +314,20 @@ refuses one longer than 2^31-1, so a room that applies such a V1 update holds
 a state whose V2 encoding its own decoder refuses. Yjs 13.6.32 reads it. It is
 upstream's behaviour and one peer update reaches it; Dispatch stores room
 state in V1 only.
+
+### Dispatch verification
+
+At Legion main 6f743e05 with a local candidate replacement, build and vet
+passed, `pmdoc` passed, and `docs` and `api` had 39 and 1 failing tests.
+The same 40 tests passed against v1.54.1-sami.3; this was a targeted baseline,
+not a full rerun at that Legion commit. The last full baseline at da8cb799
+had no failures. The pin pull request must verify its consumer migrations
+against the published tag rather than treat this candidate run as a pass.
+
+The identified migrations cover room closure, no-change updates, and parked
+log entries. Format cleanup is a likely cause of one failure, not a traced
+cause; render reuse was not root-caused. Two failures are not explained by
+those migrations: a publishing control and an unapplied margin deletion.
 
 ### Collisions the composition repairs
 

@@ -10,13 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Fork release on upstream 1.55.0 (1b3afe00), composed on upstream main
 510c2cf5, which adds only a change to mobile/go.mod. It replaces the
 1.54.1-sami.N line, which was built on upstream 1.54.0. Every change it
-carries is one of the open upstream pull requests named below, or the
-per-apply scan budget, whose pull request is not yet opened. RELEASE_NOTES.md
-lists the members, what each consumer must change, and the four repairs
-that make two members work together.
+carries is one of the open upstream pull requests named below, the per-apply
+scan budget, or `Doc.Clone` retained from 1.54.1-sami.4. The latter two await
+upstream pull requests. RELEASE_NOTES.md lists the members, what each
+consumer must change, and the repairs that make members work together.
 
 ### Added
 
+- **`crdt`: `Doc.Clone(opts...)` is retained from 1.54.1-sami.4.** It copies
+  document structures without encoding or decoding, with independent mutable
+  state and the options supplied by the caller. Its tests and benchmarks, and
+  the four large-update benchmarks from 1.54.1-sami.3, are retained.
 - **`crdt`: `Doc.SetMaxPendingItems(n)`** sets the pending cap after
   construction, so stored state over a cap can load first. (reearth/ygo#340)
 - **`provider/websocket`: `Server.PeerWriteQueueBytes` bounds the bytes

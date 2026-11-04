@@ -60,7 +60,7 @@ jobs:
       - name: Verify the CHANGELOG entry for this tag
         run: |
           version="${GITHUB_REF_NAME#v}"
-          top=$(grep -m1 -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | tr -d '#[] ')
+          top=$(grep -m1 -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?\]' CHANGELOG.md | tr -d '#[] ')
           if [ "$top" != "$version" ]; then
             echo "::error file=CHANGELOG.md::Newest version heading is [$top] but the tag is $GITHUB_REF_NAME. CHANGELOG.md is newest-first, so add a \"## [$version]\" section at the top before tagging."
             exit 1

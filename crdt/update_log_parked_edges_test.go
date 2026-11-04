@@ -89,3 +89,57 @@ func TestUnit_UpdateLog_AParkedStructWithAGCOriginKeepsItsOrigins(t *testing.T) 
 		requireSameRoom(t, room, replica, "after 3:0 arrives")
 	})
 }
+
+func TestUnit_UpdateLog_TruncatedDeleteSetKeepsAnUnboundedPartialApply(t *testing.T) {
+	src := New(WithClientID(2))
+	text := src.GetText("t")
+	src.Transact(func(txn *Transaction) { text.Insert(txn, 0, "hello", nil) })
+	whole := EncodeStateAsUpdateV1(src, nil)
+	cut := append(append([]byte(nil), whole[:len(whole)-1]...), 1, 42)
+	for _, bounded := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unbounded", true: "bounded"}[bounded], func(t *testing.T) {
+			opts := []DocOption{WithClientID(1)}
+			if bounded {
+				opts = append(opts, WithMaxIntegrateScan(100))
+			}
+			room := New(opts...)
+			log := room.OpenUpdateLog()
+			landed, err := ApplyUpdateV1Landed(room, cut, nil)
+			require.Error(t, err)
+			_, entries := log.Drain()
+			if bounded {
+				require.Empty(t, room.GetText("t").ToString())
+				require.Empty(t, landed)
+				require.Empty(t, entries)
+			} else {
+				require.Equal(t, "hello", room.GetText("t").ToString())
+				require.NotEmpty(t, landed)
+				require.Len(t, entries, 1)
+			}
+			t.Logf("bounded=%v text=%q landed=%d log_entries=%d error=%v", bounded, room.GetText("t").ToString(), len(landed), len(entries), err)
+		})
+	}
+}
+
+func TestUnit_UpdateLog_AParkedThenDrainedDeletionIsInBothPayloads(t *testing.T) {
+	room := New(WithClientID(1))
+	parked := &Item{ID: ID{Client: 2}, Origin: &ID{Client: 3}, Content: NewContentString("b")}
+	require.NoError(t, ApplyUpdateV1(room, craftedUpdate(parked), nil))
+	log := room.OpenUpdateLog()
+	src := New(WithClientID(3))
+	src.Transact(func(txn *Transaction) { txn.GetText("t").Insert(txn, 0, "a", nil) })
+	input, err := MergeUpdatesV1(EncodeStateAsUpdateV1(src, nil), deleteSetUpdate(map[ClientID][]DeleteRange{2: {{Clock: 0, Len: 1}}}))
+	require.NoError(t, err)
+	require.NoError(t, ApplyUpdateV1(room, input, nil))
+	base, entries := log.Drain()
+	require.Len(t, entries, 1)
+	for _, payload := range [][]byte{entries[0].Update, entries[0].Parked} {
+		ids, err := ContentIDsFromUpdateV1(payload)
+		require.NoError(t, err)
+		require.Equal(t, []IDRange{{Clock: 0, Len: 1}}, ids.Deletes.Ranges(2))
+	}
+	rebuilt := replay(t, base, entries)
+	requireSameRoom(t, room, rebuilt)
+	require.Equal(t, "a", room.GetText("t").ToString())
+	t.Logf("deletion 2@0+1 appears in Update and Parked; replay text=%q", rebuilt.GetText("t").ToString())
+}

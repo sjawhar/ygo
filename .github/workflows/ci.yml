@@ -196,8 +196,8 @@ jobs:
       # two reads is wrong and the mistake only surfaces at tag time.
       - name: CHANGELOG and RELEASE_NOTES agree on the newest version
         run: |
-          chg=$(grep -m1 -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | tr -d '#[] ')
-          rel=$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' RELEASE_NOTES.md | sed 's/^## v//')
+          chg=$(grep -m1 -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?\]' CHANGELOG.md | tr -d '#[] ')
+          rel=$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' RELEASE_NOTES.md | sed 's/^## v//')
           if [ "$chg" != "$rel" ]; then
             echo "::error::CHANGELOG.md leads with [$chg] but RELEASE_NOTES.md leads with v$rel. Both files are newest-first and the release job reads both, so they must name the same version."
             exit 1
