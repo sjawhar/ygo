@@ -96,6 +96,7 @@ type applyJournal struct {
 	// (pendingUpdate.noteTail) as the apply found it; a park moves it in place.
 	pendingTail      uint64
 	pendingTailValid bool
+	pendingReady     bool
 	pendingDs        parkedDeletesAt
 	pendingMoves     pendingMovesAt
 	// drain is the point the drain began at, once it has; at is the point a
@@ -165,6 +166,7 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 		j.pendingItems = s.pending.items
 		j.pendingDead = s.pending.dead
 		j.missing = s.pending.missing
+		j.pendingReady = s.pending.ready
 		j.pendingTail, j.pendingTailValid = s.pending.tail, s.pending.tailValid
 	}
 	j.pendingDs = parkedDeletesOf(s)
@@ -506,6 +508,7 @@ func (j *applyJournal) rollBack(txn *Transaction) {
 			*item = as
 		}
 		j.pending.missing = j.missing
+		j.pending.ready = j.pendingReady
 		// The apply's parks added their clocks to the queue's cover in place
 		// (addCover), and it holds none of them now.
 		j.pending.cover = nil

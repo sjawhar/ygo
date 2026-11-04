@@ -338,7 +338,7 @@ func (c *docCloner) copyPending() {
 	for client, clock := range sp.missing {
 		missing[client] = clock
 	}
-	c.dst.store.pending = &pendingUpdate{items: items, dead: sp.dead, missing: missing}
+	c.dst.store.pending = &pendingUpdate{items: items, dead: sp.dead, missing: missing, ready: sp.ready}
 	c.parked, c.parkedSrc = items, sp.items
 }
 
