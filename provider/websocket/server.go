@@ -1102,13 +1102,26 @@ type Server struct {
 	// CRDT's pending-structs machinery. Matches yrs-warp's bounded-broadcast
 	// pattern.
 	//
-	// Zero (the default) uses 512, sized for typical sync workloads.
+	// It must hold the frames of one answer to a SyncStep1, which carry the
+	// room's state in frames of up to 64 KiB and end with a SyncStep2 (see
+	// stateFrameBytes in peer.go); a peer whose answer does not fit is closed
+	// as a slow peer is.
+	//
+	// Zero (the default) uses 512, sized for typical sync workloads. How much
+	// state 512 frames hold depends on the structs it is made of. Measured
+	// with nothing else queued, they held the answer for a state of up to
+	// 33,470,582 bytes of one client's text (33,339,582 with the two
+	// handshake frames still queued), but for only 511 map values of 32,800
+	// characters (16,768,471 bytes): a map value is a struct of one clock,
+	// which cannot be cut, and two of these do not fit in one frame. A struct
+	// that cannot be cut and is longer than 64 KiB goes out in one frame of
+	// its own size, so 512 such frames hold more than 32 MiB. No single state
+	// size covers every room.
 	PeerWriteQueueSize int
 
 	// PeerWriteQueueBytes bounds the bytes queued for one peer beyond its
 	// handshake, closing the peer when reached, because PeerWriteQueueSize
-	// alone lets one peer pin many full-state frames; zero or negative
-	// disables it.
+	// alone bounds frames, not bytes; zero or negative disables it.
 	PeerWriteQueueBytes int64
 
 	// SlowPeerPolicy selects the reaction when a peer's broadcast write queue

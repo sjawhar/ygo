@@ -93,15 +93,16 @@ func (p *peer) handleMessage(data []byte) {
 			p.applySyncUpdate(subType, update, payload)
 			return
 		}
-		// Peer sent step-1 — send step-2 reply only to them. Read-only peers
-		// may still request state (#59).
-		reply, err := ygsync.ApplySyncMessage(p.room.doc, payload, p)
+		// Peer sent step-1 — send the room's state only to them, cut into the
+		// frames stateFrameBytes allows so that the receiver applies it one
+		// frame per task. Read-only peers may still request state (#59).
+		reply, err := ygsync.EncodeSyncStep2Split(p.room.doc, payload, p.stateMessageBytes())
 		if err != nil {
 			p.server.log().Debug("discarded unappliable sync message",
 				"room", p.roomName, "err", err)
 			return
 		}
-		p.sendSync(reply)
+		p.sendSyncSeries(reply)
 
 	case msgAwareness:
 		if p.readOnly {
@@ -811,9 +812,40 @@ func awarenessFrame(awMsg []byte) []byte {
 	})
 }
 
-// sendSync writes a sync message (outer type 0, raw payload) to this peer.
-func (p *peer) sendSync(syncMsg []byte) {
-	p.write(syncFrame(syncMsg))
+// stateFrameBytes caps each frame the room's state is sent in, so that a
+// receiver applies the state one frame per task. A browser applies one Yjs
+// update in one main-thread task: a 1.22 MB state, a 406,319-character text
+// one client wrote, took 355 ms as one update replayed through yjs 13.6.32 in
+// Chromium with the CPU throttled 4x, the median of 9 runs after 2 warm-ups.
+// A frame passes the cap when it carries a single struct that a V1 update
+// cannot cut and that is longer than the cap, and when it is the SyncStep2
+// and the room holds parked structs (see ygsync.EncodeSyncStep2Split).
+const stateFrameBytes = 64 << 10
+
+// stateMessageBytes is how long a sync message may be for its frame to stay
+// within stateFrameBytes: the frame adds the outer message type, and the
+// document name on a connection using Hocuspocus framing (see writeToConn).
+func (p *peer) stateMessageBytes() int {
+	frame := syncFrame(nil)
+	if p.hocuspocusFraming {
+		frame = encoding.EncodeBytes(func(enc *encoding.Encoder) {
+			enc.WriteVarString(p.roomName)
+			enc.WriteRaw(frame)
+		})
+	}
+	return stateFrameBytes - len(frame)
+}
+
+// sendSyncSeries writes sync messages to this peer as one run of frames,
+// queued in the order given and with nothing between them, so a client that
+// reads the run's last message as the end of its sync has received every
+// message before it, and no answer to a frame it sends next arrives first.
+func (p *peer) sendSyncSeries(msgs [][]byte) {
+	frames := make([][]byte, len(msgs))
+	for i, msg := range msgs {
+		frames[i] = syncFrame(msg)
+	}
+	p.writeSeries(frames...)
 }
 
 // sendAwareness writes an awareness message (outer type 1, VarBytes payload)

@@ -76,6 +76,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write continued that clock, past 2^53-1 if the GC struct reached it; this
   release's clock bound refuses that state.
 
+- **`provider/websocket`: a peer's SyncStep1 is answered in frames it applies
+  one at a time.** The room's state goes out as Update frames of at most
+  64 KiB, each of which integrates on its own, followed by one SyncStep2
+  carrying only what no Update could. A receiver applies one frame in one
+  task. Before, it applied the whole state as one SyncStep2 in one task: for
+  a 1.22 MB state, a 406,319-character text one client wrote, replayed
+  through yjs 13.6.32 in Chromium with the CPU throttled 4x, that task took
+  355 ms, the median of 9 runs after 2 warm-ups. The frames of one answer are
+  queued together, in order, so nothing queued later - a SyncStatus among
+  it - reaches the peer before that SyncStep2, and the answer is charged to
+  `Server.PeerWriteQueueBytes` on the one decision the single frame it
+  replaces got. The peer's write queue (`Server.PeerWriteQueueSize`) must
+  hold every frame of the answer, or the peer is closed. With nothing else
+  queued, the 512-frame default held a state of up to 33,470,582 bytes of one
+  client's text, but only 511 map values of 32,800 characters
+  (16,768,471 bytes), one to a frame: a map value cannot be cut, and two of
+  these do not fit in one. A struct that cannot be cut and is longer than
+  64 KiB goes out in one frame of its own size, so no single state size
+  covers every room. The connect handshake still carries no state, and the
+  slow-peer resync (`SlowPeerResync`) still sends one full-state SyncStep2.
+
 ### Fixed
 
 - **`crdt`: logical span lengths and offsets do not depend on the build's

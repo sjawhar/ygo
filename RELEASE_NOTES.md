@@ -156,9 +156,9 @@ changes.
 - **`Server.PeerWriteQueueBytes` bounds the bytes waiting for a peer.** A
   peer's write queue is bounded in frames (`PeerWriteQueueSize`, 512 by
   default), not in bytes, and the server answers each SyncStep1 with the
-  room's full state on the sender's own queue. A peer that never reads could
-  make the server keep 512 copies of the document. Set a budget above the
-  largest room state:
+  room's full state on the sender's own queue. In 1.55.0, which sent that
+  answer as one frame, a peer that never read could make the server keep 512
+  copies of the document. Set a budget above the largest room state:
 
   ```go
   srv := ygws.NewServer()
@@ -246,6 +246,35 @@ changes.
   treats a non-nil `CloseRoom` error as fatal should retry on `ErrRoomInUse`,
   and a caller that closed a room from inside its own `Apply` switches that
   call to `CloseRoomWithin`, passing the callback's `doc`.
+
+**Who is affected: every `provider/websocket` server whose rooms hold large
+documents.** No wire format changes: every frame is an ordinary y-protocols
+sync message, and no caller has to change anything.
+
+A client joining a large room was sent the room's whole state as one
+SyncStep2. A browser applies one Yjs update in one main-thread task: for a
+1.22 MB state, a 406,319-character text one client wrote, replayed through
+yjs 13.6.32 in Chromium with the CPU throttled 4x, that task took 355 ms, the
+median of 9 runs after 2 warm-ups. The answer to a SyncStep1 is now the same
+state in frames of at most 64 KiB: Update messages, and then one SyncStep2,
+last. Each Update integrates on its own, so the receiver applies the state
+one frame per task; the cut is made over the update's structs, so a struct
+is never cut in half or sent before what it names, and a text item longer
+than a frame is cut at a character boundary. Deletions ride in the frame that
+carries the structs they name. The frames of one answer are queued together,
+in order, so a client that marks a document synced at its first SyncStep2 -
+`@hocuspocus/provider` does - sees it only once every Update is in. The
+answer is charged to `Server.PeerWriteQueueBytes` as the single frame it
+replaces was, and the peer's write queue (`Server.PeerWriteQueueSize`) must
+hold every frame of it, or the peer is closed. With nothing else queued, the
+512-frame default held a state of up to 33,470,582 bytes of one client's
+text, but only 511 map values of 32,800 characters (16,768,471 bytes), one
+to a frame: a map value cannot be cut, and two of these do not fit in one. A
+struct that cannot be cut and is longer than 64 KiB goes out in one frame of
+its own size, so no single state size covers every room. `crdt.SplitUpdateV1`
+is the cut itself, for a caller with its own transport, and
+`sync.EncodeSyncStep2Split` is the answer as sync messages;
+`sync.EncodeSyncStep2` is unchanged.
 
 ## v1.55.0
 

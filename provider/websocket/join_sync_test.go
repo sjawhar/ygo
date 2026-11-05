@@ -39,17 +39,24 @@ func joinFrame(hocuspocus bool, room string, tag uint64, body []byte) []byte {
 	})
 }
 
+// syncFrameSeen is one sync frame a client read, by sub-type and by the bytes
+// the whole frame took on the socket.
+type syncFrameSeen struct {
+	sub   int
+	bytes int
+}
+
 // joinedSteps sends a Ping (preceded by the joiner's SyncStep1 when
 // sendStep1 is set) and reads up to the Pong, applying every sync frame to
-// joiner. It returns the full frame of every SyncStep2 on the way.
-func joinedSteps(t testing.TB, conn *gws.Conn, hocuspocus bool, room string, joiner *crdt.Doc, sendStep1 bool) [][]byte {
+// joiner. It returns one entry per sync frame on the way, in order.
+func joinedSteps(t testing.TB, conn *gws.Conn, hocuspocus bool, room string, joiner *crdt.Doc, sendStep1 bool) []syncFrameSeen {
 	t.Helper()
 	if sendStep1 {
 		require.NoError(t, conn.WriteMessage(gws.BinaryMessage,
 			joinFrame(hocuspocus, room, tagSync, ygsync.EncodeSyncStep1(joiner))))
 	}
 	require.NoError(t, conn.WriteMessage(gws.BinaryMessage, joinFrame(hocuspocus, room, tagPing, nil)))
-	var step2 [][]byte
+	var seen []syncFrameSeen
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		_, data, err := conn.ReadMessage()
@@ -63,23 +70,36 @@ func joinedSteps(t testing.TB, conn *gws.Conn, hocuspocus bool, room string, joi
 		require.NoError(t, err)
 		switch tag {
 		case tagPong:
-			return step2
+			return seen
 		case tagSync:
 			body := dec.RemainingBytes()
 			sub, _, err := ygsync.ReadSyncMessage(body)
 			require.NoError(t, err)
-			if sub == ygsync.MsgSyncStep2 {
-				step2 = append(step2, data)
-			}
+			seen = append(seen, syncFrameSeen{sub: sub, bytes: len(data)})
 			_, err = ygsync.ApplySyncMessage(joiner, body, nil)
 			require.NoError(t, err)
 		}
 	}
 }
 
-// A joiner gets the room's state once, in the SyncStep2 that answers its
-// SyncStep1, as y-websocket's and Hocuspocus's servers send it; a peer that
-// sends no SyncStep1 gets no SyncStep2, as on those servers.
+// stateFrames returns the frames of seen that carry state: the Updates and
+// the SyncStep2 that answer a SyncStep1, leaving out the SyncStep1 the server
+// asks with on connect.
+func stateFrames(seen []syncFrameSeen) []syncFrameSeen {
+	out := make([]syncFrameSeen, 0, len(seen))
+	for _, f := range seen {
+		if f.sub != ygsync.MsgSyncStep1 {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// A joiner gets the room's state once, in the frames that answer its
+// SyncStep1: Updates, each within the frame cap, and then the one SyncStep2
+// that a client reads as the end of its sync, last. A peer that sends no
+// SyncStep1 is sent no state, as y-websocket's and Hocuspocus's servers send
+// none.
 func TestInteg_Join_SendsStateOnce(t *testing.T) {
 	text := strings.Repeat("x", 10000)
 	for _, hocuspocus := range []bool{false, true} {
@@ -95,20 +115,30 @@ func TestInteg_Join_SendsStateOnce(t *testing.T) {
 
 					joiner := crdt.New()
 					conn := dialReadOnly(t, ts, "room", readOnly)
-					step2 := joinedSteps(t, conn, hocuspocus, "room", joiner, true)
-					want := joinFrame(hocuspocus, "room", tagSync, wholeStep2(t, srv.GetDoc("room")))
-					sizes := make([]int, 0, len(step2))
-					for _, f := range step2 {
-						sizes = append(sizes, len(f))
+					answer := stateFrames(joinedSteps(t, conn, hocuspocus, "room", joiner, true))
+					require.NotEmpty(t, answer, "the joiner's SyncStep1 is answered")
+
+					last := answer[len(answer)-1]
+					assert.Equal(t, ygsync.MsgSyncStep2, last.sub, "the answer ends with a SyncStep2")
+					for i, f := range answer[:len(answer)-1] {
+						assert.Equal(t, ygsync.MsgUpdate, f.sub, "frame %d of the answer is an Update", i+1)
 					}
-					require.Equal(t, []int{len(want)}, sizes, "bytes of each SyncStep2 frame the joiner received")
-					assert.Equal(t, want, step2[0], "the one SyncStep2 carries the room's full state")
+					total := 0
+					for i, f := range answer {
+						assert.LessOrEqual(t, f.bytes, ygws.StateFrameBytes, "bytes of frame %d of the answer", i+1)
+						total += f.bytes
+					}
+					// The state crosses once: the answer costs the one
+					// SyncStep2 it replaces, plus a header per frame.
+					whole := len(joinFrame(hocuspocus, "room", tagSync, wholeStep2(t, srv.GetDoc("room"))))
+					assert.Less(t, total, whole+64*len(answer), "bytes of the whole answer")
 					assert.Equal(t, text, joiner.GetText("t").ToString())
+					assert.Equal(t, srv.GetDoc("room").StateVector(), joiner.StateVector())
 
 					silent := crdt.New()
 					quiet := dialReadOnly(t, ts, "room", readOnly)
-					assert.Empty(t, joinedSteps(t, quiet, hocuspocus, "room", silent, false),
-						"a peer that sends no SyncStep1 is sent no SyncStep2")
+					assert.Empty(t, stateFrames(joinedSteps(t, quiet, hocuspocus, "room", silent, false)),
+						"a peer that sends no SyncStep1 is sent no state")
 				})
 			}
 		})

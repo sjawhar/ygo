@@ -80,6 +80,16 @@ func MemoryPersistenceBackoffState(m *MemoryPersistence, room string) (failures 
 // WriteTimeout is the deadline writeToConn sets on each write.
 const WriteTimeout = writeTimeout
 
+// StateFrameBytes is the cap on each frame a peer's SyncStep1 is answered
+// with. Test-only: a test asserting the cap must assert against the one the
+// server uses, not a copy of the number.
+const StateFrameBytes = stateFrameBytes
+
+// DefaultPeerWriteQueueSize is the per-peer write queue's capacity when
+// PeerWriteQueueSize is unset. Test-only: the frames of one state answer have
+// to fit in it, and that is arithmetic on this number.
+const DefaultPeerWriteQueueSize = defaultPeerWriteQueueSize
+
 // PeerQueuedBytes reports the bytes charged to room's peers and its peer
 // count, or (0, 0) for a room the server does not hold.
 func PeerQueuedBytes(s *Server, room string) (bytes int64, peers int) {
