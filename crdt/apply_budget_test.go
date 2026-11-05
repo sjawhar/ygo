@@ -1588,3 +1588,201 @@ func writeAnyMap(enc *encoding.Encoder, n int) {
 		enc.WriteUint8(126)
 	}
 }
+
+// guardedHandoff is the whole state of a peer that holds guardedState and
+// then ran edit: an update naming every root the document holds, as a client
+// handing a document's whole state back does, carrying whatever edit wrote
+// on top of it.
+func guardedHandoff(t *testing.T, base string, client ClientID, edit func(txn *Transaction, text *YText, m *YMap)) []byte {
+	t.Helper()
+	peer := New(WithClientID(client))
+	if err := ApplyUpdateV1(peer, guardedState(t, base), nil); err != nil {
+		t.Fatalf("the peer refused the guarded state: %v", err)
+	}
+	text, m := peer.GetText("t"), peer.GetMap("m")
+	peer.Transact(func(txn *Transaction) { edit(txn, text, m) })
+	return EncodeStateAsUpdateV1(peer, nil)
+}
+
+// An update naming a root the document already holds is left to the
+// containment rule: the name check refuses only a root the document does not
+// hold, since creating one is what that check is for.
+//
+// Without the division a legitimate client is refused. A peer handing back
+// the whole state of a document names every root the document holds,
+// including one the owner allows no writes under, because the decode
+// resolves each struct's root as it reads the struct - before the integrate
+// discovers the struct is one the document already has and skips it. Such a
+// handoff integrates nothing and deletes nothing under that root, and used
+// to be refused all the same.
+func TestUnit_AllowedRoots_AHandoffNamingAHeldRootItDoesNotWriteUnderApplies(t *testing.T) {
+	const base = "hello world"
+	onlyText := func(any) []string { return []string{"t"} }
+
+	doc := guardedDoc(t, base)
+	doc.SetAllowedRoots(onlyText)
+	before := stateOf(doc)
+	if err := ApplyUpdateV1(doc, guardedState(t, base), nil); err != nil {
+		t.Fatalf("a handoff of the state the document already holds was refused: %v", err)
+	}
+	if after := stateOf(doc); after != before {
+		t.Fatalf("the handoff changed the document:\nbefore %+v\nafter  %+v", before, after)
+	}
+
+	// The same handoff carrying one new item under the root the list does
+	// not name is refused by the containment rule, and so is one deleting an
+	// item under it: what the name check stopped doing, containment does.
+	for name, c := range map[string]struct {
+		edit func(txn *Transaction, text *YText, m *YMap)
+	}{
+		"one new item under the held root": {func(txn *Transaction, _ *YText, m *YMap) { m.Set(txn, "k", "new") }},
+		"a delete under the held root":     {func(txn *Transaction, _ *YText, m *YMap) { m.Delete(txn, "k") }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			update := guardedHandoff(t, base, 2, c.edit)
+
+			guarded := guardedDoc(t, base)
+			guarded.SetAllowedRoots(onlyText)
+			guardedBefore := stateOf(guarded)
+			refused := requireRefused(t, guarded, guardedBefore, ApplyUpdateV1(guarded, update, nil), ErrRootNotAllowed)
+			if refused.Root != "m" {
+				t.Fatalf("the refusal reports root %q, want \"m\"", refused.Root)
+			}
+
+			// The control: the same update with no list changes the document.
+			open := guardedDoc(t, base)
+			requireApplied(t, open, stateOf(open), ApplyUpdateV1(open, update, nil))
+		})
+	}
+
+	// A root the document does not hold at all is still refused where the
+	// decode resolves its name, before anything under it is read.
+	fresh := guardedDoc(t, base)
+	fresh.SetAllowedRoots(onlyText)
+	freshBefore := stateOf(fresh)
+	refused := requireRefused(t, fresh, freshBefore,
+		ApplyUpdateV1(fresh, rootNamedUpdate("fresh", "first", " and more"), nil), ErrRootNotAllowed)
+	if refused.Root != "fresh" {
+		t.Fatalf("the refusal reports root %q, want \"fresh\"", refused.Root)
+	}
+	if refused.Structs != 0 {
+		t.Fatalf("the refusal reports %d structs, want none: the name check refuses before one integrates", refused.Structs)
+	}
+}
+
+// parkedStructs is an update of n one-character structs for client 2 at
+// clocks 1 to n, each naming the one before it as its left origin. Clock 0 is
+// never sent, so a document that has not seen it parks every one of them.
+func parkedStructs(n int) []byte {
+	enc := encoding.NewEncoder()
+	enc.WriteVarUint(1) // clients
+	enc.WriteVarUint(uint64(n))
+	enc.WriteVarUint(2) // client
+	enc.WriteVarUint(1) // first clock: clock 0 is the gap
+	for i := range n {
+		enc.WriteUint8(wireString | flagHasOrigin)
+		enc.WriteVarUint(2)         // the left origin's client
+		enc.WriteVarUint(uint64(i)) // its clock, the struct before this one
+		enc.WriteVarString("x")
+	}
+	enc.WriteVarUint(0) // delete set: no clients
+	return bytes.Clone(enc.Bytes())
+}
+
+// pendingState is everything an update refused by the pending cap must leave
+// as it was: the document's whole encoded state and what it holds parked.
+type pendingState struct {
+	state   string
+	items   int
+	ranges  int
+	structs int
+}
+
+func pendingStateOf(doc *Doc) pendingState {
+	stats := doc.PendingStats()
+	return pendingState{
+		state:   string(EncodeStateAsUpdateV1(doc, nil)),
+		items:   stats.Items,
+		ranges:  stats.DeleteRanges,
+		structs: doc.StructCount(),
+	}
+}
+
+// The pending cap refuses with ErrPendingCap, which is not the refusal
+// unreadable bytes get. The two want opposite answers from a server: bytes
+// that do not read mean the sender is broken and may be dropped for good,
+// while the cap means only that this update waits on clocks the document has
+// not seen, which is transient - the sender stays connected and the update
+// lands once its gap is filled. Both still wrap ErrInvalidUpdate, so a
+// caller that only asks whether the update was taken reads the same answer
+// as before.
+func TestUnit_PendingCap_IsItsOwnRefusalAndStillAnInvalidUpdate(t *testing.T) {
+	const limit = 5
+
+	t.Run("structs past the cap", func(t *testing.T) {
+		doc := New(WithClientID(7), WithMaxPendingItems(limit))
+		if err := ApplyUpdateV1(doc, parkedStructs(limit), nil); err != nil {
+			t.Fatalf("%d structs, the cap, were refused: %v", limit, err)
+		}
+		before := pendingStateOf(doc)
+		if before.items != limit {
+			t.Fatalf("%d structs are parked, want the %d the cap holds", before.items, limit)
+		}
+
+		err := ApplyUpdateV1(doc, parkedStructs(4*limit), nil)
+		if !errors.Is(err, ErrPendingCap) {
+			t.Fatalf("the update was refused with %v, want ErrPendingCap", err)
+		}
+		if !errors.Is(err, ErrInvalidUpdate) {
+			t.Fatalf("ErrPendingCap does not wrap ErrInvalidUpdate: %v", err)
+		}
+		if after := pendingStateOf(doc); after != before {
+			t.Fatalf("the refused update changed the document:\nbefore %+v\nafter  %+v", before, after)
+		}
+	})
+
+	t.Run("delete ranges past the cap", func(t *testing.T) {
+		doc := New(WithClientID(7), WithMaxPendingItems(limit))
+		if err := ApplyUpdateV1(doc, parkedDeletes(98, limit), nil); err != nil {
+			t.Fatalf("%d ranges, the cap, were refused: %v", limit, err)
+		}
+		before := pendingStateOf(doc)
+		if before.ranges != limit {
+			t.Fatalf("%d delete ranges are parked, want the %d the cap holds", before.ranges, limit)
+		}
+
+		err := ApplyUpdateV1(doc, parkedDeletes(99, limit+1), nil)
+		if !errors.Is(err, ErrPendingCap) {
+			t.Fatalf("the delete set was refused with %v, want ErrPendingCap", err)
+		}
+		if !errors.Is(err, ErrInvalidUpdate) {
+			t.Fatalf("ErrPendingCap does not wrap ErrInvalidUpdate: %v", err)
+		}
+		if after := pendingStateOf(doc); after != before {
+			t.Fatalf("the refused delete set changed the document:\nbefore %+v\nafter  %+v", before, after)
+		}
+	})
+
+	t.Run("bytes that do not read are not the cap", func(t *testing.T) {
+		// Each of these carries too little to park anything, so what refuses
+		// them can only be that they do not read. A frame that declares more
+		// structs than the room and is cut after them is refused by the cap
+		// first, and rightly: as far as it reads, it would park past it.
+		one := parkedStructs(1)
+		for name, update := range map[string][]byte{
+			"a frame cut at its header": one[:1],
+			"a struct cut short":        one[:len(one)-2],
+		} {
+			t.Run(name, func(t *testing.T) {
+				doc := New(WithClientID(7), WithMaxPendingItems(limit))
+				err := ApplyUpdateV1(doc, update, nil)
+				if !errors.Is(err, ErrInvalidUpdate) {
+					t.Fatalf("the malformed update was applied with err %v", err)
+				}
+				if errors.Is(err, ErrPendingCap) {
+					t.Fatalf("a malformed update was refused as the pending cap: %v", err)
+				}
+			})
+		}
+	})
+}

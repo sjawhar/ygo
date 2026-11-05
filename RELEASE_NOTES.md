@@ -1,3 +1,40 @@
+## v1.55.1-sami.6
+
+This fork release retains the complete
+[v1.55.1-sami.5 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.5)
+and corrects one defect in it that a client can see. There are no wire format
+changes.
+
+### The defect
+
+A document with an allowed-roots list refused an update that named a root the
+document already held, even when the update wrote nothing under it. A browser
+that reconnects hands the server the whole state of its document, and that
+update names every root the document holds, because the decode resolves a
+struct's root while reading it — before it discovers the document already
+holds that struct and skips it. So a handoff that integrates nothing was
+refused, and the document stopped syncing for that person.
+
+### The fix
+
+The name check in the decode now refuses only a root the document does not
+already hold. A root it does hold is judged by the containment rule alone.
+That division is the right one: the name check's job is "a sender may not
+create a root the owner did not allow", and containment's is "a sender may
+not add to or delete under one". Together they refuse every forged write and
+stop refusing a handoff that writes nothing. A new item under a held but
+disallowed root, and a delete under one, are still refused.
+
+### Also
+
+`crdt.ErrPendingCap` is why a document refuses an update that would park more
+than `WithMaxPendingItems` allows. It wraps `ErrInvalidUpdate`, so
+`errors.Is(err, ErrInvalidUpdate)` still holds and no existing caller changes.
+It exists because that refusal and bytes that do not read want opposite
+answers from a server: a sender of unreadable bytes is broken and may be
+dropped for good, while the pending cap is transient and the sender should
+stay connected until its gap fills.
+
 ## v1.55.1-sami.5
 
 This fork release retains the complete

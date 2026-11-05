@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.6] — 2026-11-05
+
+Fork release on [1.55.1-sami.5](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.5),
+correcting one defect in it that a client can see. An allowed-roots list
+refused a browser handing back the whole state of its document, which writes
+nothing, so that document stopped syncing. No wire format changes.
+
+### Added
+
+- **`crdt.ErrPendingCap`** is why a document refuses a remote update that
+  would leave more structs or more delete ranges parked than
+  `WithMaxPendingItems` allows, from both paths that enforce the cap: the
+  one over the update's structs and the one over its delete ranges. It wraps
+  `ErrInvalidUpdate`, as every refusal of a remote update does, so
+  `errors.Is(err, ErrInvalidUpdate)` holds for it and a caller that only
+  asks whether the update was taken reads the same answer as before. It is
+  told apart because the two refusals say different things about the sender
+  and want opposite answers from a server: bytes that do not read mean the
+  sender is broken and may be dropped for good, while the pending cap means
+  only that this update waits on clocks the document has not seen yet, which
+  is transient - the sender stays connected and the update lands once its
+  gap is filled. (fork member stacked on reearth/ygo#333)
+
+### Fixed
+
+- **`crdt`: an allowed-roots list no longer refuses an update that names a
+  root the document already holds and writes nothing under it.** The name
+  check in the decode refused any root the list did not carry, held or not.
+  That refused a legitimate client: a browser handing back the whole state
+  of a document whose owner allows only roots A and B still names every root
+  the document holds, one the owner allows no writes under among them,
+  because the decode resolves the root while reading each struct - before it
+  discovers the struct is one the document already holds and skips it. The
+  handoff integrated nothing under that root and was refused all the same.
+  The name check now refuses only a root the document does not already hold,
+  and a root it holds is judged by the containment rule alone. That is the
+  right division: the name check's job is "a sender may not create a root
+  the owner did not allow", and containment's is "a sender may not add to or
+  delete under one". Together they still refuse every forged write, and they
+  stop refusing a handoff that writes nothing. (fork member stacked on
+  reearth/ygo#333)
+
 ## [1.55.1-sami.5] — 2026-11-05
 
 Fork release on the [1.55.1-sami.3 composition](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.3).
@@ -17,7 +59,7 @@ Tag `v1.55.1-sami.4` carries this same tree and is resolvable, but it has no
 published release: its tag was cut before `RELEASE_NOTES.md` carried a section
 for it, so the release workflow refused to publish. The tag was left where it
 is rather than moved, because the Go checksum database had already recorded
-that version. Pin `v1.55.1-sami.5`.
+that version. Pin `v1.55.1-sami.5` or later.
 
 ### Added
 
