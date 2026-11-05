@@ -76,6 +76,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write continued that clock, past 2^53-1 if the GC struct reached it; this
   release's clock bound refuses that state.
 
+- **`provider/websocket`: a peer's SyncStep1 is answered in frames it applies
+  one at a time.** The room's state goes out as Update frames of at most
+  64 KiB, each of which integrates on its own, followed by one SyncStep2
+  carrying only what no Update could. A receiver applies one frame in one
+  task, where one SyncStep2 of a megabyte was one task of seconds. The frames
+  of one answer are queued together, in order, so nothing queued later - a
+  SyncStatus among it - reaches the peer before that SyncStep2, and the answer
+  is charged to `Server.PeerWriteQueueBytes` on the one decision the single
+  frame it replaces got. A 1.22 MB state is 20 frames, well inside the
+  512-frame default write queue. The connect handshake still carries no
+  state, and the slow-peer resync (`SlowPeerResync`) still sends one
+  full-state SyncStep2.
+
 ### Fixed
 
 - **`crdt`: logical span lengths and offsets do not depend on the build's
