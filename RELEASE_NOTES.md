@@ -1,3 +1,59 @@
+## v1.55.1-sami.5
+
+This fork release retains the complete
+[v1.55.1-sami.3 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.3)
+and lets a document bound what each remote update may cost it. There are no
+wire format changes, and a document that sets neither a budget nor a list of
+allowed roots behaves exactly as before.
+
+### Why
+
+A document applied whatever a peer sent it. One frame could declare two
+million values, and the apply allocated every one of them before anything
+looked at how large the update was, so a single remote update could take the
+memory of the process that applied it.
+
+### What a document can now bound
+
+`crdt.WithApplyBudget` and `Doc.SetApplyBudget` give a document a budget it
+asks for, under its lock, as each remote apply begins, with that apply's
+origin — the same shape as the existing `WithIntegrateScanBudget`. An
+`ApplyBudget` bounds three costs: `Decoded`, the values the apply may decode;
+`Structs`, the items it may integrate; and `Bytes`, the content bytes it may
+add. A field below zero is no limit and zero allows nothing, so `Structs: 0`
+means "this update may integrate no item of its own" while still admitting a
+delete. The values are counted off the frame's own bytes before the decode
+allocates for a declared length, which is what makes `Decoded` bound the
+apply's memory rather than report it afterwards.
+
+`crdt.WithAllowedRoots` and `Doc.SetAllowedRoots` name the roots an apply may
+touch. It is a containment rule over everything the update adds or deletes,
+not only over the root names the wire carries, because an item written beside
+content the document already holds inherits its parent and names no root.
+
+A refused update leaves the document as it was: no observer fires, and
+`ApplyUpdate` returns a `RefusedUpdateError` reporting what the apply decoded,
+integrated and added, and which root or split refused it.
+`crdt.ParseUpdateMeta` and `ParseUpdateMetaV2` read an update's shape without
+applying it, and `Doc.StructCount` is the count an owner sizes a budget
+against.
+
+### Measured
+
+On the machine that cut this release: a frame declaring two million values is
+refused under `Decoded: 1` having allocated 2,016 bytes, where counting the
+values the decode had built allocated 32,008,272 of them first. An update of
+32,768 nested types takes 51 ms under a roots list against 45 ms with none.
+
+### A note on v1.55.1-sami.4
+
+The tag `v1.55.1-sami.4` carries this same tree and resolves as a module, but
+it has no published release: it was cut before this file carried a section for
+it, and the release workflow refused to publish. The tag was left where it is
+rather than moved, because the Go checksum database had already recorded that
+version and moving it would make every verifying consumer fail. Pin
+`v1.55.1-sami.5`.
+
 ## v1.55.1-sami.3
 
 This fork release retains the complete
