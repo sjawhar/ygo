@@ -226,6 +226,14 @@ having allocated 2,016 bytes, where counting the values the decode had built
 allocated 32,008,272 of them first. An update of 32,768 nested types takes
 51 ms under a roots list against 45 ms with none.
 
+`crdt.ErrPendingCap` is why a document refuses an update that would park more
+than `WithMaxPendingItems` allows. It wraps `ErrInvalidUpdate`, so
+`errors.Is(err, ErrInvalidUpdate)` still holds and no existing caller changes.
+It exists because that refusal and bytes that do not read want opposite
+answers from a server: a sender of unreadable bytes is broken and may be
+dropped for good, while the pending cap is transient and the sender should
+stay connected until its gap fills.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single

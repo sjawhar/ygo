@@ -265,7 +265,7 @@ func scanPendingGroupsV2(d *v2Decoder, known StateVector, remaining int, clientR
 					} else {
 						result.pending++
 						if clients == 1 && pastRoom(result.pending, remaining, parked.heldStructs()) {
-							return result, ErrInvalidUpdate
+							return result, ErrPendingCap
 						}
 					}
 				}

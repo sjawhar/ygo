@@ -377,7 +377,7 @@ func checkParkedDeletes(doc *Doc, b *pendingBudget) error {
 	if after <= limit || after <= before {
 		return nil
 	}
-	return ErrInvalidUpdate
+	return ErrPendingCap
 }
 
 // readStructs reads the update's structs once for the delete-set check, as a

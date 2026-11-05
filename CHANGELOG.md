@@ -192,6 +192,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged, reports the run Yjs's state vector reader reports and ends a
   client at its first Skip or gap. A malformed update is an error wrapping
   `ErrInvalidUpdate`, never a panic.
+- **`crdt.ErrPendingCap`** is why a document refuses a remote update that
+  would leave more structs or more delete ranges parked than
+  `WithMaxPendingItems` allows, from both paths that enforce the cap: the
+  one over the update's structs and the one over its delete ranges. It wraps
+  `ErrInvalidUpdate`, as every refusal of a remote update does, so
+  `errors.Is(err, ErrInvalidUpdate)` holds for it and a caller that only
+  asks whether the update was taken reads the same answer as before. It is
+  told apart because the two refusals say different things about the sender
+  and want opposite answers from a server: bytes that do not read mean the
+  sender is broken and may be dropped for good, while the pending cap means
+  only that this update waits on clocks the document has not seen yet, which
+  is transient - the sender stays connected and the update lands once its
+  gap is filled.
 
 ### Changed
 
