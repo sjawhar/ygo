@@ -78,6 +78,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it, and an owner can keep a document's running total from it.
 - **`crdt`: `Doc.SetMaxPendingItems(n)`** sets the pending cap after
   construction, so stored state over a cap can load first.
+- **`crdt`: `Doc.StructCount()` and `(*StructStore).Count()`** are how many
+  structs a document holds, every client's items together, deleted ones and
+  the placeholders of collected ones included. `Doc.StructCount` takes the
+  document's read lock, so it is not called from inside a `Transact`
+  callback. It is the count an owner sizes an apply budget against, and the
+  count that says what a load of the document's whole state will cost: that
+  state is one update to the next document that reads it. The count walks the
+  clients, a handful per document, rather than being kept beside the store:
+  every place that writes a client's items - an append, a split, a rollback's
+  drop, a commit's squash of merged runs and `RunGC`'s drop of collected
+  tombstones - would otherwise have to be kept in step with it.
+- **`crdt`: a budget for what each remote update may decode and add.**
+  `WithApplyBudget(func(origin any) ApplyBudget)` and `Doc.SetApplyBudget`
+  give a document a budget it asks, under its lock, as each remote apply
+  (`ApplyUpdate`, V1 and V2) begins, with that apply's origin, as the scan
+  budget is asked (`WithIntegrateScanBudget`). `ApplyBudget` bounds three
+  costs: `Decoded`, the values the apply may decode (each struct, each lib0
+  Any value at any depth, each entry of an Any map as the decoder reads it,
+  each member of a decoded JSON value, each delete range the frame carried);
+  `Structs`, the items it may integrate from the update; and `Bytes`, the
+  bytes of content it may integrate, the name a type carries of its own
+  among them, since an XML element and an XML hook keep the name their
+  sender sized. **A
+  field below zero is no limit, and zero allows nothing**, so the zero
+  `ApplyBudget` admits an apply that decodes nothing and adds nothing:
+  `Structs: 0` is "this update may integrate no item of its own" and
+  `Bytes: 0` is "it may integrate no content byte", neither of which can be
+  said if zero means no limit. A document with no budget callback is bounded
+  in no measure, as before.
+  All three are needed. A frame of lib0 Any values that integrates nothing
+  still allocates about 32 bytes for each byte of itself while it decodes,
+  so `Decoded` is what bounds the apply's memory - and it bounds it rather
+  than reporting it afterwards, because the values are counted off the
+  frame's own bytes, before the decode allocates for a declared length and
+  before it builds one value of it: a frame declaring two million values is
+  refused under `Decoded: 1` having allocated 2,016 bytes, where counting
+  the values the decode had built allocated 32,008,272 of them first. Each
+  entry of a map is counted where the decoder reads it, so a hundred
+  thousand entries that share a key cost a hundred thousand and not the one
+  the Go map they decode to holds, and each delete range is counted as the
+  frame carried it, not as the decode's sort and merge left it. `Structs`
+  keeps the document decodable, since its whole state is one update to its
+  next load; and `Bytes` is the creep rule, since a 64 KiB paste is one
+  struct. An update past its budget is refused with `ErrApplyBudget` and,
+  like every remote update a bounded document refuses, leaves the document
+  as it was and tells no observer. The struct and byte counts are read where
+  the apply's struct phase ends, before its delete set is decoded and before
+  it drains the pending queue, and nowhere after: the counts are final there
+  - a delete set integrates no struct, and the structs it makes by splitting
+  are reported as `Split`, which no budget bounds - and a refusal raised
+  after either step could not give back what that step changed, a parked
+  item the drain trimmed in place or a subdocument the delete detached from
+  its parent. Splits of items the document
+  already held are not counted by `Structs`: a split leaves the same content
+  and the commit merges the halves back, and a budget of `Structs: 0` must
+  still admit an update that only deletes held text, whose splits add
+  structs. A document with an apply budget is a bounded document whatever the
+  budget returns: it applies every remote update whole or not at all and
+  refuses subdocuments and moves from remote updates.
+- **`crdt`: an allowed-roots list for remote updates.**
+  `WithAllowedRoots(func(origin any) []string)` and `Doc.SetAllowedRoots`
+  name, per apply and by its origin, the root types a remote update may write
+  under. An update that names, integrates under or deletes under any other
+  root is refused with `ErrRootNotAllowed` and rolled back whole. The list is
+  a containment rule over the whole update, not a rule about the names it
+  writes on the wire: an update names a root only where its decode resolves
+  one by name - the first item of a root, or a map key whose slot is empty -
+  while an item written beside items the document already holds inherits its
+  parent from the item its origin names, and a delete range names nothing at
+  all. So the apply also walks up the parents of every item it integrates or
+  deletes, and refuses the update when that walk reaches a root the list does
+  not name; without it a sender could overwrite and delete inside a root it
+  may not touch. The walk is memoised per type and stops at the first
+  ancestor the apply has already answered, recording the root it reached for
+  every type it passed, so a chain of types nested inside one another is
+  walked once however many items hang under it and the rule costs an apply a
+  map lookup an item: an update of 32,768 nested types takes 51 ms under a
+  list against 45 ms with none. An item under a nested type is contained by
+  the root above it, so an update writing deep inside an allowed root is
+  allowed; one whose parents reach no root of the document is refused. A root
+  the document holds already is subject to the list, and a root it does not
+  hold yet is allowed by its name, so an allowed update may create it - the
+  empty name is a name like any other, and a list that names it may create
+  it. A nil callback, or one answering a nil or empty slice, allows every
+  root, which is what a document without the option does. A document with a
+  list is a bounded document, as one with an apply budget is, and its
+  refusal is the one refusal that can be raised while a delete set is being
+  applied: the rollback a refusal makes therefore gives a revived item's
+  subdocument its item, its parent and its attached state back, so a
+  subdocument the document still shows is never left attached to nothing.
+- **`crdt`: `RefusedUpdateError` reports what the refused apply reached.**
+  Beside `Err` and `Scanned` it now carries `Decoded`, `Structs` and `Bytes`,
+  the three counts of `ApplyBudget`; `Split`, the structs the apply made by
+  splitting items the document already held, which `Structs` does not count
+  and no budget bounds; and `Root`, the root an update refused with
+  `ErrRootNotAllowed` reached, empty for every other refusal. The counts are
+  kept on every bounded document, whatever refused the apply, so a caller
+  that asks "did this update integrate anything of its own" reads `Structs`
+  exactly.
+- **`crdt.ParseUpdateMeta(update)` and `ParseUpdateMetaV2(update)`** are the
+  lowest and the highest clock each client's structs reach in an update,
+  without integrating it: `from[client]` is the clock its first struct starts
+  at and `to[client]` the clock past its last, as Yjs `parseUpdateMeta` gives
+  them, and both are `StateVector` values rather than encoded bytes. The
+  structs are read in wire order, each struct counted whatever it is, a Skip
+  included, so `to` is the end of the last struct rather than the end of the
+  first unbroken run: `EncodeStateVectorFromUpdate`, whose own behaviour is
+  unchanged, reports the run Yjs's state vector reader reports and ends a
+  client at its first Skip or gap. A malformed update is an error wrapping
+  `ErrInvalidUpdate`, never a panic.
 
 ### Changed
 
@@ -272,6 +382,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it is added, as in Yjs. A subdocument that an undo restores starts with
   `ShouldLoad()` equal to `AutoLoad()` and takes its parent's collection ID,
   as Yjs's copy does.
+
+- **`crdt`: a remote update a bounded document refuses leaves the type it
+  formatted plain.** Integrating a `ContentFormat` raises `hasFormatting`
+  and `cleanFormatting` on the type it hangs under and bumps the generation
+  its format cache reads, and deleting one bumps that generation again;
+  nothing lowers them. The rollback did not put them back, so an update a
+  scan bound (`WithMaxIntegrateScan`) refused moved a plain text onto the
+  formatting-aware path for the rest of the document's life, and every later
+  `Delete` on it paid for the contextless cleanup walk a plain text skips. A
+  rollback now restores them.
 
 ## [1.55.0] — 2026-10-31
 

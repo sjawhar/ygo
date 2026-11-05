@@ -712,6 +712,10 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 
 		kept := false // Yjs's rest takes a client's structs from one that waits
 		for j := uint64(0); j < numStructs; j++ {
+			// Each struct is a value the apply decodes, counted before it is
+			// read, as in the V1 loop (applyTally.decode); the values its
+			// content carries are counted in decodeContentV2.
+			txn.doc.tally().decode(1)
 			info, err := dec.readInfo()
 			if err != nil {
 				return wrapUpdateErr(err)
@@ -791,11 +795,21 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		return err
 	}
 
-	// Decode delete set, unless the parked-range check read it whole.
-	ds, dsErr := budget.deleteSet, error(nil)
-	if !budget.deleteSetRead {
-		ds, dsErr = decodeDeleteSetV2(dec)
+	// The struct and byte budget is read here, where the apply has
+	// integrated every struct it is going to and nothing has been deleted or
+	// drained yet, as in the V1 apply (refuseOverBudget).
+	if err := refuseOverBudget(txn); err != nil {
+		return err
 	}
+
+	// Decode delete set, unless the parked-range check read it whole.
+	ds, dsRanges, dsErr := budget.deleteSet, budget.deleteSetRanges, error(nil)
+	if !budget.deleteSetRead {
+		ds, dsRanges, dsErr = decodeDeleteSetV2(dec)
+	}
+	// The ranges are values the apply decoded, as in the V1 apply
+	// (countDecodedRanges).
+	countDecodedRanges(txn, dsRanges)
 	if err := applyDecodedDeleteSet(txn, ds, dsErr); err != nil {
 		return err
 	}
@@ -837,9 +851,14 @@ func decodeItemV2(dec *v2Decoder, doc *Doc, client ClientID, clock uint64, info 
 			return nil, 0, err
 		}
 		if isYKey {
-			// Named root type.
+			// Named root type, refused before it is resolved when the
+			// document's allowed roots do not list it, as in the V1 decode
+			// (refuseRootOnBoundedDoc, WithAllowedRoots).
 			name, err := dec.readString()
 			if err != nil {
+				return nil, 0, err
+			}
+			if err := refuseRootOnBoundedDoc(doc, name); err != nil {
 				return nil, 0, err
 			}
 			parent = doc.getOrCreateType(name)
@@ -937,6 +956,12 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 		if l > maxV2Items {
 			return nil, ErrInvalidUpdate
 		}
+		// The declared count is charged before the list is allocated for it,
+		// as in the V1 decoder (decodeContent); the members come from the
+		// string column, not the frame's rest, so what each holds is counted
+		// off the value its text decoded to.
+		tally := doc.tally()
+		tally.decode(int(l))
 		vals := make([]any, l)
 		for i := range vals {
 			s, err := dec.readString()
@@ -946,6 +971,7 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 			if vals[i], err = fmtValFromJSON(s); err != nil {
 				return nil, err
 			}
+			tally.nested(vals[i])
 		}
 		return NewContentJSON(vals...), nil
 
@@ -964,6 +990,7 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 		return NewContentString(s), nil
 
 	case wireEmbed:
+		countAnyRun(doc.tally(), dec.restDec, 1)
 		v, err := dec.readAny()
 		if err != nil {
 			return nil, err
@@ -975,6 +1002,7 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		countAnyRun(doc.tally(), dec.restDec, 1)
 		val, err := dec.readAny()
 		if err != nil {
 			return nil, err
@@ -1000,6 +1028,9 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 		if l > maxV2Items {
 			return nil, ErrInvalidUpdate
 		}
+		// Every value is counted off the frame first, before the list is
+		// allocated and before one value is built (countAnyRun).
+		countAnyRun(doc.tally(), dec.restDec, l)
 		vals := make([]any, l)
 		for i := range vals {
 			v, err := dec.readAny()
@@ -1015,6 +1046,7 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		countAnyRun(doc.tally(), dec.restDec, 1)
 		optsAny, err := dec.readAny()
 		if err != nil {
 			return nil, err
@@ -1101,7 +1133,7 @@ func decodeTypeContentV2(dec *v2Decoder, doc *Doc, typeRef byte) (*abstractType,
 }
 
 // decodeDeleteSetV2 is decodeDeleteSet for V2, with the same result after an error.
-func decodeDeleteSetV2(dec *v2Decoder) (ds DeleteSet, err error) {
+func decodeDeleteSetV2(dec *v2Decoder) (ds DeleteSet, ranges int, err error) {
 	defer func() {
 		for c := range ds.clients {
 			ds.sortAndCompact(c)
@@ -1109,7 +1141,7 @@ func decodeDeleteSetV2(dec *v2Decoder) (ds DeleteSet, err error) {
 	}()
 	n, err := dec.restDec.ReadVarUint()
 	if err != nil {
-		return newOrderedDeleteSet(), err
+		return newOrderedDeleteSet(), 0, err
 	}
 	// A counting first pass sizes every list once, as in decodeDeleteSet; it reads
 	// the rest decoder, which is restored after it unless the pass added nothing.
@@ -1117,7 +1149,7 @@ func decodeDeleteSetV2(dec *v2Decoder) (ds DeleteSet, err error) {
 	tally := rangeTally{room: int(min(n, uint64(dec.restDec.Remaining()/4)))}
 	scanErr := readDeleteSetV2(dec, n, tally.count)
 	if len(tally.clients) == 0 {
-		return newOrderedDeleteSet(), scanErr
+		return newOrderedDeleteSet(), 0, scanErr
 	}
 	*dec.restDec, dec.dsCurrVal = rest, cur
 	tally.merge()
@@ -1125,7 +1157,7 @@ func decodeDeleteSetV2(dec *v2Decoder) (ds DeleteSet, err error) {
 	err = readDeleteSetV2(dec, n, func(client ClientID, r DeleteRange, _ bool) {
 		ds.appendDecoded(client, r, &tally)
 	})
-	return ds, err
+	return ds, tally.total(), err
 }
 
 // readDeleteSetV2 is readDeleteSet for V2.

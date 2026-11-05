@@ -72,7 +72,7 @@ func decodeStructsV1(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteS
 		}
 		out[client] = structs
 	}
-	ds, err := decodeDeleteSet(dec)
+	ds, _, err := decodeDeleteSet(dec)
 	if err != nil {
 		return nil, DeleteSet{}, wrapUpdateErr(err)
 	}
@@ -253,6 +253,82 @@ func DiffUpdateV1(update []byte, sv StateVector) ([]byte, error) {
 // structs from clock 0 up to the first Skip or gap, as Yjs reports it.
 func EncodeStateVectorFromUpdate(update []byte) ([]byte, error) {
 	return encodeStateVectorFromUpdate(update, false)
+}
+
+// ParseUpdateMeta is the lowest and the highest clock each client's structs
+// reach in a V1 update, without integrating it: from[client] is the clock its
+// first struct starts at and to[client] the clock past its last, as Yjs
+// parseUpdateMeta gives them. A client with no struct in the update is in
+// neither.
+//
+// A caller sizes what an update will cost before it applies it from these:
+// to[client] - from[client] is the clocks it carries for that client, and what
+// the document already holds for it (StateVector) says how much of that is
+// new.
+//
+// The structs are read in wire order, each struct counted whatever it is, a
+// Skip of withheld clocks included, so to is the end of the last struct rather
+// than the end of the first unbroken run: EncodeStateVectorFromUpdate, which
+// reports the run Yjs's state vector reader reports, ends a client at its
+// first Skip or gap and leaves out a client whose structs do not start at
+// clock 0. The delete set is never read.
+func ParseUpdateMeta(update []byte) (from, to StateVector, err error) {
+	return parseUpdateMeta(update, false)
+}
+
+// ParseUpdateMetaV2 is ParseUpdateMeta for a V2 update.
+func ParseUpdateMetaV2(update []byte) (from, to StateVector, err error) {
+	return parseUpdateMeta(update, true)
+}
+
+// parseUpdateMeta reads the structs of a V1 or V2 update in wire order, as
+// encodeStateVectorFromUpdate does, and keeps the lowest clock a client's
+// structs start at and the highest they reach. A malformed update is an error,
+// never a panic: the scanner stops at the byte it cannot read and the reason
+// it gives is named as an invalid update (scanReason).
+func parseUpdateMeta(update []byte, v2 bool) (StateVector, StateVector, error) {
+	from, to := make(StateVector), make(StateVector)
+	s := newPendingScanner(update, v2)
+	groups := s.uint()
+	if groups > maxV2Items {
+		return nil, nil, ErrInvalidUpdate
+	}
+	var total uint64
+	for i := uint64(0); i < groups && s.err == nil; i++ {
+		n := s.uint()
+		// The same bounds as the decoders, so a run-length V2 column cannot
+		// declare more structs than an apply would read.
+		if n > maxV2Items-total {
+			return nil, nil, ErrInvalidUpdate
+		}
+		total += n
+		c := s.client()
+		at := s.uint()
+		if s.err == nil && c > maxClient {
+			return nil, nil, ErrInvalidUpdate
+		}
+		for j := uint64(0); j < n && s.err == nil; j++ {
+			length, _, _, _ := s.item()
+			if s.err != nil {
+				break
+			}
+			end, err := structEnd(at, length)
+			if err != nil {
+				return nil, nil, err
+			}
+			if start, held := from[c]; !held || at < start {
+				from[c] = at
+			}
+			if reached, held := to[c]; !held || end > reached {
+				to[c] = end
+			}
+			at = end
+		}
+	}
+	if s.err != nil {
+		return nil, nil, wrapUpdateErr(scanReason(s.err))
+	}
+	return from, to, nil
 }
 
 // encodeStateVectorFromUpdate reads the structs of a V1 or V2 update in wire

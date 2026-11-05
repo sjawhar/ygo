@@ -66,7 +66,7 @@ func encodeSnapshotStateVector(enc *encoding.Encoder, sv StateVector) {
 func DecodeSnapshot(data []byte) (*Snapshot, error) {
 	dec := encoding.NewDecoder(data)
 
-	ds, err := decodeDeleteSet(dec)
+	ds, _, err := decodeDeleteSet(dec)
 	if err != nil {
 		return nil, wrapUpdateErr(err)
 	}

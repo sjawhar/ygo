@@ -189,6 +189,43 @@ from Yjs is kept and written back. A subdocument that an undo restores starts
 with `ShouldLoad()` equal to `AutoLoad()` and takes its parent's collection
 ID, as in Yjs.
 
+**Who is affected: servers that apply updates from peers they do not trust
+and want to bound what one update may cost.** Opt-in; a document that sets
+neither an apply budget nor a list of allowed roots behaves as before.
+
+A document applied whatever a peer sent it. One frame could declare two
+million values, and the apply allocated every one of them before anything
+looked at how large the update was, so a single remote update could take the
+memory of the process that applied it.
+
+`crdt.WithApplyBudget` and `Doc.SetApplyBudget` give a document a budget it
+asks for, under its lock, as each remote apply begins, with that apply's
+origin, in the same shape as `WithIntegrateScanBudget`. An `ApplyBudget`
+bounds three costs: `Decoded`, the values the apply may decode; `Structs`,
+the items it may integrate; and `Bytes`, the content bytes it may add. A
+field below zero is no limit and zero allows nothing, so `Structs: 0` means
+"this update may integrate no item of its own" while still admitting a
+delete. The values are counted off the frame's own bytes before the decode
+allocates for a declared length, which is what makes `Decoded` bound the
+apply's memory rather than report it afterwards.
+
+`crdt.WithAllowedRoots` and `Doc.SetAllowedRoots` name the roots an apply may
+touch. It is a containment rule over everything the update adds or deletes,
+not only over the root names the wire carries, because an item written beside
+content the document already holds inherits its parent and names no root.
+
+A refused update leaves the document as it was: no observer fires, and
+`ApplyUpdate` returns a `RefusedUpdateError` reporting what the apply decoded,
+integrated, split and added, and which root refused it.
+`crdt.ParseUpdateMeta` and `ParseUpdateMetaV2` read an update's clock ranges
+without applying it, and `Doc.StructCount` is the count an owner sizes a
+budget against.
+
+Measured: a frame declaring two million values is refused under `Decoded: 1`
+having allocated 2,016 bytes, where counting the values the decode had built
+allocated 32,008,272 of them first. An update of 32,768 nested types takes
+51 ms under a roots list against 45 ms with none.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single

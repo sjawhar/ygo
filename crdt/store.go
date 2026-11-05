@@ -419,6 +419,22 @@ func (s *StructStore) resolvePendingMoves(txn *Transaction, client ClientID) {
 	s.shrinkPendingMoveMap()
 }
 
+// Count is how many structs the store holds, every client's together. It
+// walks the clients, a handful per document, rather than keeping a counter
+// beside them: every place that writes clients - Append, insertItem, a
+// rollback's drop of what an apply added (applyJournal.rollBackTo), a commit's
+// squash of merged runs and its mergeRuns write-back, and RunGC's drop of the
+// tombstones it collected - would otherwise have to be kept in step with it,
+// and a count that drifts from the store is worse than one that costs a map
+// walk to read.
+func (s *StructStore) Count() int {
+	n := 0
+	for _, items := range s.clients {
+		n += len(items)
+	}
+	return n
+}
+
 // StateVector computes the current state vector: for each client, the clock of
 // the last item + its length (i.e. the next expected clock from that client).
 func (s *StructStore) StateVector() StateVector {

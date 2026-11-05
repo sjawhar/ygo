@@ -110,6 +110,10 @@ func (item *Item) integrate(txn *Transaction, offset uint64) {
 		// Yjs stores an item whose right origin is a GC struct as a GC struct.
 		if right != nil && right.isGCOrphan() {
 			item.markGCOrphan()
+			// A struct of a remote update that enters the store, checked
+			// against the document's allowed roots and counted against its
+			// budget where it does (noteIntegrated).
+			noteIntegrated(txn, item)
 			txn.doc.store.Append(item)
 			txn.doc.store.resolvePendingMoves(txn, item.ID.Client)
 			return
@@ -294,7 +298,10 @@ func (item *Item) integrate(txn *Transaction, offset uint64) {
 		}
 	}
 
-	// Register in the document store.
+	// Register in the document store, checked against the document's allowed
+	// roots and counted against a remote apply's budget as the struct it
+	// integrates (noteIntegrated).
+	noteIntegrated(txn, item)
 	txn.doc.store.Append(item)
 	if j := txn.applyJournal(); j != nil {
 		j.integrating = nil
@@ -382,6 +389,7 @@ func (item *Item) integrate(txn *Transaction, offset uint64) {
 	// the contextless cleanup walk. Plain-text types never set this flag,
 	// so their deletes skip the walk entirely (#86 final fix).
 	if _, ok := item.Content.(*ContentFormat); ok && item.Parent != nil {
+		noteFormatting(txn, item.Parent)
 		item.Parent.hasFormatting = true
 		item.Parent.fmtGen++
 		item.Parent.cleanFormatting = true
@@ -503,6 +511,10 @@ func (item *Item) lastID() ID {
 // (nextDeleteItem), so a remotely built tree of any depth deletes without
 // growing the goroutine stack.
 func (item *Item) delete(txn *Transaction) {
+	// A remote apply may delete only under a root the document's
+	// allowed-roots list names; the cascade below stays under the same root
+	// (noteDeleted, WithAllowedRoots).
+	noteDeleted(txn, item)
 	for current := item; current != nil; {
 		if current.Deleted {
 			current = nextDeleteItem(current, item)
@@ -514,6 +526,7 @@ func (item *Item) delete(txn *Transaction) {
 			txn.doc.store.moveDeleted(*cm.Target)
 		}
 		if _, ok := current.Content.(*ContentFormat); ok && current.Parent != nil {
+			noteFormatting(txn, current.Parent)
 			current.Parent.fmtGen++
 		}
 		if current.Parent != nil && current.Content.IsCountable() {
@@ -614,6 +627,10 @@ func splitItem(txn *Transaction, item *Item, offset uint64) *Item {
 		right.Right.Left = right
 	}
 	item.Right = right
+	// The half a split adds is a struct the apply made, reported and never
+	// bounded, since the commit merges the halves back once the items between
+	// them are gone (countSplit, WithApplyBudget).
+	countSplit(txn)
 	txn.doc.store.insertItem(right)
 	// A key's entry is its rightmost unit, so Set's origin stays the run's end.
 	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {
