@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.3] — 2026-11-05
+
+Fork release on the [1.55.1-sami.2 composition](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2).
+The websocket provider answers a peer's SyncStep1 with the room's state in
+bounded frames instead of one message. No wire format changes: every frame is
+an ordinary y-protocols sync message.
+
+### Added
+
+- `crdt.SplitUpdateV1(update, sv, maxBytes)` returns the series of V1 updates
+  a receiver whose state vector is `sv` applies, in order, in place of one
+  update. Every update but the last integrates on its own — no struct or
+  deletion it carries waits for an update still to come — and each is at most
+  `maxBytes` long, except one carrying a single struct a V1 update cannot cut
+  (content occupying one clock) and the last, which carries the structs the
+  sender itself holds parked. A text item longer than `maxBytes` is cut at a
+  character boundary, never inside one.
+- `sync.EncodeSyncStep2Split(doc, step1msg, maxBytes)` answers a step-1
+  message with that series as sync messages, each at most `maxBytes` long:
+  Update messages (type 2) and then one SyncStep2 (type 1), last. A receiver
+  that applies them in order holds exactly what `EncodeSyncStep2`'s one
+  message would have left it holding.
+
+### Changed
+
+- The websocket provider answers a peer's SyncStep1 with the room's state as
+  Update frames of at most 64 KiB, each of which integrates on its own,
+  followed by one SyncStep2 carrying only what no Update could. A receiver
+  applies one frame in one task, where one SyncStep2 of a megabyte was one
+  task of seconds. The frames of one answer are queued together, in order, so
+  nothing queued later — a SyncStatus among it — reaches the peer before that
+  SyncStep2, and the answer is charged to `Server.PeerWriteQueueBytes` on the
+  one decision the single frame it replaces got. A 1.22 MB state is 20 frames,
+  well inside the 512-frame default write queue. The connect handshake still
+  carries no state, and the slow-peer resync (`SlowPeerResync`) still sends
+  one full-state SyncStep2.
+
+### Tests
+
+- The answer to a SyncStep1 is asserted frame by frame: every frame within the
+  cap, nothing parked after each, exactly one SyncStep2 and it last, no
+  SyncStatus before it, and the rebuilt document equal to the room's. The
+  fixture is a document four clients wrote with interleaved edits, deletions
+  and nested maps, holding one text item larger than a frame.
+- `crdt.SplitUpdateV1` is covered for interleaved clients, nested types, a
+  receiver that already holds part of the document, supplementary characters,
+  an uncuttable struct and an empty document.
+
 ## [1.55.1-sami.2] — 2026-11-04
 
 Fork release on upstream main 510c2cf5, retaining the complete

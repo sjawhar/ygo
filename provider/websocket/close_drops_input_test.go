@@ -51,7 +51,9 @@ func TestInteg_WriteQueueFull_DropsBufferedInput(t *testing.T) {
 	var logs lockedLog
 	left := make(chan struct{})
 	srv := ygws.NewServer()
-	srv.PeerWriteQueueSize = 4
+	// Large enough for one answer's frames, so the flood is what fills the
+	// queue rather than the first ask.
+	srv.PeerWriteQueueSize = 16
 	srv.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 	srv.OnLoadDocument = func(_ context.Context, _ string, doc *crdt.Doc) error {
 		txt := doc.GetText("t")

@@ -1118,7 +1118,13 @@ type Server struct {
 	// CRDT's pending-structs machinery. Matches yrs-warp's bounded-broadcast
 	// pattern.
 	//
-	// Zero (the default) uses 512, sized for typical sync workloads.
+	// It must hold the frames of one answer to a SyncStep1, which carry the
+	// room's state 64 KiB at a time and end with a SyncStep2 (see
+	// stateFrameBytes in peer.go); a peer whose answer does not fit is closed
+	// as a slow peer is.
+	//
+	// Zero (the default) uses 512, sized for typical sync workloads: it holds
+	// the answer for a room of up to 32 MiB.
 	PeerWriteQueueSize int
 
 	// PeerWriteQueueBytes bounds the bytes queued for one peer beyond its

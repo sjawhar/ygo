@@ -1,3 +1,57 @@
+## v1.55.1-sami.3
+
+This fork release retains the complete
+[v1.55.1-sami.2 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2)
+and changes one thing: how the websocket provider answers a peer's SyncStep1.
+There are no wire format changes, and no caller has to change anything.
+
+### Why
+
+A client joining a large room was sent the room's whole state as one
+SyncStep2. A browser applies one Yjs update in one main-thread task, so a
+1.22 MB state was a single task of half a second to three and a half seconds —
+long enough to miss any frame budget, and nothing the client could break up.
+
+### What the server now sends
+
+The answer to a SyncStep1 is the same state in frames of at most 64 KiB:
+Update messages (type 2), and then one SyncStep2 (type 1), last. Each Update
+integrates on its own — once a client has applied one it holds every struct
+that frame carried and waits for none — so the receiver does one short task
+per frame. A split by byte length would not do this: a struct cut in half, or
+one that arrives before the struct it names, parks until a later frame. The
+cut is made over the structs of the update, so each frame is a dependency-
+closed set of them, and a text item longer than a frame is cut at a character
+boundary.
+
+Deletions ride in the frame that carries the structs they name, so a client
+never renders content a later frame deletes. The final SyncStep2 carries only
+what no Update could: the deletions of clocks no frame delivered, and the
+structs the server itself holds parked.
+
+The frames of one answer are queued together, in order, while the server
+handles the SyncStep1 and before it reads the client's next message. Nothing
+queued after them can overtake them, so a client that marks a document synced
+at its first SyncStep2 — `@hocuspocus/provider` does — sees it only once every
+Update is in, and no SyncStatus for a frame it sent next arrives first. A
+1.22 MB state is 20 frames, well inside the 512-frame default write queue
+(`Server.PeerWriteQueueSize`), and the answer is charged to
+`Server.PeerWriteQueueBytes` on the one decision the single frame it replaces
+got, so a peer that fit before still fits.
+
+The connect handshake is unchanged and still carries no state: a peer that
+sends no SyncStep1 is sent none. The slow-peer resync under `SlowPeerResync`
+is unchanged and still sends one full-state SyncStep2.
+
+### New API
+
+- `crdt.SplitUpdateV1(update, sv, maxBytes)` is the cut itself, over a V1
+  update, for a caller with its own transport.
+- `sync.EncodeSyncStep2Split(doc, step1msg, maxBytes)` is the answer, as sync
+  messages.
+
+Both are additions; `sync.EncodeSyncStep2` is unchanged.
+
 ## v1.55.1-sami.2
 
 This fork release retains the complete

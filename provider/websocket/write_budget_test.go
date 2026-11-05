@@ -264,10 +264,10 @@ func TestInteg_PeerWriteQueueBytes_LargeBroadcastKeepsAReadingPeer(t *testing.T)
 	sender := dialPipe(t, dialer, room)
 	doc := crdt.New(crdt.WithClientID(2))
 	sendUpdate(t, sender, textUpdate(doc, strings.Repeat("y", 256<<10)))
-	// Messages are handled in order, so this answer means the large broadcast
-	// is queued for the reader.
+	// Messages are handled in order, so this answer, read whole, means the
+	// large broadcast is queued for the reader.
 	require.NoError(t, askFullState(sender))
-	readOne(t, sender, 5*time.Second)
+	readAnswer(t, sender)
 	require.Eventually(t, func() bool {
 		queued, _ := ygws.PeerQueuedBytes(srv, room)
 		return queued == 0
@@ -299,9 +299,7 @@ func TestInteg_PeerWriteQueueBytes_ZeroKeepsTheFrameCapAlone(t *testing.T) {
 		require.NoError(t, askFullState(conn), "ask %d", i+1)
 	}
 	for i := range asks {
-		outerType, payload := readOne(t, conn, 5*time.Second)
-		require.Equal(t, uint64(0), outerType, "answer %d is a sync frame", i+1)
-		require.Greater(t, len(payload), docBytes, "answer %d is the full state", i+1)
+		assert.Greater(t, readAnswer(t, conn), docBytes, "answer %d is the full state", i+1)
 	}
 	queued, peers := ygws.PeerQueuedBytes(srv, room)
 	assert.Equal(t, 2, peers, "with no budget neither peer is closed")

@@ -14,7 +14,7 @@ import (
 
 // BenchmarkJoin_FragmentedRoom measures one joiner connecting to a room of
 // 20,000 typed-in-the-middle characters until it holds the room's state, and
-// reports the bytes of SyncStep2 it received.
+// reports the bytes of state it received.
 func BenchmarkJoin_FragmentedRoom(b *testing.B) {
 	for _, hocuspocus := range []bool{false, true} {
 		b.Run(framingName(hocuspocus), func(b *testing.B) {
@@ -35,18 +35,18 @@ func BenchmarkJoin_FragmentedRoom(b *testing.B) {
 			b.Cleanup(func() { _ = holder.Close() })
 			joinedSteps(b, holder, hocuspocus, "room", crdt.New(), true)
 
-			var step2Bytes int
+			var stateBytes int
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
 				conn, _, err := gws.DefaultDialer.Dial(wsURL(ts, "room"), nil)
 				require.NoError(b, err)
-				for _, f := range joinedSteps(b, conn, hocuspocus, "room", crdt.New(), true) {
-					step2Bytes += len(f)
+				for _, f := range stateFrames(joinedSteps(b, conn, hocuspocus, "room", crdt.New(), true)) {
+					stateBytes += f.bytes
 				}
 				_ = conn.Close()
 			}
-			b.ReportMetric(float64(step2Bytes)/float64(b.N), "step2-B/join")
+			b.ReportMetric(float64(stateBytes)/float64(b.N), "state-B/join")
 		})
 	}
 }
