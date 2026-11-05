@@ -55,13 +55,18 @@ wake and bounded-apply rollback restores it with the client clocks, so a
 later empty update can still drain a queue woken before the failed apply.
 The scan-budget take-back continues to restore queue slots, deleted ranges
 and the park record's drained list.
+Cache rebuilds skip emptied queue slots, so a clone accepts the same parked
+update resends as its source, including after an overlapping replacement.
+Default document UUIDs retain their v4 format and random bytes while direct
+hexadecimal encoding removes formatter-pool allocation variability.
 
 Deleted-content compatibility tests cover rooted items, both origins,
 garbage collection, snapshots and wide spans against Yjs. They protect the
 existing fix that marks deleted content deleted during integration; this
 test addition introduces no further runtime behavior change.
 
-The malformed-V2 relay corpus, clone tests and benchmarks, subdocument-copy
+The malformed-V2 relay corpus asserts convergence at both the case's cap
+and the `1<<20` control cap. Clone tests and benchmarks, the subdocument-copy
 refactor, `ChangedTypes`/`Parent` garbage-collection repair, scan-budget
 panic handling and post-garbage-collection update-log encoding remain
 included. Upstream pull requests #331, #332, #333, #335, #336, #338, #347,

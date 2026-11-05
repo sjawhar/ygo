@@ -10,6 +10,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestClone_SparsePendingQueueAcceptsResend(t *testing.T) {
+	// Client 2's clocks 5..8 park behind its missing clock 0. A GC
+	// replacement at clock 5 removes one of four slots without compacting.
+	first := []byte{1, 4, 2, 5, 1, 1, 1, 't', 1, 1, 1, 1, 't', 1, 1, 1, 1, 't', 1, 1, 1, 1, 't', 1, 0}
+	replacement := []byte{1, 1, 2, 5, 0, 1, 0}
+	for _, v2 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("v2=%v", v2), func(t *testing.T) {
+			doc := New(WithClientID(99), WithGC(false))
+			defer doc.Destroy()
+			require.NoError(t, applyVersioned(t, doc, v2, first))
+			require.NoError(t, applyVersioned(t, doc, v2, replacement))
+			require.Equal(t, 4, doc.PendingStats().Items)
+			clone := doc.Clone(WithClientID(98))
+			defer clone.Destroy()
+			require.NoError(t, applyVersioned(t, doc, v2, first), "original resend")
+			require.NoError(t, applyVersioned(t, clone, v2, first), "cloned resend")
+			require.Equal(t, doc.PendingStats(), clone.PendingStats())
+			require.Equal(t, EncodeStateAsUpdateV1(doc, nil), EncodeStateAsUpdateV1(clone, nil))
+		})
+	}
+}
+
 // ── Equivalence ──────────────────────────────────────────────────────────────
 
 // TestClone_Equivalence clones every document of the corpus and checks the

@@ -45,6 +45,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -467,7 +468,17 @@ func uuidV4() string {
 	}
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	var guid [36]byte
+	hex.Encode(guid[0:8], b[0:4])
+	guid[8] = '-'
+	hex.Encode(guid[9:13], b[4:6])
+	guid[13] = '-'
+	hex.Encode(guid[14:18], b[6:8])
+	guid[18] = '-'
+	hex.Encode(guid[19:23], b[8:10])
+	guid[23] = '-'
+	hex.Encode(guid[24:36], b[10:16])
+	return string(guid[:])
 }
 
 // NewClientID generates a fresh ClientID via crypto/rand.

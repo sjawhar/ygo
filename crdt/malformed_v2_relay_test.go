@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -87,6 +88,35 @@ func relayCase(t *testing.T, update []byte, limit, preload int) (diverged string
 // failed update that the relay does not carry.
 const parkedNotRelayed = "the room parked items the relay does not carry"
 
+func malformedV2ControlDiverged(t *testing.T, name string, preload int, why string) bool {
+	t.Helper()
+	if why == "" {
+		return false
+	}
+	t.Errorf("%s cap %d (control) preload %d: %s", name, 1<<20, preload, why)
+	return true
+}
+
+func TestMalformedV2_ControlDivergenceFails(t *testing.T) {
+	const helperEnv = "YGO_CONTROL_DIVERGENCE_HELPER"
+	if os.Getenv(helperEnv) == "1" {
+		malformedV2ControlDiverged(t, "control-regression.bin", 3, "state differs")
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMalformedV2_ControlDivergenceFails$")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("control divergence must fail the test process: err %v, output:\n%s", err, out)
+	}
+	for _, want := range []string{"control-regression.bin", "cap 1048576", "state differs"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("control failure omits %q: %s", want, out)
+		}
+	}
+}
+
 // Each malformed V2 update in testdata/malformed_v2 reaches the apply at its
 // cap, where before the delete-set walk refused it first. A peer that applies
 // what the room relays must end equal to the room: EncodeStateAsUpdateV1
@@ -148,7 +178,7 @@ func TestMalformedV2_RelayedLandedBytesConvergeThePeer(t *testing.T) {
 				t.Errorf("%s cap %d preload %d (apply err %v, %d landed bytes): %s", name, limit, preload, applyErr, len(landed), why)
 			}
 		}
-		if why, _, _ := relayCase(t, update, 1<<20, preload); why != "" {
+		if why, _, _ := relayCase(t, update, 1<<20, preload); malformedV2ControlDiverged(t, name, preload, why) {
 			controlDiverged++
 		}
 	}
@@ -160,7 +190,7 @@ func TestMalformedV2_RelayedLandedBytesConvergeThePeer(t *testing.T) {
 	}
 	t.Logf("%d cases (%d with a clock past 2^64): %d failed with landed bytes, %d failed with nothing landed, %d applied", cases, overflow, failedLanded, failedNothing, applied)
 	t.Logf("diverged at the case's cap: %d %v; at cap 1<<20 (control): %d", diverged, kinds, controlDiverged)
-	if diverged > 0 {
-		t.Errorf("%d of %d cases leave the peer unequal to the room", diverged, cases)
+	if diverged > 0 || controlDiverged > 0 {
+		t.Errorf("of %d cases, %d at the case's cap and %d at cap 1<<20 (control) leave the peer unequal to the room", cases, diverged, controlDiverged)
 	}
 }

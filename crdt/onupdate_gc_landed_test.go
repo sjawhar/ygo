@@ -62,5 +62,6 @@ func TestUnit_ApplyUpdateV1Landed_SuccessAllocatesNoMoreThanApply(t *testing.T) 
 		_, err := ApplyUpdateV1Landed(newTestDoc(2), update, nil)
 		require.NoError(t, err)
 	})
+	t.Logf("successful apply allocations: apply=%g landed=%g", apply, landed)
 	require.LessOrEqual(t, landed, apply)
 }

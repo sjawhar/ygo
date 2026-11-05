@@ -39,6 +39,8 @@ cancellation capability joins the composition. No wire format changes.
 - Updates check only clients whose clocks advanced when deciding whether to
   retry parked structs, rather than scanning every waiting client.
   `Doc.Clone` and bounded-apply rollback preserve a previously raised wake.
+- Pending-queue cache rebuilds skip emptied slots. A cloned document accepts
+  the same overlapping parked-update resends as its source.
 - `Server.Apply` honors cancellation while waiting for an existing room to
   load, releasing only that waiter's in-flight reference without invoking
   its callback or cancelling the shared load. (reearth/ygo#375)
@@ -54,6 +56,14 @@ cancellation capability joins the composition. No wire format changes.
   Yjs. This protects an existing integration fix. (reearth/ygo#340)
 - Retain the malformed-V2 relay corpus, clone API and tests, update-log
   replay checks, and every composition repair from 1.55.1-sami.1.
+- Assert malformed-V2 relay convergence at both the case's cap and the
+  `1<<20` control cap, reporting the cap and case on a control divergence.
+
+### Performance
+
+- **`crdt`: Default document UUIDs use two allocations.** Direct hexadecimal
+  encoding preserves the UUID format without the shared formatter pool that
+  made allocation comparisons vary by one object.
 
 ## [1.55.0] — 2026-10-31
 
