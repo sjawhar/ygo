@@ -1113,13 +1113,27 @@ func countDecodedRanges(txn *Transaction, n int) {
 
 // refuseRootOnBoundedDoc is ErrRootNotAllowed for name, a root type a remote
 // apply's decode is about to resolve on doc, when doc's allowed roots do not
-// list it; nil otherwise, which includes every decode outside an apply and
-// every apply whose list is empty (WithAllowedRoots). It records the name, so
-// the refusal reports which root the update named
-// (RefusedUpdateError.Root).
+// list it and doc does not hold it already; nil otherwise, which includes
+// every decode outside an apply and every apply whose list is empty
+// (WithAllowedRoots). It records the name, so the refusal reports which root
+// the update named (RefusedUpdateError.Root).
+//
+// A root doc already holds is left to the containment rule (checkItemRoot),
+// which refuses the update at the first item it integrates or deletes under
+// that root. The division is what the two checks are each for: this one says
+// a sender may not create a root the owner did not allow, and containment
+// says a sender may not add to or delete under one. Between them every
+// forged write is still refused, while an update that names a held root and
+// writes nothing under it is not: a peer handing back the whole state of a
+// document names every root the document holds, since the decode resolves
+// each struct's root as it reads it, before the integrate discovers the
+// struct is one the document already has and skips it.
 func refuseRootOnBoundedDoc(doc *Doc, name string) error {
 	t := doc.tally()
 	if t == nil || len(t.roots) == 0 || slices.Contains(t.roots, name) {
+		return nil
+	}
+	if _, held := doc.share[name]; held {
 		return nil
 	}
 	t.root = name

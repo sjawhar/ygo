@@ -161,8 +161,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the document holds already is subject to the list, and a root it does not
   hold yet is allowed by its name, so an allowed update may create it - the
   empty name is a name like any other, and a list that names it may create
-  it. A nil callback, or one answering a nil or empty slice, allows every
-  root, which is what a document without the option does. A document with a
+  it. The name check refuses only a root the document does not hold yet, and
+  leaves a root it holds to the containment rule, so a client handing back
+  the whole state of a document, which names every root the document holds
+  and writes nothing under them, is not refused. A nil callback, or one
+  answering a nil or empty slice, allows every root, which is what a
+  document without the option does. A document with a
   list is a bounded document, as one with an apply budget is, and its
   refusal is the one refusal that can be raised while a delete set is being
   applied: the rollback a refusal makes therefore gives a revived item's

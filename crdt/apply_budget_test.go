@@ -1585,3 +1585,84 @@ func writeAnyMap(enc *encoding.Encoder, n int) {
 		enc.WriteUint8(126)
 	}
 }
+
+// guardedHandoff is the whole state of a peer that holds guardedState and
+// then ran edit: an update naming every root the document holds, as a client
+// handing a document's whole state back does, carrying whatever edit wrote
+// on top of it.
+func guardedHandoff(t *testing.T, base string, client ClientID, edit func(txn *Transaction, text *YText, m *YMap)) []byte {
+	t.Helper()
+	peer := New(WithClientID(client))
+	if err := ApplyUpdateV1(peer, guardedState(t, base), nil); err != nil {
+		t.Fatalf("the peer refused the guarded state: %v", err)
+	}
+	text, m := peer.GetText("t"), peer.GetMap("m")
+	peer.Transact(func(txn *Transaction) { edit(txn, text, m) })
+	return EncodeStateAsUpdateV1(peer, nil)
+}
+
+// An update naming a root the document already holds is left to the
+// containment rule: the name check refuses only a root the document does not
+// hold, since creating one is what that check is for.
+//
+// Without the division a legitimate client is refused. A peer handing back
+// the whole state of a document names every root the document holds,
+// including one the owner allows no writes under, because the decode
+// resolves each struct's root as it reads the struct - before the integrate
+// discovers the struct is one the document already has and skips it. Such a
+// handoff integrates nothing and deletes nothing under that root, and used
+// to be refused all the same.
+func TestUnit_AllowedRoots_AHandoffNamingAHeldRootItDoesNotWriteUnderApplies(t *testing.T) {
+	const base = "hello world"
+	onlyText := func(any) []string { return []string{"t"} }
+
+	doc := guardedDoc(t, base)
+	doc.SetAllowedRoots(onlyText)
+	before := stateOf(doc)
+	if err := ApplyUpdateV1(doc, guardedState(t, base), nil); err != nil {
+		t.Fatalf("a handoff of the state the document already holds was refused: %v", err)
+	}
+	if after := stateOf(doc); after != before {
+		t.Fatalf("the handoff changed the document:\nbefore %+v\nafter  %+v", before, after)
+	}
+
+	// The same handoff carrying one new item under the root the list does
+	// not name is refused by the containment rule, and so is one deleting an
+	// item under it: what the name check stopped doing, containment does.
+	for name, c := range map[string]struct {
+		edit func(txn *Transaction, text *YText, m *YMap)
+	}{
+		"one new item under the held root": {func(txn *Transaction, _ *YText, m *YMap) { m.Set(txn, "k", "new") }},
+		"a delete under the held root":     {func(txn *Transaction, _ *YText, m *YMap) { m.Delete(txn, "k") }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			update := guardedHandoff(t, base, 2, c.edit)
+
+			guarded := guardedDoc(t, base)
+			guarded.SetAllowedRoots(onlyText)
+			guardedBefore := stateOf(guarded)
+			refused := requireRefused(t, guarded, guardedBefore, ApplyUpdateV1(guarded, update, nil), ErrRootNotAllowed)
+			if refused.Root != "m" {
+				t.Fatalf("the refusal reports root %q, want \"m\"", refused.Root)
+			}
+
+			// The control: the same update with no list changes the document.
+			open := guardedDoc(t, base)
+			requireApplied(t, open, stateOf(open), ApplyUpdateV1(open, update, nil))
+		})
+	}
+
+	// A root the document does not hold at all is still refused where the
+	// decode resolves its name, before anything under it is read.
+	fresh := guardedDoc(t, base)
+	fresh.SetAllowedRoots(onlyText)
+	freshBefore := stateOf(fresh)
+	refused := requireRefused(t, fresh, freshBefore,
+		ApplyUpdateV1(fresh, rootNamedUpdate("fresh", "first", " and more"), nil), ErrRootNotAllowed)
+	if refused.Root != "fresh" {
+		t.Fatalf("the refusal reports root %q, want \"fresh\"", refused.Root)
+	}
+	if refused.Structs != 0 {
+		t.Fatalf("the refusal reports %d structs, want none: the name check refuses before one integrates", refused.Structs)
+	}
+}
