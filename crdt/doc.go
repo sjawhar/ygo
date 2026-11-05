@@ -227,6 +227,144 @@ func (d *Doc) SetIntegrateScanBudget(budget func(origin any) int) {
 	d.integrateScanBudget = budget
 }
 
+// ApplyBudget bounds one remote apply. A field below zero is no limit; zero
+// allows nothing in that measure, so the zero value of the struct admits an
+// apply that decodes nothing, integrates no struct of its own and takes no
+// byte of content. A caller that wants a measure unbounded sets it to -1.
+//
+// Zero is "nothing" rather than "no limit" because the two strictest rules
+// are the useful ones: Structs: 0 is "this update may integrate no item of
+// its own", which still admits an update that only deletes text the document
+// holds (its splits add structs that Structs does not count, see Split), and
+// Bytes: 0 is "it may integrate no content byte". Neither can be said if zero
+// means no limit. A document with no budget callback at all is unbounded in
+// every measure, which is what a document without the option does
+// (WithApplyBudget).
+//
+// The three bound different costs, and a document that bounds what it takes
+// from a peer needs all three.
+//
+// Decoded bounds the apply's memory, which the two counts below cannot: a
+// frame of lib0 Any values integrates nothing when it names clocks the
+// document already holds, and still allocates about 32 bytes for each byte of
+// the frame while it decodes (a null is one byte on the wire and an interface
+// word and a slot in a []any once decoded), so a megabyte of frame reaches
+// tens of megabytes of heap before a count of what it integrated could refuse
+// it. It also bounds what an update can make the document do per byte: each
+// delete range it carries can split a struct the document holds, and a split
+// adds a struct no Structs count bounds (see Split).
+//
+// Structs keeps the document decodable. Its whole state is one update to its
+// next load, and every struct of it decodes and integrates then, so an owner
+// that lets a peer add a million one-character items has a document whose load
+// no longer fits the time or the memory it has for one.
+//
+// Bytes is the creep rule: a 64 KiB paste is one struct of one byte of wire
+// overhead per character, which no count of structs bounds.
+type ApplyBudget struct {
+	// Decoded is the values the apply may decode: each struct, each lib0 Any
+	// value at any depth, each Any map entry, each JSON member.
+	Decoded int
+	// Structs is the items the apply may integrate from the update, splits
+	// of items the document already held excluded.
+	Structs int
+	// Bytes is the bytes of content the apply may integrate.
+	Bytes int
+}
+
+// WithApplyBudget bounds what each remote update may decode and add by an
+// allowance of its own: as each remote apply (ApplyUpdate and its V1 and V2
+// forms) begins, the document calls budget with the apply's origin, and the
+// apply may decode at most ApplyBudget.Decoded values, integrate at most
+// ApplyBudget.Structs structs of its own and at most ApplyBudget.Bytes bytes
+// of content; a field below zero leaves that one apply unbounded in that
+// measure. The owner sizes each update's allowance by what it can see of the
+// update before applying it - its length, the peer it came from, what the
+// document holds already (StructCount) - keyed by the origin it applies it
+// with, as the scan budget is (WithIntegrateScanBudget).
+//
+// An update that passes its allowance is refused with ErrApplyBudget, and like
+// every remote update a bounded document refuses it leaves the document as it
+// was, fires no observer, and is returned as a RefusedUpdateError reporting
+// what the refused apply reached: Decoded, Structs, Bytes, and Split, the
+// structs it made by splitting items the document already held, which the
+// Structs budget does not count and no budget bounds. The decoded values are
+// counted as the apply decodes them, so a frame of them is refused before it
+// is all in memory; the structs and the bytes are counted as they integrate
+// and checked once the apply has integrated, which the decode count has
+// already bounded the heap for.
+//
+// Splits are excluded from Structs because a split costs the document nothing
+// lasting - it leaves the same content, and the commit merges the halves back
+// once the items between them are gone (tryMergeWithLefts) - and because the
+// caller needs "did this update integrate anything of its own" to be
+// answerable exactly: a budget of Structs: 1 must refuse an update that
+// integrates two characters whatever the deletes beside them split, and a
+// budget of Structs: 0 must take an update that only deletes.
+//
+// A document with an apply budget is a bounded document whatever budget
+// returns: it applies every remote update whole or not at all, and refuses a
+// remote update carrying a subdocument or a move. budget runs under the
+// document's lock, so it must not call the document. Local transactions are
+// never bounded.
+func WithApplyBudget(budget func(origin any) ApplyBudget) DocOption {
+	return func(d *Doc) { d.applyBudget = budget }
+}
+
+// SetApplyBudget sets the budget of WithApplyBudget on a document already
+// made, or with nil removes it, for an owner that loads trusted state first
+// and bounds what arrives after it. It takes the document lock.
+func (d *Doc) SetApplyBudget(budget func(origin any) ApplyBudget) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.applyBudget = budget
+}
+
+// WithAllowedRoots names the root types a remote update may write under on
+// this document: as each remote apply begins, the document calls roots with
+// the apply's origin, and an update that names, integrates under or deletes
+// under any root outside the answer is refused with ErrRootNotAllowed, rolled
+// back whole as every refusal of a bounded document is, and returned as a
+// RefusedUpdateError whose Root is the root's name. A nil callback, or one
+// answering a nil or empty slice, allows every root, which is what a document
+// without the option does.
+//
+// The list is a containment rule over the whole update, not a rule about the
+// names it writes on the wire. An update names a root only where its decode
+// resolves one by name - the first item of a root, or a map key whose slot is
+// empty - and an item written beside items the document already holds names
+// no root at all, since it inherits its parent from the item its origin
+// names, nor does a delete range. So the apply also walks up the parents of
+// every item it integrates or deletes, and refuses the update when that walk
+// reaches a root the list does not name: without it a sender could overwrite
+// and delete inside a root it may not touch, and only a root with nothing in
+// it would be guarded. An item under a nested type is contained by the root
+// above that type, so an update writing deep inside an allowed root is
+// allowed; an item whose parents reach no root of the document is refused,
+// since the owner cannot have allowed what is under no root of theirs.
+//
+// The list is what the owner allows the update to write under, not what the
+// document holds: a root the document holds already is refused too when the
+// list does not name it, since an owner that keeps a root of its own beside
+// the ones a peer may write needs the peer's updates refused when they reach
+// into it. A root the document does not hold yet is allowed by its name, so
+// an update the list allows may create it.
+//
+// A document with an allowed-roots list is a bounded document, as one with an
+// apply budget is. roots runs under the document's lock, so it must not call
+// the document, and the answer is read once per apply and not retained.
+func WithAllowedRoots(roots func(origin any) []string) DocOption {
+	return func(d *Doc) { d.allowedRoots = roots }
+}
+
+// SetAllowedRoots sets the list of WithAllowedRoots on a document already
+// made, or with nil removes it. It takes the document lock.
+func (d *Doc) SetAllowedRoots(roots func(origin any) []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.allowedRoots = roots
+}
+
 // updateSub pairs a unique subscription ID with its callback so that
 // unsubscribe closures can find and remove the right entry even when
 // callbacks are removed out-of-order.
@@ -282,6 +420,16 @@ type Doc struct {
 	// WithIntegrateScanBudget, which takes the bound's place while set.
 	maxIntegrateScan    int
 	integrateScanBudget func(origin any) int
+	// applyBudget is the budget of WithApplyBudget and allowedRoots the list
+	// of WithAllowedRoots, each nil for none. applying is the running tally
+	// of the remote apply on this document, between beginRemoteApply and
+	// endRemoteApply and nil at every other time: the decode counts against
+	// the budget through the document, since the decoders it counts in are
+	// shared with the merge and snapshot decoders, which have no apply and
+	// pass a document that holds no tally (applyTally).
+	applyBudget  func(origin any) ApplyBudget
+	allowedRoots func(origin any) []string
+	applying     *applyTally
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -420,11 +568,32 @@ func (d *Doc) detachSubdoc(item *Item) {
 	}
 }
 
-// scanBounded is whether d bounds the conflict scans of its remote updates, by
-// a bound (WithMaxIntegrateScan) or a budget (WithIntegrateScanBudget), and so
-// applies each whole or not at all. Its caller holds d.mu.
+// reattachSubdoc puts back the links detachSubdoc dropped, where the apply
+// that deleted item is rolled back whole and item is alive again
+// (applyJournal.rollBackTo). Without it a refused update leaves the
+// subdocument detached though the document still holds the item that carries
+// it: Load would set shouldLoad and tell no one, because a detached
+// subdocument has no parent to open a transaction on.
+func (d *Doc) reattachSubdoc(item *Item, parent *Doc) {
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
+	if d.item == nil && d.detached {
+		d.item, d.parent, d.detached = item, parent, false
+	}
+}
+
+// scanBounded is whether d bounds what its remote updates may do, by a scan
+// bound (WithMaxIntegrateScan), a scan budget (WithIntegrateScanBudget), an
+// apply budget (WithApplyBudget) or an allowed-roots list (WithAllowedRoots),
+// and so applies each whole or not at all. Its caller holds d.mu.
+//
+// The budget and the list are in it because their refusals are rollbacks like
+// the scan bound's: a document that refuses an apply keeps the journal
+// beginRemoteApply takes, and without it there would be nothing to roll an
+// apply back to and the refused update would stand, half integrated.
 func (d *Doc) scanBounded() bool {
-	return d.integrateScanBudget != nil || d.maxIntegrateScan > 0
+	return d.integrateScanBudget != nil || d.maxIntegrateScan > 0 ||
+		d.applyBudget != nil || d.allowedRoots != nil
 }
 
 // applyScanLimit is the most items the conflict scans of a remote apply with
@@ -444,10 +613,32 @@ func (d *Doc) applyScanLimit(origin any) int {
 func (d *Doc) callIntegrateScanBudget(origin any) (n int) {
 	defer func() {
 		if r := recover(); r != nil {
-			panic(budgetCallbackPanic{r})
+			panic(budgetCallbackPanic{"WithIntegrateScanBudget", r})
 		}
 	}()
 	return d.integrateScanBudget(origin)
+}
+
+// callApplyBudget calls the WithApplyBudget callback, tagging a panic it
+// raises as callIntegrateScanBudget does; the caller holds d.mu.
+func (d *Doc) callApplyBudget(origin any) (budget ApplyBudget) {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{"WithApplyBudget", r})
+		}
+	}()
+	return d.applyBudget(origin)
+}
+
+// callAllowedRoots calls the WithAllowedRoots callback, tagging a panic it
+// raises as callIntegrateScanBudget does; the caller holds d.mu.
+func (d *Doc) callAllowedRoots(origin any) (roots []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{"WithAllowedRoots", r})
+		}
+	}()
+	return d.allowedRoots(origin)
 }
 
 // maxPendingItemsLimit returns the effective cap on the pending queue depth.
@@ -1266,6 +1457,18 @@ func (d *Doc) StateVector() StateVector {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.store.StateVector()
+}
+
+// StructCount is how many structs the document holds: the items of every
+// client, deleted ones and the placeholders of collected ones included, which
+// is the count an owner sizes an apply budget against (WithApplyBudget) and
+// the count that decides what a load of the document's whole state costs. It
+// takes the document's read lock, and so must not be called inside a Transact
+// callback (see Transact and GetText; issue #138).
+func (d *Doc) StructCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.store.Count()
 }
 
 // EncodeStateAsUpdate encodes the full document state as a V1 binary update.

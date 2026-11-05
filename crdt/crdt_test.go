@@ -1572,7 +1572,7 @@ func TestUnit_DeleteSet_EncodedClientOrder(t *testing.T) {
 
 	enc := encoding.NewEncoder()
 	encodeDeleteSet(enc, ds)
-	got, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
+	got, _, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
 	require.NoError(t, err)
 	assert.Equal(t, want, got.orderedClients(), "V1")
 
@@ -1580,7 +1580,7 @@ func TestUnit_DeleteSet_EncodedClientOrder(t *testing.T) {
 	encodeDeleteSetV2(enc2, ds)
 	dec2, err := newV2Decoder(enc2.toBytes())
 	require.NoError(t, err)
-	got2, err := decodeDeleteSetV2(dec2)
+	got2, _, err := decodeDeleteSetV2(dec2)
 	require.NoError(t, err)
 	assert.Equal(t, want, got2.orderedClients(), "V2")
 }
@@ -1593,7 +1593,7 @@ func TestUnit_DecodeDeleteSet_CompactsRangesReadBeforeAnError(t *testing.T) {
 	for _, v := range []uint64{1, 7, 3, 0, 2, 1, 2, 5} {
 		enc.WriteVarUint(v)
 	}
-	ds, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
+	ds, _, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
 	require.Error(t, err)
 	assert.Equal(t, []DeleteRange{{Clock: 0, Len: 3}}, ds.clients[7], "V1")
 
@@ -1610,7 +1610,7 @@ func TestUnit_DecodeDeleteSet_CompactsRangesReadBeforeAnError(t *testing.T) {
 	b := enc2.toBytes()
 	dec2, err := newV2Decoder(b[:len(b)-1])
 	require.NoError(t, err)
-	ds, err = decodeDeleteSetV2(dec2)
+	ds, _, err = decodeDeleteSetV2(dec2)
 	require.Error(t, err)
 	assert.Equal(t, []DeleteRange{{Clock: 0, Len: 3}}, ds.clients[7], "V2")
 }

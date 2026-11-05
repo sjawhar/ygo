@@ -114,16 +114,16 @@ func TestUnit_WalkGroups_TheWalkReadsWhatTheFullScanReads(t *testing.T) {
 			}
 			var wantDS DeleteSet
 			if format.v2 {
-				wantDS, err = decodeDeleteSetV2(full.v2)
+				wantDS, _, err = decodeDeleteSetV2(full.v2)
 			} else {
-				wantDS, err = decodeDeleteSet(full.rest)
+				wantDS, _, err = decodeDeleteSet(full.rest)
 			}
 			if err != nil {
 				t.Fatalf("round %d %s: the full scan's delete set does not read: %v", round, format.name, err)
 			}
 
 			b := pendingBudget{update: update, v2: format.v2}
-			gotDS, err := deleteSetOf(&b)
+			gotDS, _, err := deleteSetOf(&b)
 			if err != nil {
 				t.Fatalf("round %d %s: deleteSetOf: %v", round, format.name, err)
 			}

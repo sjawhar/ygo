@@ -42,9 +42,12 @@ type pendingBudget struct {
 	clocks StateVector
 	// deleteSet is the update's delete set once the parked-range check read
 	// it whole from deleteSetBytes, the bytes the apply's decoder reaches after
-	// the structs, so the apply does not decode it again.
-	deleteSet     DeleteSet
-	deleteSetRead bool
+	// the structs, so the apply does not decode it again, and
+	// deleteSetRanges is how many ranges that read took off the frame, which
+	// is what the apply counts (countDecodedRanges).
+	deleteSet       DeleteSet
+	deleteSetRead   bool
+	deleteSetRanges int
 }
 
 func newPendingBudget(doc *Doc, initial StateVector, update []byte, v2 bool) pendingBudget {

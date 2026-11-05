@@ -12,6 +12,7 @@ import (
 	"sort"
 
 	"github.com/reearth/ygo/encoding"
+	"github.com/reearth/ygo/internal/anycodec"
 )
 
 // Wire content type tags matching the Yjs V1 protocol.
@@ -49,19 +50,37 @@ var ErrIntegrateScanBudget = fmt.Errorf("%w: its conflict scans pass more items 
 
 // RefusedUpdateError is the error ApplyUpdateV1 and ApplyUpdateV2 return for a
 // remote update a bounded document (WithMaxIntegrateScan,
-// WithIntegrateScanBudget) refused and took back. The refused apply commits no
-// transaction an observer sees, so this error is what reports the work it did.
+// WithIntegrateScanBudget, WithApplyBudget, WithAllowedRoots) refused and took
+// back. The refused apply commits no transaction an observer sees, so this
+// error is what reports the work it did.
 //
 // Err is why the update was refused: ErrIntegrateScanBudget when its scans
-// reached the apply's limit, otherwise an error wrapping ErrInvalidUpdate.
-// Unwrap returns it, so errors.Is matches either, and Error is its message.
+// reached the apply's limit, ErrApplyBudget when it decoded or added more than
+// its budget allows, ErrRootNotAllowed when it named a root the document does
+// not allow, otherwise an error wrapping ErrInvalidUpdate. Unwrap returns it,
+// so errors.Is matches either, and Error is its message.
+//
 // Scanned is the number of items the refused apply's conflict scans passed,
 // counted as Transaction.IntegrateScanned counts them for an apply that
 // commits: never more than the apply's limit, and exactly the limit when the
 // scans reached it.
+//
+// Decoded, Structs and Bytes are what the refused apply reached of the three
+// counts of ApplyBudget, and Split is the structs it made by splitting items
+// the document already held, which the Structs budget does not count and no
+// budget bounds: a caller that asks "did this update integrate anything of its
+// own" reads Structs, and one that wants to know what the document did for it
+// reads Split too. They are counted on every bounded document, whether or not
+// a budget bounds them. Root is the root type an update refused with
+// ErrRootNotAllowed named, and empty for every other refusal.
 type RefusedUpdateError struct {
 	Err     error
 	Scanned int
+	Decoded int
+	Structs int
+	Bytes   int
+	Split   int
+	Root    string
 }
 
 // Error is the message of the error the update was refused for, or a bare
@@ -81,11 +100,29 @@ func (e *RefusedUpdateError) Unwrap() error { return e.Err }
 // applyV1Txn and applyV2Txn recover it as ErrIntegrateScanBudget.
 type integrateScanBudgetExceeded struct{}
 
-// budgetCallbackPanic wraps a panic the WithIntegrateScanBudget callback
-// raised, so recoveredApplyErr names the callback rather than item integration.
-// callIntegrateScanBudget tags it; the apply runs the callback inside its own
-// panic recovery (beginRemoteApply).
-type budgetCallbackPanic struct{ v any }
+// applyBudgetExceeded is the panic the decode counters raise when a remote
+// apply has decoded more values than its budget allows (applyTally.decode),
+// inside the decode loop so that the frame is refused as it is read rather
+// than once it is all in memory; applyV1Txn and applyV2Txn recover it as
+// ErrApplyBudget.
+type applyBudgetExceeded struct{}
+
+// rootNotAllowed is the panic the containment check raises when a remote
+// apply integrates or deletes an item under a root the document's
+// allowed-roots list does not name (applyTally.checkItemRoot), where the
+// apply is past the decode and has no error to return; applyV1Txn and
+// applyV2Txn recover it as ErrRootNotAllowed.
+type rootNotAllowed struct{}
+
+// budgetCallbackPanic wraps a panic one of the document's apply callbacks
+// raised, with the option that sets it, so recoveredApplyErr names the
+// callback rather than item integration. Doc.callIntegrateScanBudget,
+// Doc.callApplyBudget and Doc.callAllowedRoots tag it; the apply runs the
+// callbacks inside its own panic recovery (beginRemoteApply).
+type budgetCallbackPanic struct {
+	option string
+	v      any
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -785,10 +822,21 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 		return err
 	}
 
-	ds, dsErr := budget.deleteSet, error(nil)
-	if !budget.deleteSetRead {
-		ds, dsErr = decodeDeleteSet(dec)
+	// 3. The struct and byte budget is read here, where the apply has
+	//    integrated every struct it is going to and nothing has been deleted
+	//    or drained yet (refuseOverBudget).
+	if err := refuseOverBudget(txn); err != nil {
+		return err
 	}
+
+	ds, dsRanges, dsErr := budget.deleteSet, budget.deleteSetRanges, error(nil)
+	if !budget.deleteSetRead {
+		ds, dsRanges, dsErr = decodeDeleteSet(dec)
+	}
+	// The ranges are values the apply decoded, counted as the decode read
+	// them and before one of them deletes or splits anything
+	// (countDecodedRanges).
+	countDecodedRanges(txn, dsRanges)
 	if err := applyDecodedDeleteSet(txn, ds, dsErr); err != nil {
 		return err
 	}
@@ -800,6 +848,16 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 // integrate, so one that fails partway drains on what it kept, as a peer
 // applying its update does; a drain error is its error only when err is nil.
 // On a bounded document the drain is a phase of its own (drainParked).
+//
+// It raises no refusal of its own, and neither does endRemoteApply: an apply
+// past its struct or byte budget was refused before the delete set, two
+// phases earlier (refuseOverBudget). A drain that succeeds gives up the
+// record of what it changed in the parked items it integrated (drainParked
+// clears parkedAs, since until the apply budget existed no rollback of the
+// whole apply could follow a successful drain), and the rollback a refusal
+// makes restores the pending queue's pointers but cannot put that content
+// back: a parked "BC" the drain trimmed to "C" would stay trimmed, and this
+// node would keep a document every peer disagrees with.
 func drainAfterApply(txn *Transaction, err error) (retErr error) {
 	retErr = err
 	defer func() {
@@ -857,6 +915,13 @@ func decodeStructs(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 
 		kept := false // Yjs's rest takes a client's structs from one that waits
 		for j := uint64(0); j < numStructs; j++ {
+			// Each struct is a value the apply decodes, counted before it is
+			// read so that a budget refuses the one past it rather than the
+			// one after (applyTally.decode); the values its content carries
+			// are counted as decodeContent reads them. The count is taken
+			// here, in the apply's own loop, and not in decodeItem, which the
+			// merge decoders share.
+			txn.doc.tally().decode(1)
 			item, err := decodeItem(dec, txn.doc, client, clock)
 			if err != nil {
 				return nil, nil, 0, err
@@ -942,6 +1007,8 @@ func integrateGroup(txn *Transaction, group []*Item, existingEnd uint64, pending
 				item.ID.Clock += offset
 				item.Content = item.Content.Splice(offset)
 			}
+			// A struct of the update that enters the store (noteIntegrated).
+			noteIntegrated(txn, item)
 			txn.doc.store.Append(item)
 			// A deferred move whose target is in this GC struct stops waiting.
 			txn.doc.store.resolvePendingMoves(txn, item.ID.Client)
@@ -983,7 +1050,7 @@ func integrateGroup(txn *Transaction, group []*Item, existingEnd uint64, pending
 		if rightIsGC(txn, item) {
 			item.Left = nil
 			item.markGCOrphan()
-			appendTrimmed(store, item, existingEnd)
+			appendTrimmed(txn, item, existingEnd)
 			// A deferred move whose target is in this GC struct stops waiting.
 			store.resolvePendingMoves(txn, item.ID.Client)
 			existingEnd = itemEnd
@@ -1219,9 +1286,15 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 			return nil, err
 		}
 		if parentInfo == 1 {
-			// Named root type.
+			// Named root type. A document with an allowed-roots list refuses
+			// the update here, before the name is resolved, so a name it does
+			// not allow does not reach d.share even for the rollback to take
+			// out again (WithAllowedRoots).
 			name, err := dec.ReadVarString()
 			if err != nil {
+				return nil, err
+			}
+			if err := refuseRootOnBoundedDoc(doc, name); err != nil {
 				return nil, err
 			}
 			parent = doc.getOrCreateType(name)
@@ -1333,11 +1406,19 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if n > uint64(dec.Remaining()) {
 			return nil, ErrInvalidUpdate
 		}
+		// The declared count is charged before the list is allocated for it,
+		// so a length the budget cannot hold is refused before one byte is
+		// taken for it; what each member then holds is counted off the value
+		// the text decoded to, which a JSON text's own bytes bound
+		// (WithApplyBudget).
+		tally := doc.tally()
+		tally.decode(int(n))
 		if n == 0 || !isAnyTag(dec.RemainingBytes()[0]) {
 			vals, err := readJSONVals(dec, n)
 			if err != nil {
 				return nil, err
 			}
+			tally.nestedAll(vals)
 			return NewContentJSON(vals...), nil
 		}
 		// ygo ≤1.51.0 wrote lib0 Any per value, always starting with a tag
@@ -1351,11 +1432,13 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 			for range len(rem) - sub.Remaining() {
 				_, _ = dec.ReadUint8()
 			}
+			tally.nestedAll(vals)
 			return NewContentJSON(vals...), nil
 		}
 		if vals, err = readLegacyAnyVals(dec, n); err != nil {
 			return nil, jsonErr
 		}
+		tally.nestedAll(vals)
 		return NewContentJSON(vals...), nil
 
 	case wireBinary:
@@ -1384,6 +1467,7 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		doc.tally().value(v)
 		return NewContentEmbed(v), nil
 
 	case wireFormat:
@@ -1399,6 +1483,7 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		doc.tally().value(val)
 		return NewContentFormat(key, val), nil
 
 	case wireType:
@@ -1420,6 +1505,10 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if n > uint64(dec.Remaining()) {
 			return nil, ErrInvalidUpdate
 		}
+		// Every value is counted off the frame first, before the list is
+		// allocated and before one value is built, so a declared length past
+		// what the budget has left costs no memory at all (countAnyRun).
+		countAnyRun(doc.tally(), dec, n)
 		vals := make([]any, n)
 		for i := range vals {
 			if vals[i], err = dec.ReadAny(); err != nil {
@@ -1434,6 +1523,7 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		countAnyRun(doc.tally(), dec, 1)
 		optsAny, err := dec.ReadAny()
 		if err != nil {
 			return nil, err
@@ -1520,8 +1610,10 @@ func decodeTypeContent(dec *encoding.Decoder, doc *Doc, typeClass byte) (*abstra
 }
 
 // decodeDeleteSet returns the ranges it read in full, sorted and merged per
-// client, also on an error, since Yjs has applied those by then.
-func decodeDeleteSet(dec *encoding.Decoder) (ds DeleteSet, err error) {
+// client, also on an error, since Yjs has applied those by then, and ranges,
+// how many it read before that sort and merge: what an apply counts against
+// its budget, since the set it gets back may hold fewer (countDecodedRanges).
+func decodeDeleteSet(dec *encoding.Decoder) (ds DeleteSet, ranges int, err error) {
 	defer func() {
 		for c := range ds.clients {
 			ds.sortAndCompact(c)
@@ -1529,7 +1621,7 @@ func decodeDeleteSet(dec *encoding.Decoder) (ds DeleteSet, err error) {
 	}()
 	n, err := dec.ReadVarUint()
 	if err != nil {
-		return newOrderedDeleteSet(), err
+		return newOrderedDeleteSet(), 0, err
 	}
 	// A first pass on a copy of the cursor counts each client's ranges, so the
 	// decode sizes every list once; an entry with a range takes at least four
@@ -1538,14 +1630,14 @@ func decodeDeleteSet(dec *encoding.Decoder) (ds DeleteSet, err error) {
 	scanErr := readDeleteSet(&scan, n, tally.count)
 	if len(tally.clients) == 0 {
 		*dec = scan // the pass read what the decode would, and added nothing
-		return newOrderedDeleteSet(), scanErr
+		return newOrderedDeleteSet(), 0, scanErr
 	}
 	tally.merge()
 	ds = tally.deleteSet()
 	err = readDeleteSet(dec, n, func(client ClientID, r DeleteRange, _ bool) {
 		ds.appendDecoded(client, r, &tally)
 	})
-	return ds, err
+	return ds, tally.total(), err
 }
 
 // readDeleteSet reads the n client entries of a V1 delete set, calling add for
@@ -1640,15 +1732,21 @@ func structEnd(clock, n uint64) (uint64, error) {
 // wrapUpdateErr names err as an invalid update once: an error that already is
 // one is returned as it is.
 // recoveredApplyErr is the error an apply returns for a panic it recovered:
-// ErrIntegrateScanBudget for the scan bound's own panic, a message naming the
-// WithIntegrateScanBudget callback for a panic it raised, otherwise
-// ErrInvalidUpdate naming the panic from integrating the update.
+// ErrIntegrateScanBudget for the scan bound's own panic, ErrApplyBudget for
+// the decode counters' (applyTally.decode), ErrRootNotAllowed for the root
+// containment check's (applyTally.checkItemRoot), a message naming the
+// callback that raised a panic, otherwise ErrInvalidUpdate naming the panic
+// from integrating the update.
 func recoveredApplyErr(r any) error {
 	switch r := r.(type) {
 	case integrateScanBudgetExceeded:
 		return ErrIntegrateScanBudget
+	case applyBudgetExceeded:
+		return ErrApplyBudget
+	case rootNotAllowed:
+		return ErrRootNotAllowed
 	case budgetCallbackPanic:
-		return fmt.Errorf("%w: panic in the WithIntegrateScanBudget callback: %v", ErrInvalidUpdate, r.v)
+		return fmt.Errorf("%w: panic in the %s callback: %v", ErrInvalidUpdate, r.option, r.v)
 	}
 	return integrationPanicErr(r)
 }
@@ -1733,6 +1831,90 @@ func fmtValFromJSON(s string) (any, error) {
 // isAnyTag reports whether b is a lib0 Any type tag.
 func isAnyTag(b byte) bool { return b >= 116 && b <= 127 }
 
+// countAnyRun charges t for the n lib0 Any values dec is about to read, and
+// for everything inside them, reading the frame's own bytes on a cursor of
+// its own and leaving dec where it found it.
+//
+// It counts off the wire rather than off the values the decode builds, which
+// is what makes Decoded bound the apply's memory rather than report it
+// afterwards:
+//
+//   - a declared length is charged before anything is allocated for it, so a
+//     frame declaring two million values under a budget of one is refused
+//     having allocated 2,368 bytes, within a few hundred of the 2,144 a
+//     one-value frame allocates, where charging it after the list was made
+//     allocated 32,008,272;
+//   - every entry of a map is counted as it is read, where a count taken off
+//     the decoded Go map counts only the entries that survived - a hundred
+//     thousand entries that share a key are one entry there, and were
+//     admitted by a budget of three.
+//
+// The scan allocates nothing: it reads strings and binary as the bytes they
+// alias. It stops without an error at the first byte it cannot read, at a
+// length the decoders will not accept, or past the depth they allow
+// (anycodec.MaxDepth, anycodec.MaxElements): the decode that follows reads
+// the same bytes and reports the fault, and a frame the budget would refuse
+// for what the scan could not reach is refused by the decode instead.
+func countAnyRun(t *applyTally, dec *encoding.Decoder, n uint64) {
+	if t == nil {
+		return
+	}
+	// A copy of the cursor, as decodeDeleteSet's counting pass takes one:
+	// the scan reads the same bytes and leaves dec where it found it.
+	scan := *dec
+	for range n {
+		if !countAnyValue(t, &scan, 0) {
+			return
+		}
+	}
+}
+
+// countAnyValue charges t for one lib0 Any value at depth and everything
+// inside it, and reports whether it read the whole value.
+func countAnyValue(t *applyTally, dec *encoding.Decoder, depth int) bool {
+	if depth > anycodec.MaxDepth {
+		return false
+	}
+	t.decode(1)
+	tag, err := dec.ReadUint8()
+	if err != nil {
+		return false
+	}
+	switch tag {
+	case 127, 126, 120, 121: // undefined, null, true, false
+		return true
+	case 125:
+		_, err = dec.ReadVarInt()
+	case 124:
+		_, err = dec.ReadFloat32()
+	case 123:
+		_, err = dec.ReadFloat64()
+	case 122:
+		_, err = dec.ReadBigInt64()
+	case 119, 116: // string, binary: read as the bytes they alias
+		_, err = dec.ReadVarBytes()
+	case 117, 118: // array, map
+		elements, err := dec.ReadVarUint()
+		if err != nil || elements > anycodec.MaxElements || elements > uint64(dec.Remaining()) {
+			return false
+		}
+		for range elements {
+			if tag == 118 {
+				if _, err := dec.ReadVarBytes(); err != nil {
+					return false
+				}
+			}
+			if !countAnyValue(t, dec, depth+1) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+	return err == nil
+}
+
 // readJSONVals reads n ContentJSON values in Yjs's JSON-text form.
 func readJSONVals(dec *encoding.Decoder, n uint64) ([]any, error) {
 	vals := make([]any, n)
@@ -1783,13 +1965,16 @@ func jsonNumbers(v any) any {
 
 // appendTrimmed stores an item without integrating it, dropping the prefix the
 // store already has for its client. existingEnd must be at least the item's
-// clock.
-func appendTrimmed(store *StructStore, item *Item, existingEnd uint64) {
+// clock. It takes the transaction rather than the store so that a struct of
+// the update that enters the store this way is checked and counted like one
+// that integrates (noteIntegrated, WithApplyBudget).
+func appendTrimmed(txn *Transaction, item *Item, existingEnd uint64) {
 	if offset := existingEnd - item.ID.Clock; offset > 0 {
 		item.ID.Clock += offset
 		item.Content = item.Content.Splice(offset)
 	}
-	store.Append(item)
+	noteIntegrated(txn, item)
+	txn.doc.store.Append(item)
 }
 
 // errGCContinuation refuses an item whose new clocks follow its client's GC
@@ -1944,7 +2129,7 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 	// contiguous per-client list. The guards above leave clock <= existingEnd
 	// here, so the offset is never negative.
 	if item.Parent == nil && item.Deleted {
-		appendTrimmed(store, item, existingEnd)
+		appendTrimmed(txn, item, existingEnd)
 		store.resolvePendingMoves(txn, item.ID.Client)
 		return true, 0, nil
 	}
@@ -2008,7 +2193,7 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 			// which diverges by integration order (#156). Store it as the GC
 			// struct Yjs integrates it as.
 			item.markGCOrphan()
-			appendTrimmed(store, item, existingEnd)
+			appendTrimmed(txn, item, existingEnd)
 			store.resolvePendingMoves(txn, item.ID.Client)
 			return true, 0, nil
 		}
@@ -2062,7 +2247,7 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 	if (item.Left != nil && item.Left.isGCOrphan()) || typeCollected(item.Parent) || rightIsGC(txn, item) {
 		item.Left = nil
 		item.markGCOrphan()
-		appendTrimmed(store, item, existingEnd)
+		appendTrimmed(txn, item, existingEnd)
 		store.resolvePendingMoves(txn, item.ID.Client)
 		return true, 0, nil
 	}
