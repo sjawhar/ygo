@@ -2,8 +2,9 @@
 
 This fork release retains the complete
 [v1.55.1-sami.2 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2)
-and changes one thing: how the websocket provider answers a peer's SyncStep1.
-There are no wire format changes, and no caller has to change anything.
+and changes how the websocket provider answers a peer's SyncStep1. It also
+makes the Redis awareness replay test deterministic. There are no wire format
+changes or additional breaking changes beyond those declared in v1.55.1-sami.2.
 
 ### Why
 
@@ -14,15 +15,20 @@ long enough to miss any frame budget, and nothing the client could break up.
 
 ### What the server now sends
 
-The answer to a SyncStep1 is the same state in frames of at most 64 KiB:
-Update messages (type 2), and then one SyncStep2 (type 1), last. Each Update
-integrates on its own — once a client has applied one it holds every struct
+The answer to a SyncStep1 is the same state in Update messages (type 2)
+targeting frames of at most 64 KiB, and then one SyncStep2 (type 1), last.
+Each Update integrates on its own — once a client has applied one it holds every struct
 that frame carried and waits for none — so the receiver does one short task
 per frame. A split by byte length would not do this: a struct cut in half, or
 one that arrives before the struct it names, parks until a later frame. The
 cut is made over the structs of the update, so each frame is a dependency-
 closed set of them, and a text item longer than a frame is cut at a character
 boundary.
+
+Content occupying a single clock cannot be cut and is carried whole even
+when it exceeds the cap. The final SyncStep2 can also exceed the cap when
+the server holds parked structs; these exceptions are documented on
+`crdt.SplitUpdateV1`.
 
 Deletions ride in the frame that carries the structs they name, so a client
 never renders content a later frame deletes. The final SyncStep2 carries only
@@ -51,6 +57,20 @@ is unchanged and still sends one full-state SyncStep2.
   messages.
 
 Both are additions; `sync.EncodeSyncStep2` is unchanged.
+
+### Cost
+
+Each join adds one full update decode and encode. The measured 1.22 MB
+document uses about 0.02% more bytes on the wire. The default write queue
+remains 512 frames.
+
+### Redis awareness test
+
+The Redis stream-reader test fixes one awareness read's cursor to the
+existing tail after sync replay reaches the sink, then holds that read
+until the live witness is published. Both positive delivery witnesses and
+the stale-presence rejection remain. This changes only the test: production
+Redis commands and awareness replay policy are unchanged.
 
 ## v1.55.1-sami.2
 

@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Fork release on the [1.55.1-sami.2 composition](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2).
 The websocket provider answers a peer's SyncStep1 with the room's state in
 bounded frames instead of one message. No wire format changes: every frame is
-an ordinary y-protocols sync message.
+an ordinary y-protocols sync message. No additional breaking changes beyond
+those declared in 1.55.1-sami.2.
 
 ### Added
 
@@ -23,7 +24,8 @@ an ordinary y-protocols sync message.
   sender itself holds parked. A text item longer than `maxBytes` is cut at a
   character boundary, never inside one.
 - `sync.EncodeSyncStep2Split(doc, step1msg, maxBytes)` answers a step-1
-  message with that series as sync messages, each at most `maxBytes` long:
+  message with that series as sync messages, targeting `maxBytes` per message
+  with the same uncuttable-content and final-message exceptions:
   Update messages (type 2) and then one SyncStep2 (type 1), last. A receiver
   that applies them in order holds exactly what `EncodeSyncStep2`'s one
   message would have left it holding.
@@ -31,8 +33,10 @@ an ordinary y-protocols sync message.
 ### Changed
 
 - The websocket provider answers a peer's SyncStep1 with the room's state as
-  Update frames of at most 64 KiB, each of which integrates on its own,
-  followed by one SyncStep2 carrying only what no Update could. A receiver
+  Update frames targeting at most 64 KiB, each of which integrates on its own,
+  followed by one SyncStep2 carrying only what no Update could. Single-clock
+  content is carried whole over the cap, and the last frame can exceed it
+  when the sender holds parked structs. A receiver
   applies one frame in one task, where one SyncStep2 of a megabyte was one
   task of seconds. The frames of one answer are queued together, in order, so
   nothing queued later — a SyncStatus among it — reaches the peer before that
@@ -52,6 +56,16 @@ an ordinary y-protocols sync message.
 - `crdt.SplitUpdateV1` is covered for interleaved clients, nested types, a
   receiver that already holds part of the document, supplementary characters,
   an uncuttable struct and an empty document.
+- The Redis awareness replay test establishes one awareness read's cursor
+  after sync replay, then publishes its live witness before releasing that
+  read. Both delivery witnesses and stale-presence rejection remain; no
+  production Redis command or replay-policy change.
+
+### Performance
+
+- First-sync framing adds one full update decode and encode per join and
+  about 0.02% more wire bytes on the measured 1.22 MB document. The default
+  write queue remains 512 frames.
 
 ## [1.55.1-sami.2] — 2026-11-04
 
