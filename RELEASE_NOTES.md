@@ -290,6 +290,27 @@ changes.
   and a caller that closed a room from inside its own `Apply` switches that
   call to `CloseRoomWithin`, passing the callback's `doc`.
 
+**Who is affected: every `provider/websocket` server whose rooms hold large
+documents.** No wire format changes: every frame is an ordinary y-protocols
+sync message, and no caller has to change anything.
+
+A client joining a large room was sent the room's whole state as one
+SyncStep2. A browser applies one Yjs update in one main-thread task, so a
+1.22 MB state was a single task of half a second to three and a half seconds.
+The answer to a SyncStep1 is now the same state in frames of at most 64 KiB:
+Update messages, and then one SyncStep2, last. Each Update integrates on its
+own, so the receiver does one short task per frame; the cut is made over the
+update's structs, so a struct is never cut in half or sent before what it
+names, and a text item longer than a frame is cut at a character boundary.
+Deletions ride in the frame that carries the structs they name. The frames of
+one answer are queued together, in order, so a client that marks a document
+synced at its first SyncStep2 - `@hocuspocus/provider` does - sees it only
+once every Update is in. A 1.22 MB state is 20 frames, inside the 512-frame
+default write queue, and the answer is charged to `Server.PeerWriteQueueBytes`
+as the single frame it replaces was. `crdt.SplitUpdateV1` is the cut itself,
+for a caller with its own transport, and `sync.EncodeSyncStep2Split` is the
+answer as sync messages; `sync.EncodeSyncStep2` is unchanged.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single
