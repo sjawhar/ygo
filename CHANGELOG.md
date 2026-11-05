@@ -42,6 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ErrRoomNotFound` when the name holds a different instance by then, and
   `ErrNotInApply` when nobody is inside the room at all.
 
+- **`crdt.SplitUpdateV1(update, sv, maxBytes)`** returns the series of V1
+  updates a receiver whose state vector is `sv` applies, in order, in place
+  of one update. Every update but the last integrates on its own - no struct
+  or deletion it carries waits for an update still to come - and each is at
+  most `maxBytes` long, except one carrying a single struct a V1 update cannot
+  cut (content occupying one clock) and the last, which carries the structs
+  the sender itself holds parked. A text item longer than `maxBytes` is cut at
+  a character boundary, never inside one.
+- **`sync.EncodeSyncStep2Split(doc, step1msg, maxBytes)`** answers a step-1
+  message with that series as sync messages, each at most `maxBytes` long:
+  Update messages (type 2) and then one SyncStep2 (type 1), last. A receiver
+  that applies them in order holds exactly what `EncodeSyncStep2`'s one
+  message would have left it holding.
+
 ### Changed
 
 - **`crdt` (breaking): `Content.Len()` returns `uint64`, and
