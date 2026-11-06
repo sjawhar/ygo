@@ -1,3 +1,54 @@
+## v1.55.1-sami.7
+
+This fork release retains the complete
+[v1.55.1-sami.6 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.6)
+and corrects a denial of service that v1.55.1-sami.3 introduced. There are no
+wire format changes, and the series `SplitUpdateV1` produces is unchanged.
+
+### The defect
+
+`crdt.SplitUpdateV1` cuts a room's state into bounded frames, and
+`sync.EncodeSyncStep2Split` calls it on every browser's first sync. Its walk
+visited clients in the order the encoder writes them, descending, and repeated
+whole passes until a pass placed nothing. When a document's structs chain
+across clients — the item of client N+1 naming the item of client N as its
+left origin, which is what a room looks like when people append in turn — the
+dependencies run the other way, so each pass placed about one struct and the
+walk made a pass for every client. The work grew with the square of the
+clients: 1,000 chained clients took 56 ms, 4,000 took 1.0 s, and 40,000 took
+about 100 seconds of processor time for a single handover.
+
+A browser syncing such a room was sent nothing for the whole of that wait —
+no second sync step, no update, no close and no error — so the document could
+not be opened live by anyone, and every later load paid the same cost. A
+client can build that chain deliberately.
+
+### The fix
+
+The walk keeps a heap of the waiters on each dependency and, when a placement
+frees a waiter, queues it in the pass the old walk would have reached it in.
+It therefore does the work once rather than once per client. The same 40,000
+chained clients now take about 0.29 seconds, most of it decoding and encoding
+rather than walking.
+
+Because a freed waiter is queued exactly where the old walk would have placed
+it, the placement order is the same and so are the bytes. `SplitUpdateV1`
+keeps its signature and every documented property: each update but the last
+integrates on its own, the last carries the parked structs and the deletions
+no struct delivers and is always present, and `maxBytes` holds but for the two
+exceptions its documentation names.
+
+### How the output was checked
+
+The author replayed 441 inputs — every shape the existing suite covers, plus a
+seeded random corpus across five frame sizes and partial receiver state
+vectors — through both builds and compared the length and digest of every
+update of every series. This release was then checked independently with a
+second corpus of 85 splits producing 1,013 parts, compared byte for byte
+between the two builds, and the scaling was measured through the public API
+alone: 1,000 chained clients 40.3 ms before against 1.9 ms after, 2,000
+75.5 ms against 5.1 ms.
+
 ## v1.55.1-sami.6
 
 This fork release retains the complete

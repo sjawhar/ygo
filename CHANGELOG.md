@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.7] — 2026-11-06
+
+Fork release on [1.55.1-sami.6](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.6),
+correcting a denial of service that 1.55.1-sami.3 introduced. No wire format
+changes, and the series `SplitUpdateV1` produces is unchanged.
+
+### Fixed
+
+- **`crdt`: `SplitUpdateV1` no longer costs work that grows with the square
+  of the clients whose structs chain.** The walk visited clients in the
+  order the encoder writes them, descending, and repeated whole passes until
+  one placed nothing. A document whose structs chain across clients — the
+  item of client N+1 naming the item of client N as its left origin, which
+  is what a room looks like when people append in turn — has its
+  dependencies running the other way, so each pass placed about one struct
+  and the walk made a pass for every client. `EncodeSyncStep2Split` calls
+  this on every browser's first sync, so a document of 40,000 chained
+  clients spent about 100 seconds of processor time on one handover and the
+  browser was sent nothing at all in the meantime: no second sync step, no
+  update, no close. A client can build that chain on purpose. The walk now
+  keeps a heap of the waiters on each dependency and wakes a waiter into the
+  pass the old walk would have reached it in, so it does the work once: the
+  same 40,000 clients take about 0.29 seconds. The placement order is the
+  order the pass-over-every-client walk produced, so the bytes of every
+  update in the series are unchanged; this was checked over 441 inputs by
+  the author and independently over 85 further splits of 1,013 parts, each
+  compared byte for byte between the two builds. `SplitUpdateV1` keeps its
+  signature and every documented property: each update but the last
+  integrates on its own, the last carries the parked structs and the
+  deletions no struct delivers and is always present, and `maxBytes` holds
+  but for the two exceptions its documentation names. (fork member stacked
+  on reearth/ygo#333)
+
 ## [1.55.1-sami.6] — 2026-11-05
 
 Fork release on [1.55.1-sami.5](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.5),
