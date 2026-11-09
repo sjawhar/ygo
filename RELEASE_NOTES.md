@@ -356,6 +356,28 @@ answers from a server: a sender of unreadable bytes is broken and may be
 dropped for good, while the pending cap is transient and the sender should
 stay connected until its gap fills.
 
+**Who is affected: servers that set an apply budget, an allowed-roots list,
+or `Server.OnStateAnswer`.** A document that sets none of them is unchanged.
+
+The apply budget and the allowed-roots list left holes a crafted update
+could go through. `ApplyBudget.Split` now bounds the structs an apply makes
+by splitting held items, which a delete-only update could grow without
+limit; a struct that parks is charged to `Structs` and `Bytes` when it
+parks, so content can no longer wait behind a clock its sender never sends
+under a zero budget; a parked struct is checked against the allowed-roots
+list of the apply that parked it, so a restricted sender cannot borrow a
+trusted peer's roots across the gap; and `Bytes` counts a map key and a new
+root's name. A drain whose splits pass `Split` is taken back on its own and
+the backlog stays parked, so the peer that fills a gap is not refused for
+another sender's content. `ApplyBudget` gains the `Split` field: a budget
+written positionally no longer compiles, and one that wants splits
+unbounded sets `Split: -1`.
+
+`crdt.WithRefusedContent` refuses remote updates carrying content kinds a
+schema has no node for, which no count can catch. `Server.OnStateAnswer`
+lets a server admit the decode a SyncStep1 answer costs before it runs, so a
+join storm cannot run any number of whole-room decodes at once.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single

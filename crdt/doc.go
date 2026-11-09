@@ -204,8 +204,9 @@ func (d *Doc) SetIntegrateScanBudget(budget func(origin any) int) {
 
 // ApplyBudget bounds one remote apply. A field below zero is no limit; zero
 // allows nothing in that measure, so the zero value of the struct admits an
-// apply that decodes nothing, integrates no struct of its own and takes no
-// byte of content. A caller that wants a measure unbounded sets it to -1.
+// apply that decodes nothing, integrates no struct of its own, takes no byte
+// of content and splits nothing. A caller that wants a measure unbounded
+// sets it to -1.
 //
 // Zero is "nothing" rather than "no limit" because the two strictest rules
 // are the useful ones: Structs: 0 is "this update may integrate no item of
@@ -236,38 +237,103 @@ func (d *Doc) SetIntegrateScanBudget(budget func(origin any) int) {
 //
 // Bytes is the creep rule: a 64 KiB paste is one struct of one byte of wire
 // overhead per character, which no count of structs bounds.
+//
+// Split is what bounds the structs Structs excludes.
 type ApplyBudget struct {
 	// Decoded is the values the apply may decode: each struct, each lib0 Any
 	// value at any depth, each Any map entry, each JSON member.
 	Decoded int
 	// Structs is the items the apply may integrate from the update, splits
-	// of items the document already held excluded.
+	// of items the document already held excluded. A struct of the update
+	// that parks behind a clock the document does not hold counts here too,
+	// where it parks (WithApplyBudget).
 	Structs int
-	// Bytes is the bytes of content the apply may integrate.
+	// Bytes is the bytes of content the apply may integrate, counted for a
+	// struct that parks as for one that integrates. Besides the content
+	// itself (contentBytes) it counts the map key an item carries, which the
+	// document keeps for as long as the entry lives. A deleted item is not
+	// counted: it carries no content, and what the document keeps for it is a
+	// range record of two integers whatever span it names, so its span is no
+	// byte cost. The number of delete ranges an update carries is bounded by
+	// Decoded instead.
 	Bytes int
+	// Split is the structs the apply may make by splitting items the
+	// document already held, which Structs excludes and which an update
+	// carrying no struct of its own can still make: this is what bounds
+	// them. A document whose structs are near the count its next load can
+	// decode needs it, because a single delete grows that count without
+	// integrating anything. Measured on the one-run text of
+	// TestUnit_ApplyBudget_RefusesADeleteWhoseSplitsPassWhatItAllows, a
+	// delete of a range inside the run cuts that one item into three: two
+	// structs the document keeps until the items between the halves are
+	// gone, from an update whose Structs count is 0. A room already at the
+	// count its load can decode takes one such delete and can no longer be
+	// loaded, which reads as "crdt: invalid update" on the next load and
+	// not as a refusal of the update that caused it.
+	//
+	// It is read where the split is made and not where Structs and Bytes
+	// are read (countSplit), because most splits are made after that point:
+	// the delete set runs after it, and the splits of a delete-only update
+	// are all its own.
+	//
+	// Split and Structs count the drain of the pending queue differently,
+	// and a caller sizing a budget needs the difference. A struct the drain
+	// integrates is outside Structs: it is one an earlier update parked,
+	// charged in full - struct and bytes - to the apply that brought it, at
+	// the moment it parked, so charging it again to whichever update later
+	// fills the gap would charge one edit twice and let one sender have
+	// every update that fills its gap refused. A split the drain makes is
+	// inside Split: it belongs to no earlier update, since it is a half of
+	// an item the document already held, cut at the moment the parked
+	// struct lands, and nothing charged it at park. So Split is what an
+	// apply may add by cutting, its drain included, and Structs is what it
+	// may add by carrying. Together they bound what one apply adds to the
+	// document; without the drain's splits in Split, neither does.
+	//
+	// Passing Split in the drain does not refuse the update. The drain is
+	// taken back, the parked structs stay parked whole, and the apply that
+	// filled the gap commits with what it carried itself: the content whose
+	// splits passed the budget is another sender's, already in the room's
+	// queue, and the sender that filled the gap can neither see it nor
+	// send anything smaller. The budget still holds - the document gains
+	// nothing from that drain - and what an owner watches for is a pending
+	// queue that stops falling (Doc.PendingStats), which it can answer in
+	// its own terms. Passing Split in the update's own structs or delete
+	// set refuses the apply, as the other three measures do.
+	Split int
 }
 
 // WithApplyBudget bounds what each remote update may decode and add by an
 // allowance of its own: as each remote apply (ApplyUpdate and its V1 and V2
 // forms) begins, the document calls budget with the apply's origin, and the
 // apply may decode at most ApplyBudget.Decoded values, integrate at most
-// ApplyBudget.Structs structs of its own and at most ApplyBudget.Bytes bytes
-// of content; a field below zero leaves that one apply unbounded in that
-// measure. The owner sizes each update's allowance by what it can see of the
-// update before applying it - its length, the peer it came from, what the
-// document holds already (StructCount) - keyed by the origin it applies it
-// with, as the scan budget is (WithIntegrateScanBudget).
+// ApplyBudget.Structs structs of its own, take at most ApplyBudget.Bytes
+// bytes of content and make at most ApplyBudget.Split structs by splitting
+// items the document already held; a field below zero leaves that one apply
+// unbounded in that measure. The owner sizes each update's allowance by what
+// it can see of the update before applying it - its length, the peer it came
+// from, what the document holds already (StructCount) - keyed by the origin
+// it applies it with, as the scan budget is (WithIntegrateScanBudget).
 //
 // An update that passes its allowance is refused with ErrApplyBudget, and like
 // every remote update a bounded document refuses it leaves the document as it
 // was, fires no observer, and is returned as a RefusedUpdateError reporting
-// what the refused apply reached: Decoded, Structs, Bytes, and Split, the
-// structs it made by splitting items the document already held, which the
-// Structs budget does not count and no budget bounds. The decoded values are
-// counted as the apply decodes them, so a frame of them is refused before it
-// is all in memory; the structs and the bytes are counted as they integrate
-// and checked once the apply has integrated, which the decode count has
-// already bounded the heap for.
+// what the refused apply reached: Decoded, Structs, Bytes and Split. The
+// decoded values are counted as the apply decodes them, so a frame of them is
+// refused before it is all in memory; the structs and the bytes are counted as
+// they integrate and checked once the apply has integrated, which the decode
+// count has already bounded the heap for; a split is counted and checked where
+// the apply makes it, since the delete set makes its splits after the structs
+// and the bytes have been read (ApplyBudget.Split).
+//
+// A struct of the update that parks - one waiting on a clock the document
+// does not hold yet - counts against Structs, and its content against Bytes,
+// at the moment it parks: the update that brings content is charged for it
+// whether that content integrates now or waits for a gap its sender will
+// fill, and a parked struct costs the document the same memory either way.
+// The apply that later fills the gap is charged nothing for what an earlier
+// update parked, so no sender can have every update that fills its gap
+// refused (noteIntegrated).
 //
 // Splits are excluded from Structs because a split costs the document nothing
 // lasting - it leaves the same content, and the commit merges the halves back
@@ -275,7 +341,8 @@ type ApplyBudget struct {
 // caller needs "did this update integrate anything of its own" to be
 // answerable exactly: a budget of Structs: 1 must refuse an update that
 // integrates two characters whatever the deletes beside them split, and a
-// budget of Structs: 0 must take an update that only deletes.
+// budget of Structs: 0 must take an update that only deletes. What the
+// splits of such an update cost is Split's to bound.
 //
 // A document with an apply budget is a bounded document whatever budget
 // returns: it applies every remote update whole or not at all, and refuses a
@@ -340,6 +407,45 @@ func (d *Doc) SetAllowedRoots(roots func(origin any) []string) {
 	d.allowedRoots = roots
 }
 
+// WithRefusedContent names the kinds of content a remote update may not
+// carry on this document: as each remote apply begins, the document calls
+// kinds with the apply's origin, and an update carrying a struct of any kind
+// in the answer is refused with ErrContentNotAllowed, rolled back whole as
+// every refusal of a bounded document is, and returned as a
+// RefusedUpdateError. A nil callback, or one answering a nil or empty slice,
+// takes every kind of content, which is what a document without the option
+// does.
+//
+// It is for an owner whose editor writes a known subset of the format and
+// whose readers cannot show the rest. A browser that sends a kind the
+// owner's schema has no node for is not refused by any count: one such
+// struct is one struct of a few bytes, within any budget an owner can set,
+// and every reader of the document then sees content outside the schema -
+// one crafted edit takes a document out of editing for everyone until a
+// person repairs it. The owner names the kinds its schema cannot hold and
+// the apply refuses them where it reads them, before one is integrated.
+//
+// The check is on the content a struct carries and not on what it says it
+// is: the apply reads each struct of the update, and a struct of a refused
+// kind refuses the whole update wherever in the update it sits. An update
+// that carries none of the named kinds is applied exactly as it would be
+// with no option set.
+//
+// A document with this option is a bounded document, as one with an apply
+// budget is. kinds runs under the document's lock, so it must not call the
+// document, and the answer is read once per apply and not retained.
+func WithRefusedContent(kinds func(origin any) []ContentKind) DocOption {
+	return func(d *Doc) { d.refusedContent = kinds }
+}
+
+// SetRefusedContent sets the kinds of WithRefusedContent on a document
+// already made, or with nil removes it. It takes the document lock.
+func (d *Doc) SetRefusedContent(kinds func(origin any) []ContentKind) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.refusedContent = kinds
+}
+
 // updateSub pairs a unique subscription ID with its callback so that
 // unsubscribe closures can find and remove the right entry even when
 // callbacks are removed out-of-order.
@@ -394,16 +500,18 @@ type Doc struct {
 	// WithIntegrateScanBudget, which takes the bound's place while set.
 	maxIntegrateScan    int
 	integrateScanBudget func(origin any) int
-	// applyBudget is the budget of WithApplyBudget and allowedRoots the list
-	// of WithAllowedRoots, each nil for none. applying is the running tally
+	// applyBudget is the budget of WithApplyBudget, allowedRoots the list of
+	// WithAllowedRoots and refusedContent the kinds of WithRefusedContent,
+	// each nil for none. applying is the running tally
 	// of the remote apply on this document, between beginRemoteApply and
 	// endRemoteApply and nil at every other time: the decode counts against
 	// the budget through the document, since the decoders it counts in are
 	// shared with the merge and snapshot decoders, which have no apply and
 	// pass a document that holds no tally (applyTally).
-	applyBudget  func(origin any) ApplyBudget
-	allowedRoots func(origin any) []string
-	applying     *applyTally
+	applyBudget    func(origin any) ApplyBudget
+	allowedRoots   func(origin any) []string
+	refusedContent func(origin any) []ContentKind
+	applying       *applyTally
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -531,16 +639,17 @@ func (d *Doc) reattachSubdoc(item *Item, parent *Doc) {
 
 // scanBounded is whether d bounds what its remote updates may do, by a scan
 // bound (WithMaxIntegrateScan), a scan budget (WithIntegrateScanBudget), an
-// apply budget (WithApplyBudget) or an allowed-roots list (WithAllowedRoots),
-// and so applies each whole or not at all. Its caller holds d.mu.
+// apply budget (WithApplyBudget), an allowed-roots list (WithAllowedRoots) or
+// a set of refused content kinds (WithRefusedContent), and so applies each
+// whole or not at all. Its caller holds d.mu.
 //
-// The budget and the list are in it because their refusals are rollbacks like
-// the scan bound's: a document that refuses an apply keeps the journal
-// beginRemoteApply takes, and without it there would be nothing to roll an
-// apply back to and the refused update would stand, half integrated.
+// The budget, the list and the set are in it because their refusals are
+// rollbacks like the scan bound's: a document that refuses an apply keeps the
+// journal beginRemoteApply takes, and without it there would be nothing to
+// roll an apply back to and the refused update would stand, half integrated.
 func (d *Doc) scanBounded() bool {
 	return d.integrateScanBudget != nil || d.maxIntegrateScan > 0 ||
-		d.applyBudget != nil || d.allowedRoots != nil
+		d.applyBudget != nil || d.allowedRoots != nil || d.refusedContent != nil
 }
 
 // applyScanLimit is the most items the conflict scans of a remote apply with
@@ -607,6 +716,17 @@ func (d *Doc) callAllowedRoots(origin any) (roots []string) {
 		}
 	}()
 	return d.allowedRoots(origin)
+}
+
+// callRefusedContent calls the WithRefusedContent callback, tagging a panic
+// it raises as callIntegrateScanBudget does; the caller holds d.mu.
+func (d *Doc) callRefusedContent(origin any) (kinds []ContentKind) {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{"WithRefusedContent", r})
+		}
+	}()
+	return d.refusedContent(origin)
 }
 
 // maxPendingItemsLimit returns the effective cap on the pending queue depth.

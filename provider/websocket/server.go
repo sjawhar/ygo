@@ -992,6 +992,18 @@ type Server struct {
 	// PeerUpdateHook.
 	OnPeerUpdate PeerUpdateHook
 
+	// OnStateAnswer, if non-nil, runs immediately before the room answers a
+	// peer's SyncStep1 with the room's whole state, and its release runs
+	// once that answer has been handed to the peer's writer. Answering
+	// decodes the room's state into a merge store before it cuts it into
+	// frames, so the answer costs the server memory in proportion to what
+	// the room holds and not to the frame it arrived in; this is where an
+	// owner weighs that cost, admits the answer, or refuses it and closes
+	// the peer. A refusal sends no answer. Nil keeps the behaviour without
+	// a hook exactly: the room answers every SyncStep1. See
+	// StateAnswerHook.
+	OnStateAnswer StateAnswerHook
+
 	// OnTokenAuth, if non-nil, validates the token from a Hocuspocus in-band
 	// Auth message (tag 2). A nil error accepts the connection and replies
 	// Authenticated (scope from the returned ConnectionConfig.ReadOnly); a

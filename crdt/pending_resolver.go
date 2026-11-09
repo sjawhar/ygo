@@ -234,16 +234,23 @@ func integrateClientRuns(txn *Transaction, pending []*Item, step int, done []boo
 }
 
 // tryIntegrateOrDrop is tryIntegrate that, with a non-nil dropped, reports a
-// panicking item as integrated so the caller stops retrying it. The scan
-// bound's own panic is not the item's fault and goes on to drainParked, which
-// takes the drain back and keeps the item parked.
+// panicking item as integrated so the caller stops retrying it.
+//
+// Two panics are not the item's fault and are let through to drainParked,
+// which takes the drain back and keeps the item parked while the update
+// that filled the gap stands: the scan bound's, and the apply budget's,
+// which a drain's splits can raise (countSplit). The roots rule's panic is
+// the item's own - a parked write outside the permissions of the sender
+// that parked it (checkParkedRoot) - so it drops that one item and the
+// drain goes on.
 func tryIntegrateOrDrop(txn *Transaction, item *Item, dropped *error) (ok bool, waitsOn ClientID, err error) {
 	if dropped == nil {
 		return tryIntegrate(txn, item)
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			if _, bound := r.(integrateScanBudgetExceeded); bound {
+			switch r.(type) {
+			case integrateScanBudgetExceeded, applyBudgetExceeded:
 				panic(r)
 			}
 			*dropped = integrationPanicErr(r)
@@ -271,6 +278,10 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 			// it found it.
 			j.keepQueueFor(s.pending, pl)
 		}
+		// A GC struct the merge grew gains deleted-range clocks, which the
+		// document holds as a range record, not as bytes of content. A widened
+		// range is no heap, so the grown span is not charged; the arriving GC
+		// struct is bounded like any other, by Decoded and Structs.
 		pending = s.pending.apply(pl, pending, s.parked != nil && len(s.parked.items) > 0)
 	}
 	from := 0
@@ -290,6 +301,15 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 		if s.pending.heldStructs() >= limit {
 			return ErrPendingCap
 		}
+		// A struct that parks is the update's as much as one that
+		// integrates: it costs the document the same memory from here on,
+		// comes back in its encoded state and lands as soon as the gap is
+		// filled. So the update that brought it is charged for it here, and
+		// it is refused here when it hangs under a root the document's
+		// allowed-roots list does not name. The drain that later integrates
+		// it is charged nothing, so the sender that fills the gap pays
+		// nothing for what another update parked (notePark).
+		notePark(txn, item)
 		if s.pending == nil {
 			s.pending = &pendingUpdate{missing: make(StateVector), tailClient: item.ID.Client, tailValid: true}
 		}

@@ -50,28 +50,30 @@ var ErrIntegrateScanBudget = fmt.Errorf("%w: its conflict scans pass more items 
 
 // RefusedUpdateError is the error ApplyUpdateV1 and ApplyUpdateV2 return for a
 // remote update a bounded document (WithMaxIntegrateScan,
-// WithIntegrateScanBudget, WithApplyBudget, WithAllowedRoots) refused and took
+// WithIntegrateScanBudget, WithApplyBudget, WithAllowedRoots,
+// WithRefusedContent) refused and took
 // back. The refused apply commits no transaction an observer sees, so this
 // error is what reports the work it did.
 //
 // Err is why the update was refused: ErrIntegrateScanBudget when its scans
 // reached the apply's limit, ErrApplyBudget when it decoded or added more than
 // its budget allows, ErrRootNotAllowed when it named a root the document does
-// not allow, otherwise an error wrapping ErrInvalidUpdate. Unwrap returns it,
-// so errors.Is matches either, and Error is its message.
+// not allow, ErrContentNotAllowed when it carried a kind of content the
+// document does not take, otherwise an error wrapping ErrInvalidUpdate.
+// Unwrap returns it, so errors.Is matches either, and Error is its message.
 //
 // Scanned is the number of items the refused apply's conflict scans passed,
 // counted as Transaction.IntegrateScanned counts them for an apply that
 // commits: never more than the apply's limit, and exactly the limit when the
 // scans reached it.
 //
-// Decoded, Structs and Bytes are what the refused apply reached of the three
-// counts of ApplyBudget, and Split is the structs it made by splitting items
-// the document already held, which the Structs budget does not count and no
-// budget bounds: a caller that asks "did this update integrate anything of its
-// own" reads Structs, and one that wants to know what the document did for it
-// reads Split too. They are counted on every bounded document, whether or not
-// a budget bounds them. Root is the root type an update refused with
+// Decoded, Structs, Bytes and Split are what the refused apply reached of the
+// four counts of ApplyBudget, Split being the structs it made by splitting
+// items the document already held, which the Structs count excludes: a caller
+// that asks "did this update integrate anything of its own" reads Structs,
+// and one that wants to know what the document did for it reads Split too.
+// They are counted on every bounded document, whether or not a budget bounds
+// them. Root is the root type an update refused with
 // ErrRootNotAllowed named, and empty for every other refusal.
 type RefusedUpdateError struct {
 	Err     error
@@ -1261,6 +1263,7 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 			if err := refuseRootOnBoundedDoc(doc, name); err != nil {
 				return nil, err
 			}
+			noteRootName(doc, name)
 			parent = doc.getOrCreateType(name)
 		} else {
 			// Nested type: referenced by container item's ID.
@@ -1311,6 +1314,9 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 		return nil, err
 	}
 	if err := refuseOnBoundedDoc(doc, content); err != nil {
+		return nil, err
+	}
+	if err := refuseContentKind(doc, content); err != nil {
 		return nil, err
 	}
 

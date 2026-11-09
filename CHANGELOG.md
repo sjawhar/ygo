@@ -255,6 +255,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Update messages (type 2) and then one SyncStep2 (type 1), last. A receiver
   that applies them in order holds exactly what `EncodeSyncStep2`'s one
   message would have left it holding.
+- **`crdt.ApplyBudget.Split`** bounds the structs one remote apply may make
+  by splitting items the document already held, which `Structs` excludes and
+  which nothing bounded before. It follows the rule the other three fields
+  follow: below zero is no limit and zero allows nothing, so a caller that
+  wants splits unbounded sets `Split: -1`; a budget written positionally no
+  longer compiles. A delete integrates no struct of its own, so
+  `Structs: 0` takes it, and the document is left holding structs it did not
+  have: measured on a one-run text of "hello world", a delete of five
+  characters inside the run cuts that one item into three. A room already at
+  the count its next load can decode takes one such delete and can no longer
+  be loaded, which reads as `crdt: invalid update` on the next load and not
+  as a refusal of the update that caused it. The budget is read where the
+  split is made, at the very top of the split, before the content is cut and
+  before the new half is built, so that a refusal unwinds with no half-made
+  split behind it. `RefusedUpdateError.Split` keeps its meaning: the splits
+  the refused apply reached.
+
+  The splits a drain of the pending queue makes are charged too, to the
+  apply that lands them, and `Structs` still leaves a struct the drain
+  integrates out. A parked struct was charged in full to the apply that
+  brought it, so charging it again to the update that fills the gap would
+  charge one edit twice, while a split half belongs to no earlier update.
+  Uncharged, ten parked one-character inserts landing in one run left a
+  document ten structs larger under `Structs: 1, Bytes: 1, Split: 0`.
+
+  What that charge refuses is the drain, not the update that started it.
+  The drain is taken back, the backlog stays parked whole, and the gap
+  filler commits with what it carried itself; the filler's own structs and
+  delete set are judged as before. Refusing the filler for its drain would
+  punish the one sender who can do nothing about it: the content whose
+  splits passed the budget is another sender's, already in the room's queue,
+  and since the drain is taken back the next writer to carry that clock
+  would be refused identically, for ever. The update that does this in
+  practice is a whole-state handoff, which is what a reconnecting browser
+  sends. The budget is still served: the document gains nothing from a
+  refused drain, and what an owner watches is a pending queue that stops
+  falling (`Doc.PendingStats`).
+- **A struct of the update that parks is counted.** A struct waiting on a
+  clock the document does not hold yet counts against `Structs`, and its
+  content against `Bytes`, at the moment it parks, exactly as an integrated
+  one does. It used to cost nothing in any measure, so a sender could hand a
+  document any number of structs of any size by writing them behind a clock
+  it never sent, all of it under a budget of `Structs: 0` and `Bytes: 0`.
+  The charge is the arriving update's alone - the drain that later
+  integrates a parked struct counts nothing for it - so the peer that fills
+  the gap is never refused for what another update parked.
+- **The allowed-roots check runs where a struct parks, and travels with it.**
+  A struct that parks under a root `WithAllowedRoots` does not name refuses
+  the whole apply with `ErrRootNotAllowed` and is not stored. The check ran
+  only where a struct integrates, so a sender could write into a root the
+  owner allows it nothing under by parking the struct behind a clock it
+  never sent. A struct whose container has not arrived has no parent to read
+  a root off, so the list of the apply that parked it now travels with it
+  and must hold when the drain integrates it; a drain that refuses on it
+  drops that one struct and goes on, since the apply that filled the gap is
+  the wrong sender to refuse.
+- **`crdt.ApplyBudget.Bytes` counts a map key and a root name.** An item
+  under a map key carries that key, and the document keeps the string for as
+  long as the entry lives, so one struct of one byte of content under a key
+  of a megabyte was admitted and retained under `Bytes: 1`. The name of a
+  root an update creates is a sender-chosen string the document keeps too,
+  charged once per root. A deleted range's span is not charged: the document
+  keeps a range record of two integers for it whatever span it names, and a
+  delete is bounded by the ranges it carries (`Decoded`), the splits its
+  edges make (`Split`) and the tombstone structs it integrates (`Structs`).
+- **`crdt.WithRefusedContent` and `crdt.SetRefusedContent`** name the kinds
+  of content (`crdt.ContentKind`) a remote update may not carry, and refuse
+  an update carrying one with `crdt.ErrContentNotAllowed`, rolled back whole
+  as every refusal of a bounded document is. No count can do this: one embed
+  is one struct of a few bytes, within any budget an owner can set, and once
+  it is in the document every reader is shown content its schema has no node
+  for. A nil callback, or one answering nothing, takes every kind, which is
+  what a document without the option does.
+- **`websocket.Server.OnStateAnswer`** (`websocket.StateAnswerHook`) runs
+  immediately before the server answers a peer's `SyncStep1` with the room's
+  state, and the release it returns runs once that answer has been handed to
+  the peer's writer, on every way out including the one that sends nothing.
+  Answering decodes the whole of what the peer is missing into a merge store
+  before cutting it into frames (`sync.EncodeSyncStep2Split`), so it costs
+  the server memory in proportion to what the room holds and not to the
+  frame that asked for it, and nothing bounded how many such decodes a join
+  storm could run at once. A hook that returns an error sends no answer and
+  closes the peer, with the code and reason of a `*PeerClose` it names and
+  with 4205 "Reset Connection" otherwise. A release that panics is recovered
+  and logged, as the hook itself is. `StateAnswerInfo.Structs` counts the
+  structs waiting in the room's pending queue as well as the stored ones,
+  and `StateAnswerInfo.StructsNow` reads the figure again for a hook that
+  waited before admitting the answer. A `Server` with no hook answers as
+  before.
+
+A document that sets no apply budget, no allowed-roots list, no refused
+content kinds and no scan bound keeps no tally, and every count, check and
+refusal above reads that tally first and returns when there is none.
 
 ### Changed
 

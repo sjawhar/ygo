@@ -393,6 +393,12 @@ func refsOf(items []*Item) []mergeRef {
 
 // apply merges arrived into p's queue by plan and returns the arrivals to
 // append; viewed is whether a recorded view of the queue must stay.
+//
+// A GC struct grows by the GC structs it takes in, gaining deleted-range
+// clocks. Those are not charged: the document holds a deleted range as a range
+// record, not as bytes of content, so a widened range is no heap to charge
+// for. The arriving GC struct is still bounded like any other, by Decoded and
+// Structs; only its span goes uncharged (applyTally.integrated).
 func (p *pendingUpdate) apply(pl mergePlan, arrived []*Item, viewed bool) []*Item {
 	var dropped []queued
 	var gone []ClientID
@@ -411,7 +417,6 @@ func (p *pendingUpdate) apply(pl mergePlan, arrived []*Item, viewed bool) []*Ite
 			case !k.kept():
 				dropped, changed = append(dropped, q), true
 			default:
-				// A GC struct grows by the GC structs it took in.
 				keep(q.Item, k)
 				if k.end > end {
 					p.cover.insertSpan(q.Item)
