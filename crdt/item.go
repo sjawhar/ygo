@@ -40,6 +40,15 @@ type Item struct {
 	// re-insertion to avoid redoing the same item twice and to let neighbour
 	// position-tracing follow the chain. Never encoded. (Yjs Item.redone parity.)
 	redone *ID
+	// parkedRoots is the allowed-roots list of the remote apply that put this
+	// struct in the pending queue, kept only while the struct waits with no
+	// parent to read a root off, and nil for every other struct and for an
+	// apply that allowed every root. The drain that finally integrates the
+	// struct runs under another update's list; this one is what the struct
+	// must still pass, so a sender cannot write under a root it may not
+	// touch by parking the write until a trusted peer brings the container
+	// (notePark, checkParkedRoot). Never encoded.
+	parkedRoots []string
 }
 
 // parentSubKey collapses a *string parentSub to a plain string bucket label for
@@ -604,7 +613,48 @@ func nextDeleteItem(current, root *Item) *Item {
 // item.Content is mutated to hold [0, offset); the returned item holds [offset, end).
 // Both halves are registered in the store. The linked-list pointers are updated.
 func splitItem(txn *Transaction, item *Item, offset uint64) *Item {
-	// A drain taken back parks again the items it integrated, whole.
+	// Counted and refused here, before the split touches anything at all.
+	//
+	// The half a split adds is a struct the apply made, which Structs does not
+	// count and Split does (countSplit, WithApplyBudget), and countSplit
+	// refuses an apply whose splits pass its budget by a panic the apply
+	// recovers as ErrApplyBudget. The position is not a repair of something
+	// the fork got wrong: until Split existed, countSplit only incremented a
+	// counter and could refuse nothing, so there was no such thing as a
+	// refusal part way through a split. The position is what makes the
+	// refusal possible at all, and these are the two things it must not do:
+	//
+	//   - after Content.Splice, the content is already cut, and cutting is not
+	//     reversible for every content. A delete set that splits inside a
+	//     supplementary character - which only a wire-level delete can do,
+	//     never YText.Delete, since the text API deletes whole characters -
+	//     leaves each half holding one half of a UTF-16 surrogate pair, and the
+	//     rollback's merge of the halves yields two U+FFFD in its place. The
+	//     update is refused, no observer fires, and the state vector is
+	//     unchanged, so re-applying the whole state repairs nothing: every
+	//     reader of that document sees the mojibake from then on.
+	//   - after the right half is built, a split of an item carrying an undo
+	//     redone link leaves the extra struct behind, so a sender refused again
+	//     and again grows the document a struct at a time, which is what the
+	//     budget is there to stop.
+	//
+	// Counted before the split, neither is reachable: nothing of the split has
+	// happened when the panic unwinds, and splitItem has no early return, so
+	// nothing is counted that then does not happen
+	// (TestUnit_ApplyBudget_ARefusedSplitLeavesTheTextAndTheStoreExactlyAsTheyWere).
+	countSplit(txn)
+	// A drain taken back parks again the items it integrated, whole, and the
+	// refusal above unwinds before this mark is set. That is right on both
+	// counts. No split has happened, so there are no halves for a take-back
+	// to park wrongly; and the mark is not this call's to make in the first
+	// place. Every parked item the drain touches is recorded by tryIntegrate
+	// before the drain resolves, trims or integrates it, so an item split
+	// here is already in parkedAs and this call returns at once (keepParked);
+	// what it covers is a half the drain itself added earlier, and a struct
+	// the drain added is dropped whole by the drain's rollback, which keeps
+	// no record of it (rollBackTo). So the take-back the budget refusal now
+	// starts is the ordinary one, and it gives the item back whole
+	// (TestUnit_ApplyBudget_ARefusedSplitInADrainParksTheItemBackWhole).
 	if j := txn.applyJournal(); j != nil && j.drained(item) {
 		j.keepParked(item)
 	}
@@ -627,10 +677,6 @@ func splitItem(txn *Transaction, item *Item, offset uint64) *Item {
 		right.Right.Left = right
 	}
 	item.Right = right
-	// The half a split adds is a struct the apply made, reported and never
-	// bounded, since the commit merges the halves back once the items between
-	// them are gone (countSplit, WithApplyBudget).
-	countSplit(txn)
 	txn.doc.store.insertItem(right)
 	// A key's entry is its rightmost unit, so Set's origin stays the run's end.
 	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {

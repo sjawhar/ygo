@@ -179,7 +179,7 @@ func TestUnit_ApplyBudget_RefusesAnUpdateThatIntegratesMoreStructsThanItAllows(t
 	update := threeInserts(t, base)
 
 	doc := budgetDoc(t, base)
-	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 2, Bytes: -1} })
+	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 2, Bytes: -1, Split: -1} })
 	before := stateOf(doc)
 	updates := observed(doc)
 	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
@@ -194,7 +194,7 @@ func TestUnit_ApplyBudget_RefusesAnUpdateThatIntegratesMoreStructsThanItAllows(t
 	}
 
 	fits := budgetDoc(t, base)
-	fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 3, Bytes: -1} })
+	fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 3, Bytes: -1, Split: -1} })
 	fitsBefore := stateOf(fits)
 	requireApplied(t, fits, fitsBefore, ApplyUpdateV1(fits, update, nil))
 	if got, want := fits.GetText("t").ToString(), appliedText(t, base, update); got != want {
@@ -213,7 +213,7 @@ func TestUnit_ApplyBudget_RefusesAnUpdateThatDecodesMoreValuesThanItAllows(t *te
 	update := threeInserts(t, base)
 
 	doc := budgetDoc(t, base)
-	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 2, Structs: -1, Bytes: -1} })
+	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 2, Structs: -1, Bytes: -1, Split: -1} })
 	before := stateOf(doc)
 	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
 	if refused.Decoded != 3 {
@@ -224,7 +224,7 @@ func TestUnit_ApplyBudget_RefusesAnUpdateThatDecodesMoreValuesThanItAllows(t *te
 	}
 
 	fits := budgetDoc(t, base)
-	fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 3, Structs: -1, Bytes: -1} })
+	fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 3, Structs: -1, Bytes: -1, Split: -1} })
 	requireApplied(t, fits, stateOf(fits), ApplyUpdateV1(fits, update, nil))
 
 	// The delete ranges an update carries are values it decodes too, since
@@ -232,14 +232,14 @@ func TestUnit_ApplyBudget_RefusesAnUpdateThatDecodesMoreValuesThanItAllows(t *te
 	// struct no budget bounds (countDecodedRanges).
 	deleteOnly := editUpdate(t, base, func(txn *Transaction, text *YText) { text.Delete(txn, 3, 5) })
 	ranges := budgetDoc(t, base)
-	ranges.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 0, Structs: -1, Bytes: -1} })
+	ranges.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 0, Structs: -1, Bytes: -1, Split: -1} })
 	rangesBefore := stateOf(ranges)
 	refusedRanges := requireRefused(t, ranges, rangesBefore, ApplyUpdateV1(ranges, deleteOnly, nil), ErrApplyBudget)
 	if refusedRanges.Decoded != 1 {
 		t.Fatalf("the refusal reports %d decoded values, want the one delete range it carries", refusedRanges.Decoded)
 	}
 	fitsRanges := budgetDoc(t, base)
-	fitsRanges.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 1, Structs: -1, Bytes: -1} })
+	fitsRanges.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 1, Structs: -1, Bytes: -1, Split: -1} })
 	requireApplied(t, fitsRanges, stateOf(fitsRanges), ApplyUpdateV1(fitsRanges, deleteOnly, nil))
 }
 
@@ -255,7 +255,7 @@ func TestUnit_ApplyBudget_RefusesAnUpdateThatIntegratesMoreBytesThanItAllows(t *
 
 	doc := budgetDoc(t, base)
 	doc.SetApplyBudget(func(any) ApplyBudget {
-		return ApplyBudget{Decoded: -1, Structs: -1, Bytes: len(paste) - 1}
+		return ApplyBudget{Decoded: -1, Structs: -1, Bytes: len(paste) - 1, Split: -1}
 	})
 	before := stateOf(doc)
 	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
@@ -268,7 +268,7 @@ func TestUnit_ApplyBudget_RefusesAnUpdateThatIntegratesMoreBytesThanItAllows(t *
 
 	fits := budgetDoc(t, base)
 	fits.SetApplyBudget(func(any) ApplyBudget {
-		return ApplyBudget{Decoded: -1, Structs: -1, Bytes: len(paste)}
+		return ApplyBudget{Decoded: -1, Structs: -1, Bytes: len(paste), Split: -1}
 	})
 	requireApplied(t, fits, stateOf(fits), ApplyUpdateV1(fits, update, nil))
 }
@@ -281,7 +281,7 @@ func TestUnit_ApplyBudget_RefusesAnUpdateThatIntegratesMoreBytesThanItAllows(t *
 // apply made.
 func TestUnit_ApplyBudget_StructsZeroAdmitsADeleteAndRefusesOneCharacter(t *testing.T) {
 	const base = "hello world"
-	none := func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 0, Bytes: -1} }
+	none := func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 0, Bytes: -1, Split: -1} }
 	deleteOnly := editUpdate(t, base, func(txn *Transaction, text *YText) { text.Delete(txn, 3, 5) })
 	oneCharacter := editUpdate(t, base, func(txn *Transaction, text *YText) { text.Insert(txn, 3, "x", nil) })
 
@@ -314,7 +314,7 @@ func TestUnit_ApplyBudget_StructsZeroAdmitsADeleteAndRefusesOneCharacter(t *test
 // refused.
 func TestUnit_ApplyBudget_BytesZeroAdmitsADeleteAndRefusesOneCharacter(t *testing.T) {
 	const base = "hello world"
-	none := func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: -1, Bytes: 0} }
+	none := func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: -1, Bytes: 0, Split: -1} }
 	deleteOnly := editUpdate(t, base, func(txn *Transaction, text *YText) { text.Delete(txn, 3, 5) })
 	oneCharacter := editUpdate(t, base, func(txn *Transaction, text *YText) { text.Insert(txn, 3, "x", nil) })
 
@@ -438,7 +438,7 @@ func TestUnit_StructCount_CountsTheStructsTheDocumentHolds(t *testing.T) {
 		t.Fatalf("the applied update left %d structs, want at least the one held and the three it carries", applied)
 	}
 
-	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 0, Bytes: -1} })
+	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 0, Bytes: -1, Split: -1} })
 	more := editUpdateFrom(t, base, 3, func(txn *Transaction, text *YText) { text.Insert(txn, 2, "zz", nil) })
 	if err := ApplyUpdateV1(doc, more, nil); !errors.Is(err, ErrApplyBudget) {
 		t.Fatalf("the update was applied with err %v", err)
@@ -460,9 +460,10 @@ func TestUnit_ApplyBudget_BoundsTheV2DecoderToo(t *testing.T) {
 	}
 
 	for name, budget := range map[string]ApplyBudget{
-		"decoded": {Decoded: 2, Structs: -1, Bytes: -1},
-		"structs": {Decoded: -1, Structs: 2, Bytes: -1},
-		"bytes":   {Decoded: -1, Structs: -1, Bytes: 2},
+		"decoded": {Decoded: 2, Structs: -1, Bytes: -1, Split: -1},
+		"structs": {Decoded: -1, Structs: 2, Bytes: -1, Split: -1},
+		"bytes":   {Decoded: -1, Structs: -1, Bytes: 2, Split: -1},
+		"split":   {Decoded: -1, Structs: -1, Bytes: -1, Split: 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			doc := budgetDoc(t, base)
@@ -485,7 +486,7 @@ func TestUnit_ApplyBudget_BoundsTheV2DecoderToo(t *testing.T) {
 	}
 
 	fits := budgetDoc(t, base)
-	fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 3, Structs: 3, Bytes: 3} })
+	fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 3, Structs: 3, Bytes: 3, Split: -1} })
 	fitsBefore := stateOf(fits)
 	requireApplied(t, fits, fitsBefore, ApplyUpdateV2(fits, v2, nil))
 	if got, want := fits.GetText("t").ToString(), appliedText(t, base, v1); got != want {
@@ -570,7 +571,7 @@ func TestUnit_ApplyBudget_ADenseFrameOfAnyValuesIsRefusedBeforeItAllocates(t *te
 	}
 
 	doc := budgetDoc(t, base)
-	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 100, Structs: -1, Bytes: -1} })
+	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 100, Structs: -1, Bytes: -1, Split: -1} })
 	before := stateOf(doc)
 	allocated, took, err := applyMeasured(doc, update)
 	t.Logf("a dense frame of %d bytes: the refused apply allocated %d bytes in %s, the unbudgeted one %d bytes in %s",
@@ -592,7 +593,7 @@ func TestUnit_ApplyBudget_ADocumentWithOnlyABudgetRollsARefusedApplyBack(t *test
 	update := threeInserts(t, base)
 
 	budget := budgetDoc(t, base)
-	budget.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 1, Bytes: -1} })
+	budget.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: 1, Bytes: -1, Split: -1} })
 	before := stateOf(budget)
 	refused := requireRefused(t, budget, before, ApplyUpdateV1(budget, update, nil), ErrApplyBudget)
 	if refused.Structs != 3 {
@@ -927,7 +928,7 @@ func TestUnit_ApplyBudget_ARefusalAfterTheDrainKeepsWhatTheDocumentHeld(t *testi
 			}
 
 			doc.SetApplyBudget(func(any) ApplyBudget {
-				return ApplyBudget{Decoded: -1, Structs: 0, Bytes: -1}
+				return ApplyBudget{Decoded: -1, Structs: 0, Bytes: -1, Split: -1}
 			})
 			if err := apply(doc, gapStringUpdate(0, "AB", nil)); !errors.Is(err, ErrApplyBudget) {
 				t.Fatalf("the apply answered %v, want the struct budget's refusal", err)
@@ -959,7 +960,7 @@ func TestUnit_ApplyBudget_ARefusalAfterTheDrainKeepsWhatTheDocumentHeld(t *testi
 func TestUnit_ApplyBudget_ADeclaredLengthIsRefusedBeforeItIsAllocated(t *testing.T) {
 	const base = "hello world"
 	const many = 2_000_000
-	oneValue := ApplyBudget{Decoded: 1, Structs: -1, Bytes: -1}
+	oneValue := ApplyBudget{Decoded: 1, Structs: -1, Bytes: -1, Split: -1}
 
 	one := budgetDoc(t, base)
 	one.SetApplyBudget(func(any) ApplyBudget { return oneValue })
@@ -981,7 +982,7 @@ func TestUnit_ApplyBudget_ADeclaredLengthIsRefusedBeforeItIsAllocated(t *testing
 	// The control: the same shape at a length the budget holds applies, so
 	// what refuses the frames above is the length and not the shape.
 	fits := budgetDoc(t, base)
-	fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 5, Structs: -1, Bytes: -1} })
+	fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 5, Structs: -1, Bytes: -1, Split: -1} })
 	fitsBefore := stateOf(fits)
 	requireApplied(t, fits, fitsBefore, ApplyUpdateV1(fits, denseAnyValues(1, 4), nil))
 	if got := fits.StructCount(); got != fitsBefore.structs+1 {
@@ -1204,7 +1205,7 @@ func TestUnit_ApplyBudget_CountsEachEntryAndEachRangeAsItIsRead(t *testing.T) {
 		update := repeatedKeyMap(entries)
 
 		doc := budgetDoc(t, base)
-		doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 3, Structs: -1, Bytes: -1} })
+		doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 3, Structs: -1, Bytes: -1, Split: -1} })
 		before := stateOf(doc)
 		requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
 
@@ -1213,7 +1214,7 @@ func TestUnit_ApplyBudget_CountsEachEntryAndEachRangeAsItIsRead(t *testing.T) {
 		// the repeated key decodes to - which is what the count used to see.
 		fits := budgetDoc(t, base)
 		fits.SetApplyBudget(func(any) ApplyBudget {
-			return ApplyBudget{Decoded: 2 + entries, Structs: -1, Bytes: -1}
+			return ApplyBudget{Decoded: 2 + entries, Structs: -1, Bytes: -1, Split: -1}
 		})
 		fitsBefore := stateOf(fits)
 		requireApplied(t, fits, fitsBefore, ApplyUpdateV1(fits, update, nil))
@@ -1234,7 +1235,7 @@ func TestUnit_ApplyBudget_CountsEachEntryAndEachRangeAsItIsRead(t *testing.T) {
 		update := adjacentDeletes(1, len(base))
 
 		doc := budgetDoc(t, base)
-		doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 5, Structs: -1, Bytes: -1} })
+		doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 5, Structs: -1, Bytes: -1, Split: -1} })
 		before := stateOf(doc)
 		refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
 		if refused.Decoded != len(base) {
@@ -1243,7 +1244,7 @@ func TestUnit_ApplyBudget_CountsEachEntryAndEachRangeAsItIsRead(t *testing.T) {
 
 		fits := budgetDoc(t, base)
 		fits.SetApplyBudget(func(any) ApplyBudget {
-			return ApplyBudget{Decoded: len(base), Structs: -1, Bytes: -1}
+			return ApplyBudget{Decoded: len(base), Structs: -1, Bytes: -1, Split: -1}
 		})
 		fitsBefore := stateOf(fits)
 		requireApplied(t, fits, fitsBefore, ApplyUpdateV1(fits, update, nil))
@@ -1277,15 +1278,17 @@ func xmlElementUpdate(root string, n int) []byte {
 // name their sender sized, so a one-million-byte node name was admitted and
 // retained under Bytes: 0.
 func TestUnit_ApplyBudget_BytesCountsAnXMLTypeName(t *testing.T) {
-	const base, name = "hello world", 1_000_000
-	update := xmlElementUpdate("xml", name)
+	const base, name, root = "hello world", 1_000_000, "xml"
+	update := xmlElementUpdate(root, name)
 
 	doc := budgetDoc(t, base)
-	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 1, Structs: 1, Bytes: 0} })
+	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 1, Structs: 1, Bytes: 0, Split: -1} })
 	before := stateOf(doc)
 	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
-	if refused.Bytes != name {
-		t.Fatalf("the refusal reports %d bytes, want the %d of the node name", refused.Bytes, name)
+	// The root the update creates is a sender-chosen string the document
+	// keeps too, and is charged beside the node name (noteRootName).
+	if want := name + len(root); refused.Bytes != want {
+		t.Fatalf("the refusal reports %d bytes, want the %d of the node name and the root it names", refused.Bytes, want)
 	}
 	if _, held := doc.share["xml"]; held {
 		t.Fatal("the refused update left its root on the document")
@@ -1541,7 +1544,7 @@ func TestUnit_ApplyBudget_CountsEveryLib0AnyTagAsTheDecoderReadsIt(t *testing.T)
 			}
 
 			fits := budgetDoc(t, base)
-			fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: want, Structs: -1, Bytes: -1} })
+			fits.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: want, Structs: -1, Bytes: -1, Split: -1} })
 			fitsBefore := stateOf(fits)
 			if err := ApplyUpdateV1(fits, update, nil); err != nil {
 				t.Fatalf("a budget of the %d values the decode produced refused the frame, so the count is above it: %v", want, err)
@@ -1549,7 +1552,7 @@ func TestUnit_ApplyBudget_CountsEveryLib0AnyTagAsTheDecoderReadsIt(t *testing.T)
 			requireApplied(t, fits, fitsBefore, nil)
 
 			tight := budgetDoc(t, base)
-			tight.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: want - 1, Structs: -1, Bytes: -1} })
+			tight.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: want - 1, Structs: -1, Bytes: -1, Split: -1} })
 			tightBefore := stateOf(tight)
 			err := ApplyUpdateV1(tight, update, nil)
 			if err == nil {
@@ -1783,6 +1786,290 @@ func TestUnit_PendingCap_IsItsOwnRefusalAndStillAnInvalidUpdate(t *testing.T) {
 					t.Fatalf("a malformed update was refused as the pending cap: %v", err)
 				}
 			})
+		}
+	})
+}
+
+// Split bounds the structs a delete makes of items the document already
+// held, which Structs excludes and no count used to bound. A document whose
+// structs are near the count its next load can decode needs it: a delete
+// integrates nothing of its own, so Structs: 0 takes it, and the document is
+// left with structs it did not have. Measured here on the one run of "hello
+// world": a delete of five characters inside it cuts that one item into
+// three, two structs more than the document held, from an update whose
+// Structs count is 0.
+func TestUnit_ApplyBudget_RefusesADeleteWhoseSplitsPassWhatItAllows(t *testing.T) {
+	const base = "hello world"
+	deleteOnly := editUpdate(t, base, func(txn *Transaction, text *YText) { text.Delete(txn, 3, 5) })
+
+	doc := budgetDoc(t, base)
+	doc.SetApplyBudget(func(any) ApplyBudget {
+		return ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1, Split: 1}
+	})
+	before := stateOf(doc)
+	updates := observed(doc)
+	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, deleteOnly, nil), ErrApplyBudget)
+	if refused.Split != 2 {
+		t.Fatalf("the refusal reports %d splits, want the 2 the delete's edges make", refused.Split)
+	}
+	if refused.Structs != 0 {
+		t.Fatalf("the refusal reports %d structs, want none: a delete integrates nothing of its own", refused.Structs)
+	}
+	if *updates != 0 {
+		t.Fatalf("the refused update was handed to %d observers", *updates)
+	}
+
+	// A budget that holds the splits takes the same delete, and the document
+	// keeps the structs they added, which is the cost Split bounds.
+	fits := budgetDoc(t, base)
+	fits.SetApplyBudget(func(any) ApplyBudget {
+		return ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1, Split: 2}
+	})
+	fitsBefore := stateOf(fits)
+	requireApplied(t, fits, fitsBefore, ApplyUpdateV1(fits, deleteOnly, nil))
+	if got, want := fits.GetText("t").ToString(), appliedText(t, base, deleteOnly); got != want {
+		t.Fatalf("the applied delete left %q, want %q", got, want)
+	}
+	if got, want := fits.StructCount(), fitsBefore.structs+2; got != want {
+		t.Fatalf("the applied delete left %d structs, want the %d it held and the 2 its splits added", got, want)
+	}
+
+	// Split: 0 is "this update may split nothing", and an update that splits
+	// nothing is taken under it: the delete above is refused, and an insert
+	// at the head of the run, which splits nothing, applies.
+	none := func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1, Split: 0} }
+	strict := budgetDoc(t, base)
+	strict.SetApplyBudget(none)
+	strictBefore := stateOf(strict)
+	requireRefused(t, strict, strictBefore, ApplyUpdateV1(strict, deleteOnly, nil), ErrApplyBudget)
+	head := editUpdateFrom(t, base, 3, func(txn *Transaction, text *YText) { text.Insert(txn, 0, "X", nil) })
+	requireApplied(t, strict, strictBefore, ApplyUpdateV1(strict, head, nil))
+}
+
+// A struct of the update that parks counts against Structs and its content
+// against Bytes where it parks, and the apply that fills the gap is charged
+// nothing for it.
+//
+// A parked struct used to cost nothing in any measure, so a sender could
+// hand a document any number of structs of any size by writing them behind
+// a clock it never sent: the document holds each of them in memory, returns
+// them in its encoded state and integrates them as soon as the gap is
+// filled, all of it under a budget of Structs: 0 and Bytes: 0. The charge is
+// the arriving update's alone, so the peer that later fills the gap is not
+// refused for what somebody else parked.
+func TestUnit_ApplyBudget_CountsTheStructsAnUpdateParks(t *testing.T) {
+	const n = 5 // n one-character structs of client 2, behind the gap at clock 0
+	update := parkedStructs(n)
+
+	structs := New(WithClientID(7))
+	structs.SetApplyBudget(func(any) ApplyBudget {
+		return ApplyBudget{Decoded: -1, Structs: n - 1, Bytes: -1, Split: -1}
+	})
+	before := stateOf(structs)
+	refused := requireRefused(t, structs, before, ApplyUpdateV1(structs, update, nil), ErrApplyBudget)
+	if refused.Structs != n {
+		t.Fatalf("the refusal reports %d structs, want the %d the update parked", refused.Structs, n)
+	}
+	if structs.PendingStats().Items != 0 {
+		t.Fatalf("the refused update left %d structs parked, want none", structs.PendingStats().Items)
+	}
+
+	content := New(WithClientID(7))
+	content.SetApplyBudget(func(any) ApplyBudget {
+		return ApplyBudget{Decoded: -1, Structs: -1, Bytes: n - 1, Split: -1}
+	})
+	contentBefore := stateOf(content)
+	refusedBytes := requireRefused(t, content, contentBefore, ApplyUpdateV1(content, update, nil), ErrApplyBudget)
+	if refusedBytes.Bytes != n {
+		t.Fatalf("the refusal reports %d bytes, want the %d bytes the %d parked structs carry", refusedBytes.Bytes, n, n)
+	}
+
+	// A budget that holds them parks them, and the update that fills the gap
+	// is charged for its own one struct and byte alone, though the drain it
+	// runs integrates all n parked structs.
+	doc := New(WithClientID(7))
+	doc.SetApplyBudget(func(any) ApplyBudget {
+		return ApplyBudget{Decoded: -1, Structs: n, Bytes: n, Split: -1}
+	})
+	fitsBefore := stateOf(doc)
+	requireApplied(t, doc, fitsBefore, ApplyUpdateV1(doc, update, nil))
+	if got := doc.PendingStats().Items; got != n {
+		t.Fatalf("%d structs parked, want the %d the update carried", got, n)
+	}
+
+	doc.SetApplyBudget(func(any) ApplyBudget {
+		return ApplyBudget{Decoded: -1, Structs: 1, Bytes: 1, Split: -1}
+	})
+	if err := ApplyUpdateV1(doc, gapStringUpdate(0, "A", nil), nil); err != nil {
+		t.Fatalf("the update that fills the gap was refused: %v", err)
+	}
+	if got := doc.PendingStats().Items; got != 0 {
+		t.Fatalf("%d structs are still parked, want the drain to have taken them all", got)
+	}
+	if got, want := doc.GetText("t").ToString(), "A"+strings.Repeat("x", n); got != want {
+		t.Fatalf("the document reads %q, want %q", got, want)
+	}
+}
+
+// parkedUnderRoot is an update of one string struct for client 2 at clock 1,
+// parented to the named root: clock 0 is never sent, so a document that has
+// not seen it parks the struct with its parent already resolved. The root is
+// one the document holds, so the name check in the decode lets it through
+// (refuseRootOnBoundedDoc) and what must refuse it is the containment check
+// over what the apply adds.
+func parkedUnderRoot(root, value string) []byte {
+	enc := encoding.NewEncoder()
+	enc.WriteVarUint(1) // clients
+	enc.WriteVarUint(1) // one struct
+	enc.WriteVarUint(2) // client
+	enc.WriteVarUint(1) // first clock: clock 0 is the gap
+	enc.WriteUint8(wireString)
+	enc.WriteUint8(1) // parent info: a named root follows
+	enc.WriteVarString(root)
+	enc.WriteVarString(value)
+	enc.WriteVarUint(0) // delete set: no clients
+	return bytes.Clone(enc.Bytes())
+}
+
+// An allowed-roots list keeps a sender out of a root whether its struct
+// integrates or parks. A struct that parks is stored, encoded into the
+// document's state and integrated as soon as its gap is filled, so a check
+// made only where a struct integrates let a sender write into a root the
+// owner allows it nothing under: it had only to park the struct behind a
+// clock it never sent.
+func TestUnit_AllowedRoots_RefusesAStructThatParksUnderADisallowedRoot(t *testing.T) {
+	const base = "hello world"
+	update := parkedUnderRoot("m", "forged")
+
+	doc := guardedDoc(t, base)
+	doc.SetAllowedRoots(func(any) []string { return []string{"t"} })
+	before := stateOf(doc)
+	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrRootNotAllowed)
+	if refused.Root != "m" {
+		t.Fatalf("the refusal reports root %q, want \"m\"", refused.Root)
+	}
+	if got := doc.PendingStats().Items; got != 0 {
+		t.Fatalf("the refused update left %d structs parked", got)
+	}
+	// Nothing of it is in the document's stored state either, so no later
+	// load of that state can bring it back.
+	reloaded := New(WithClientID(8))
+	if err := ApplyUpdateV1(reloaded, EncodeStateAsUpdateV1(doc, nil), nil); err != nil {
+		t.Fatalf("the stored state of the refused document does not load: %v", err)
+	}
+	if got := reloaded.PendingStats().Items; got != 0 {
+		t.Fatalf("a load of the stored state brought back %d parked structs", got)
+	}
+
+	// The control: with no list the same struct parks, and the document
+	// carries it in its stored state to every peer that loads it - which is
+	// what the refusal above keeps out.
+	open := guardedDoc(t, base)
+	if err := ApplyUpdateV1(open, update, nil); err != nil {
+		t.Fatalf("the document with no list refused the update: %v", err)
+	}
+	if got := open.PendingStats().Items; got != 1 {
+		t.Fatalf("%d structs parked with no list, want the one the update carried", got)
+	}
+	carried := New(WithClientID(8))
+	if err := ApplyUpdateV1(carried, EncodeStateAsUpdateV1(open, nil), nil); err != nil {
+		t.Fatalf("the stored state of the open document does not load: %v", err)
+	}
+	if got := carried.PendingStats().Items; got != 1 {
+		t.Fatalf("the stored state carried %d parked structs, want the one it parked", got)
+	}
+
+	// A struct that parks under a root the list names is taken, so what the
+	// check refuses is the root and not the parking.
+	allowed := guardedDoc(t, base)
+	allowed.SetAllowedRoots(func(any) []string { return []string{"t"} })
+	if err := ApplyUpdateV1(allowed, parkedUnderRoot("t", "later"), nil); err != nil {
+		t.Fatalf("a struct parking under the allowed root was refused: %v", err)
+	}
+	if got := allowed.PendingStats().Items; got != 1 {
+		t.Fatalf("%d structs parked under the allowed root, want one", got)
+	}
+}
+
+// deletedRangeUpdate is an update of one struct for client 9 under the root
+// name: a deleted run of length clocks, which carries no content at all and
+// leaves the document holding a range of that length in its delete set.
+func deletedRangeUpdate(root string, length uint64) []byte {
+	enc := encoding.NewEncoder()
+	enc.WriteVarUint(1) // clients
+	enc.WriteVarUint(1) // one struct
+	enc.WriteVarUint(9) // client
+	enc.WriteVarUint(0) // first clock
+	enc.WriteUint8(wireDeleted)
+	enc.WriteUint8(1) // parent info: a named root follows
+	enc.WriteVarString(root)
+	enc.WriteVarUint(length)
+	enc.WriteVarUint(0) // delete set: no clients
+	return bytes.Clone(enc.Bytes())
+}
+
+// Bytes counts two costs an item's content cannot show: the map key it hangs
+// under, and the length of a deleted run.
+//
+// Both were free. A key is a string the sender sizes and the document keeps
+// for as long as the entry lives, so one struct of one byte of content under
+// a key of a megabyte was admitted and retained under Bytes: 1; and a
+// deleted run carries no content, so a run of a million clocks was admitted
+// under Bytes: 0 and kept as a range in the document's delete set, which
+// every encode of its state carries.
+func TestUnit_ApplyBudget_BytesCountsAMapKeyAndADeletedRange(t *testing.T) {
+	const base = "hello world"
+
+	t.Run("a map key", func(t *testing.T) {
+		const key, value = 1_000, "v"
+		long := strings.Repeat("k", key)
+		update := guardedEdit(t, base, 2, func(txn *Transaction, _ *YText, m *YMap) {
+			m.Set(txn, long, value)
+		})
+		want := key + len(value)
+
+		doc := guardedDoc(t, base)
+		doc.SetApplyBudget(func(any) ApplyBudget {
+			return ApplyBudget{Decoded: -1, Structs: -1, Bytes: want - 1, Split: -1}
+		})
+		before := stateOf(doc)
+		refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
+		if refused.Bytes != want {
+			t.Fatalf("the refusal reports %d bytes, want the %d of the key and its value", refused.Bytes, want)
+		}
+
+		fits := guardedDoc(t, base)
+		fits.SetApplyBudget(func(any) ApplyBudget {
+			return ApplyBudget{Decoded: -1, Structs: -1, Bytes: want, Split: -1}
+		})
+		requireApplied(t, fits, stateOf(fits), ApplyUpdateV1(fits, update, nil))
+		if got, _ := fits.GetMap("m").Get(long); got != value {
+			t.Fatalf("the applied update left %v under the long key, want %q", got, value)
+		}
+	})
+
+	t.Run("a deleted range", func(t *testing.T) {
+		const length = 1_000
+		update := deletedRangeUpdate("t", length)
+
+		doc := guardedDoc(t, base)
+		doc.SetApplyBudget(func(any) ApplyBudget {
+			return ApplyBudget{Decoded: -1, Structs: -1, Bytes: length - 1, Split: -1}
+		})
+		before := stateOf(doc)
+		refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
+		if refused.Bytes != length {
+			t.Fatalf("the refusal reports %d bytes, want the %d clocks of the deleted run", refused.Bytes, length)
+		}
+
+		fits := guardedDoc(t, base)
+		fits.SetApplyBudget(func(any) ApplyBudget {
+			return ApplyBudget{Decoded: -1, Structs: -1, Bytes: length, Split: -1}
+		})
+		fitsBefore := stateOf(fits)
+		requireApplied(t, fits, fitsBefore, ApplyUpdateV1(fits, update, nil))
+		if got := fitsBefore.deletes; got == stateOf(fits).deletes {
+			t.Fatalf("the applied run left the delete set at %s, so the length costs the document nothing", got)
 		}
 	})
 }

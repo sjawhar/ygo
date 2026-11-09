@@ -392,10 +392,18 @@ func refsOf(items []*Item) []mergeRef {
 }
 
 // apply merges arrived into p's queue by plan and returns the arrivals to
-// append; viewed is whether a recorded view of the queue must stay.
-func (p *pendingUpdate) apply(pl mergePlan, arrived []*Item, viewed bool) []*Item {
+// append and the clocks the merge grew queued structs by; viewed is whether
+// a recorded view of the queue must stay.
+//
+// Only a GC struct grows, by the GC structs it takes in, and the clocks it
+// gains are deleted range the document now holds for an arrival that left
+// no struct of its own to charge. The caller charges them against the
+// arriving update's byte budget (noteParkGrowth), since a count taken over
+// the queue instead would cost a pass over it per park.
+func (p *pendingUpdate) apply(pl mergePlan, arrived []*Item, viewed bool) ([]*Item, uint64) {
 	var dropped []queued
 	var gone []ClientID
+	grown := uint64(0)
 	held := pl.held
 	kepts := make([][]queued, len(pl.wins)) // nil where the merge changed nothing
 	for wi, w := range pl.wins {
@@ -412,7 +420,11 @@ func (p *pendingUpdate) apply(pl mergePlan, arrived []*Item, viewed bool) []*Ite
 				dropped, changed = append(dropped, q), true
 			default:
 				// A GC struct grows by the GC structs it took in.
+				was := q.Content.Len()
 				keep(q.Item, k)
+				if now := q.Content.Len(); now > was {
+					grown += now - was
+				}
 				if k.end > end {
 					p.cover.insertSpan(q.Item)
 					p.noteTail(q.Item)
@@ -444,7 +456,7 @@ func (p *pendingUpdate) apply(pl mergePlan, arrived []*Item, viewed bool) []*Ite
 			out = append(out, it)
 		}
 	}
-	return out
+	return out, grown
 }
 
 // drop empties the slots of dropped, so a merge costs no pass over the queue,

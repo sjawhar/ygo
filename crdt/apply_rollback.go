@@ -222,6 +222,9 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 			}
 		}
 	}
+	if d.refusedContent != nil {
+		j.tally.refusedContent = d.callRefusedContent(txn.Origin)
+	}
 }
 
 // pendingMovesAt is the store's pending moves as a point of an apply found
@@ -433,6 +436,31 @@ func drainParked(txn *Transaction, drain func()) {
 			clear(s.parked.left[leftLen:])
 			s.parked.left = s.parked.left[:leftLen]
 		}
+		// The failure stays the drain's, the split budget's included: the
+		// drain is taken back, the backlog is parked again whole, and the
+		// update that filled the gap stands.
+		//
+		// Refusing that update instead would punish the one sender who can
+		// do nothing about it. The content whose splits passed the budget
+		// is somebody else's, already in this room's queue; the sender
+		// cannot see that backlog, cannot drop it, and has no smaller
+		// update it could have sent, since carrying the gap-filling clock
+		// at all is what starts the drain. Nor would it pass: the drain is
+		// taken back, the backlog stays, and the next writer to carry that
+		// clock is refused identically, for ever - a peer can park content
+		// whose drain splits a long run many times and close that gap to
+		// everyone. The update that does this in practice is a whole-state
+		// handoff, which is what a reconnecting browser sends, and
+		// 1.55.1-sami.6 was cut for refusing exactly that by another route
+		// (an allowed-roots list refusing a handoff that writes nothing).
+		//
+		// What the budget is for is still served: the drain added nothing,
+		// so the document gains only what the update itself carried, and an
+		// owner sees the backlog standing still in Doc.PendingStats. A
+		// caller that wants the hard failure makes it from its own side on
+		// that reading, where it has a close code and a message of its own;
+		// a library that failed the writer here would leave a consumer with
+		// "invalid update" for ever and no way to reach the cause.
 	}()
 	drain()
 }
@@ -799,6 +827,86 @@ func refuseOnBoundedDoc(doc *Doc, content Content) error {
 	return nil
 }
 
+// ContentKind names one kind of content a struct can carry, which is what
+// WithRefusedContent's set is made of. Its values are the content tags of
+// the Yjs wire format, which the format fixes, so a set an owner writes down
+// keeps its meaning across releases.
+type ContentKind uint8
+
+// The content kinds a struct of a remote update can carry. A subdocument and
+// a move are among them for completeness; a bounded document already refuses
+// both from a remote update (refuseOnBoundedDoc).
+const (
+	ContentKindDeleted = ContentKind(wireDeleted)
+	ContentKindJSON    = ContentKind(wireJSON)
+	ContentKindBinary  = ContentKind(wireBinary)
+	ContentKindString  = ContentKind(wireString)
+	ContentKindEmbed   = ContentKind(wireEmbed)
+	ContentKindFormat  = ContentKind(wireFormat)
+	ContentKindType    = ContentKind(wireType)
+	ContentKindAny     = ContentKind(wireAny)
+	ContentKindDoc     = ContentKind(wireDoc)
+	ContentKindMove    = ContentKind(wireMove)
+)
+
+// ErrContentNotAllowed is why a document with a set of refused content kinds
+// (WithRefusedContent) refuses a remote update carrying one of them. It
+// wraps ErrInvalidUpdate, and the apply returns it inside a
+// RefusedUpdateError: like every remote update a bounded document refuses,
+// the update leaves the document as it was.
+var ErrContentNotAllowed = fmt.Errorf("%w: it carries a kind of content the document does not allow", ErrInvalidUpdate)
+
+// contentKindOf is the kind c is, and false for content no remote update can
+// carry (a skip struct's, say), which no set can name.
+func contentKindOf(c Content) (ContentKind, bool) {
+	switch c.(type) {
+	case *ContentDeleted:
+		return ContentKindDeleted, true
+	case *ContentJSON:
+		return ContentKindJSON, true
+	case *ContentBinary:
+		return ContentKindBinary, true
+	case *ContentString:
+		return ContentKindString, true
+	case *ContentEmbed:
+		return ContentKindEmbed, true
+	case *ContentFormat:
+		return ContentKindFormat, true
+	case *ContentType:
+		return ContentKindType, true
+	case *ContentAny:
+		return ContentKindAny, true
+	case *ContentDoc:
+		return ContentKindDoc, true
+	case *ContentMove:
+		return ContentKindMove, true
+	}
+	return 0, false
+}
+
+// refuseContentKind is ErrContentNotAllowed for content a remote apply on
+// doc has just decoded, when the apply's set of refused kinds names its kind;
+// nil otherwise, which includes every decode outside an apply and every apply
+// whose set is empty (WithRefusedContent).
+//
+// It runs where the decode has read the struct and before the struct
+// integrates (decodeItem), the earliest point at which the kind is known: a
+// refusal there costs the apply nothing it has not already spent, and no
+// struct of a refused kind is ever linked into a list. The set is short -
+// an owner names the kinds its schema has no node for - so the lookup is a
+// walk over it rather than a map the apply would have to build.
+func refuseContentKind(doc *Doc, content Content) error {
+	t := doc.tally()
+	if t == nil || len(t.refusedContent) == 0 {
+		return nil
+	}
+	kind, known := contentKindOf(content)
+	if !known || !slices.Contains(t.refusedContent, kind) {
+		return nil
+	}
+	return ErrContentNotAllowed
+}
+
 // ErrApplyBudget is why a document with an apply budget (WithApplyBudget)
 // refuses a remote update that decodes or integrates more than the apply's
 // budget allows. It wraps ErrInvalidUpdate, and the apply returns it inside a
@@ -815,8 +923,9 @@ var ErrRootNotAllowed = fmt.Errorf("%w: it names a root the document does not al
 
 // applyTally is what one remote apply has decoded and added, and the
 // allowance it may do so within: the budget WithApplyBudget answered for the
-// apply's origin and the roots WithAllowedRoots allowed it, both read once as
-// the apply began (beginRemoteApply).
+// apply's origin, the roots WithAllowedRoots allowed it and the content
+// kinds WithRefusedContent keeps out of it, each read once as the apply
+// began (beginRemoteApply).
 //
 // The counts are what RefusedUpdateError reports for a refused apply, since
 // no observer reports a rolled-back transaction, and a document with any
@@ -841,6 +950,9 @@ type applyTally struct {
 	roots        []string
 	allowedTypes map[*abstractType]bool
 	rootOf       map[*abstractType]*abstractType
+	// refusedContent is the kinds of content the update may not carry, or
+	// nil or empty for every kind (WithRefusedContent).
+	refusedContent []ContentKind
 	// decoded, structs, bytes and split are the counts of WithApplyBudget;
 	// root is the root a refused apply reached that roots does not allow,
 	// empty when the refused item hangs under no root of the document.
@@ -851,7 +963,7 @@ type applyTally struct {
 // noApplyBudget is the budget of an apply on a document with no budget
 // callback: no limit in any measure, so the counts are kept and reported and
 // nothing is refused for them (WithApplyBudget).
-var noApplyBudget = ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1}
+var noApplyBudget = ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1, Split: -1}
 
 // tally is the running tally of the remote apply on d, or nil when no apply
 // is running on it, when d bounds nothing, or when d itself is nil, which a
@@ -923,17 +1035,48 @@ func (t *applyTally) nestedAll(vals []any) {
 }
 
 // integrated counts item, a struct of the update the apply has just added to
-// the store, with the bytes of content it carries.
+// the store or just parked, with the bytes it costs the document to hold.
+//
+// Those bytes are the content's (contentBytes) and two more charges the
+// content itself cannot answer for. A map key is the first: an item under a
+// key carries that key, the document keeps the string for as long as the
+// entry lives, and its length is the sender's to choose, so an update of one
+// struct under a key of a megabyte costs a megabyte the content does not
+// show. A deleted item's length is the second: its content is a length and
+// no bytes, and what the document keeps for it is a range in its delete set,
+// which it carries into every encode of its state, so the length is what to
+// charge (TestUnit_ApplyBudget_BytesCountsAMapKeyAndADeletedRange).
 func (t *applyTally) integrated(item *Item) {
 	if t == nil {
 		return
 	}
 	t.structs++
 	t.bytes += contentBytes(item.Content)
+	if item.ParentSub != nil {
+		t.bytes += len(*item.ParentSub)
+	}
+	if del, ok := item.Content.(*ContentDeleted); ok {
+		t.bytes += clampedLen(del.Len())
+	}
+}
+
+// clampedLen is n as an int that cannot wrap: a length past what an int
+// holds counts as the largest int, which no budget can be at or above, so
+// an apply carrying one is refused rather than credited by an overflow. It
+// is the 32-bit build that needs it, where a length of four gigabytes wraps
+// to a small or negative number.
+func clampedLen(n uint64) int {
+	const maxInt = int(^uint(0) >> 1)
+	if n > uint64(maxInt) {
+		return maxInt
+	}
+	return int(n)
 }
 
 // integratedErr is ErrApplyBudget when the apply integrated more structs or
-// more bytes than its budget allows, and nil otherwise.
+// more bytes than its budget allows, and nil otherwise. The split count is
+// not read here: the apply makes most of its splits after this runs, so
+// Split is read where a split is made (countSplit).
 func (t *applyTally) integratedErr() error {
 	if t == nil {
 		return nil
@@ -952,17 +1095,17 @@ func (t *applyTally) integratedErr() error {
 // applies call it where their struct phase ends, before the delete set is
 // decoded and before the pending queue drains (applyV1Txn, applyV2Txn).
 //
-// The counts are final there: the delete set integrates no struct of its
-// own, and the structs it makes by splitting items the document already held
-// are reported as Split, which no budget bounds. Reading the budget there
-// and nowhere later is what keeps two whole classes of damage out of a
-// refusal. A refusal after the delete set had run would have to give back a
-// subdocument the delete detached from its parent, and a refusal after the
+// The struct and byte counts are final there: every struct the update
+// carries has integrated or parked (noteIntegrated, notePark), and the
+// delete set adds none of its own. Reading them there and nowhere later is
+// what keeps a whole class of damage out of a refusal: a refusal after the
 // drain cannot give back what the drain changed in the parked items it
 // integrated - a parked "BC" it trimmed to "C" stays trimmed - so this node
-// would keep a document every peer disagrees with. Neither is reachable
-// through ErrApplyBudget when the budget is read before both
-// (TestUnit_ApplyBudget_ARefusalAfterTheDrainKeepsWhatTheDocumentHeld).
+// would keep a document every peer disagrees with. That is not reachable
+// through ErrApplyBudget when the budget is read before the drain
+// (TestUnit_ApplyBudget_ARefusalAfterTheDrainKeepsWhatTheDocumentHeld). The
+// split count is the one measure read later, where each split is made and so
+// before the drain too (countSplit).
 func refuseOverBudget(txn *Transaction) error {
 	j := txn.applyJournal()
 	if j == nil {
@@ -974,16 +1117,25 @@ func refuseOverBudget(txn *Transaction) error {
 // noteIntegrated records item with txn's apply, where the apply adds a struct
 // of its update to the store (Item.integrate, integrateGroup, appendTrimmed):
 // it refuses the apply when the item lands under a root the document's
-// allowed-roots list does not name (checkItemRoot), and counts the struct and
-// its bytes against the budget.
+// allowed-roots list does not name (checkItemRoot), or under one the list of
+// the apply that parked it did not name (checkParkedRoot), and counts the
+// struct and its bytes against the budget.
 //
 // A struct the drain of the pending queue adds is not the update's and is not
 // counted: refusing the update for what an earlier update parked would let
 // one sender have every later update that fills its gap refused
-// (drainParked). The root check does run for it, since what the list keeps
-// out of a root must stay out of it however it arrives; a drain the check
-// refuses is taken back on its own and its items stay parked.
+// (drainParked). The root checks do run for it, since what a list keeps out
+// of a root must stay out of it however it arrives.
+//
+// The asymmetry with notePark is the point of both: the update that brings
+// content is charged for it where it arrives, whether the content integrates
+// at once or waits in the queue for a gap its sender will fill, and the
+// sender of the gap filler is charged nothing for what another update
+// parked. What the gap filler IS charged for is the splits its drain makes,
+// which are structs the document gains at that moment and which nothing
+// charged at park (countSplit).
 func noteIntegrated(txn *Transaction, item *Item) {
+	checkParkedRoot(txn, item)
 	t := txn.doc.tally()
 	if t == nil {
 		return
@@ -994,11 +1146,93 @@ func noteIntegrated(txn *Transaction, item *Item) {
 	}
 }
 
+// notePark records item with txn's apply, where the apply puts a struct of
+// its update in the pending queue instead of the store
+// (parkWithinUpdatePending), as noteIntegrated records one it integrated:
+// the item is charged against the struct and byte budget, refused when it
+// hangs under a root the document's allowed-roots list does not name, and -
+// when its parent is not resolved yet, so that no root can be read off it -
+// made to carry that list, which authorises it when the drain finally
+// integrates it (checkParkedRoot).
+//
+// A parked struct is the update's whatever becomes of it. The document holds
+// it in memory from the moment it parks, returns it in its encoded state and
+// integrates it as soon as the gap is filled, so an update charged nothing
+// for what it parks could grow the document without limit under any budget,
+// and a root the list keeps a sender out of could be written into by parking
+// behind a clock the sender never sends. The counting is the update's alone:
+// the drain that later integrates the item adds nothing to the struct or
+// byte count (noteIntegrated), so the apply that fills the gap pays nothing
+// for it (TestUnit_ApplyBudget_CountsTheStructsAnUpdateParks).
+func notePark(txn *Transaction, item *Item) {
+	noteIntegrated(txn, item)
+	if item.Parent != nil {
+		// The root is readable now and was just checked; nothing is left to
+		// decide later.
+		return
+	}
+	if t := txn.doc.tally(); t != nil && len(t.roots) > 0 {
+		item.parkedRoots = t.roots
+	}
+}
+
+// noteParkGrowth charges clocks, the deleted range a park added to a GC
+// struct the queue already held (pendingUpdate.apply), against the apply's
+// byte budget. Such an arrival leaves no struct of its own in the queue, so
+// notePark never sees it, and the clocks are a range the document keeps and
+// carries in its encoded state exactly as an integrated deleted item's
+// length is (applyTally.integrated). It adds no struct to the count: the
+// queue holds one struct before and after
+// (TestUnit_ApplyBudget_BytesCountsTheRangeAParkGrows).
+func noteParkGrowth(txn *Transaction, clocks uint64) {
+	if clocks == 0 {
+		return
+	}
+	if t := txn.doc.tally(); t != nil {
+		t.bytes += clampedLen(clocks)
+	}
+}
+
+// checkParkedRoot refuses the apply, by the panic it recovers as
+// ErrRootNotAllowed (recoveredApplyErr), when item is a parked struct whose
+// parking apply allowed a list of roots (notePark) and the root it now
+// resolves to is outside that list.
+//
+// It is what keeps a parked write inside the permissions of the sender that
+// parked it. A struct whose container has not arrived has no parent to read
+// a root off, so the check at park time can say nothing about it; without
+// this one it would be judged, when the drain integrates it, against the
+// list of whatever apply happened to supply the container. A sender allowed
+// only "public" could then park a child of a private container it may not
+// touch and wait for a trusted peer to bring that container: the drain would
+// authorise the forged write against the trusted peer's list and store it.
+// Both lists must hold: the parking one here, and the draining one in
+// checkItemRoot
+// (TestUnit_AllowedRoots_AParkedWriteKeepsItsOwnSendersPermissions).
+//
+// A drain this refuses drops the one item it refused and goes on
+// (tryIntegrateOrDrop): the item is nobody else's to answer for, and
+// refusing the apply that filled the gap would punish the wrong sender.
+func checkParkedRoot(txn *Transaction, item *Item) {
+	if len(item.parkedRoots) == 0 || item.Parent == nil {
+		return
+	}
+	d := txn.doc
+	name, isRoot := rootName(d, rootAbove(d.tally(), item.Parent))
+	if isRoot && slices.Contains(item.parkedRoots, name) {
+		return
+	}
+	if t := d.tally(); t != nil {
+		t.root = name
+	}
+	panic(rootNotAllowed{})
+}
+
 // noteDeleted refuses txn's apply when it deletes an item under a root the
 // document's allowed-roots list does not name (Item.delete). Deleting is not
 // counted against the budget - it adds nothing to the document but the splits
-// the range's edges make, which countSplit reports - and it is bounded by the
-// delete ranges the apply decoded (countDecodedRanges).
+// the range's edges make, which countSplit counts and Split bounds - and it
+// is bounded by the delete ranges the apply decoded (countDecodedRanges).
 func noteDeleted(txn *Transaction, item *Item) {
 	if t := txn.doc.tally(); t != nil {
 		t.checkItemRoot(txn.doc, item.Parent)
@@ -1031,28 +1265,7 @@ func (t *applyTally) checkItemRoot(d *Doc, parent *abstractType) {
 	if len(t.roots) == 0 || parent == nil {
 		return
 	}
-	root, known := t.rootOf[parent]
-	if !known {
-		var chain []*abstractType
-		root = parent
-		for {
-			if above, seen := t.rootOf[root]; seen {
-				root = above
-				break
-			}
-			chain = append(chain, root)
-			if root.item == nil || root.item.Parent == nil {
-				break
-			}
-			root = root.item.Parent
-		}
-		if t.rootOf == nil {
-			t.rootOf = make(map[*abstractType]*abstractType, len(chain))
-		}
-		for _, passed := range chain {
-			t.rootOf[passed] = root
-		}
-	}
+	root := rootAbove(t, parent)
 	if t.allowedTypes[root] {
 		return
 	}
@@ -1065,6 +1278,45 @@ func (t *applyTally) checkItemRoot(d *Doc, parent *abstractType) {
 	}
 	t.root = name
 	panic(rootNotAllowed{})
+}
+
+// rootAbove is the topmost type above parent: parent itself when it is a
+// root, and otherwise the type the chain of containers ends at. With a
+// tally it memoises the answer per type and one walk answers a whole chain -
+// it climbs only to the first ancestor already answered and records the root
+// for every type it passed, so an update of n items nested n deep costs one
+// walk rather than one for each item. t may be nil, which is a plain walk.
+func rootAbove(t *applyTally, parent *abstractType) *abstractType {
+	if t == nil {
+		root := parent
+		for root.item != nil && root.item.Parent != nil {
+			root = root.item.Parent
+		}
+		return root
+	}
+	if root, known := t.rootOf[parent]; known {
+		return root
+	}
+	var chain []*abstractType
+	root := parent
+	for {
+		if above, seen := t.rootOf[root]; seen {
+			root = above
+			break
+		}
+		chain = append(chain, root)
+		if root.item == nil || root.item.Parent == nil {
+			break
+		}
+		root = root.item.Parent
+	}
+	if t.rootOf == nil {
+		t.rootOf = make(map[*abstractType]*abstractType, len(chain))
+	}
+	for _, passed := range chain {
+		t.rootOf[passed] = root
+	}
+	return root
 }
 
 // rootName is the name d holds root under, and false for a type that is no
@@ -1086,11 +1338,55 @@ func rootName(d *Doc, root *abstractType) (string, bool) {
 }
 
 // countSplit counts the struct a split added, where the apply splits an item
-// (splitItem). A split is reported and never bounded (WithApplyBudget), and
-// like an integrated struct it is counted only outside the drain.
+// (splitItem), and refuses once the splits pass the budget, by the panic the
+// apply recovers as ErrApplyBudget (recoveredApplyErr). What the refusal
+// falls on depends on where the split was made: a split of the update's own
+// refuses the whole apply, and a split the drain of the pending queue made
+// refuses the drain alone (drainParked).
+//
+// The budget is read here, and not where the struct and byte budgets are
+// read (refuseOverBudget), because that point is before the delete set and
+// every split of a delete-only update is made after it: a check there would
+// never fire for the update the Split budget exists for (ApplyBudget.Split).
+// Reading it at the split is also where the cost is taken, as the decode
+// count is read inside the decode loop (applyTally.decode), so an update of
+// a hundred thousand delete ranges is refused at the split that passes the
+// budget and not once it has made them all.
+//
+// A split the drain of the pending queue makes is counted, where a struct
+// the drain integrates is not (noteIntegrated), and the asymmetry is the
+// point of both. A parked struct's own structs and bytes were charged to
+// the sender that brought them, at the moment it parked, so charging them
+// again to the apply that fills the gap would charge one edit twice and let
+// one sender have every later update refused. A split half is nobody's
+// before the drain makes it: it is a struct the document gains at that
+// moment, from items the document already held, and without this charge
+// Structs + Split stops bounding what an apply adds - twelve parked
+// one-character inserts landing in one run cost the document twelve split
+// halves that no count saw
+// (TestUnit_ApplyBudget_ADrainsSplitsAreChargedToTheApplyThatLandsThem).
+//
+// A refusal raised from inside the delete set is taken back whole, as the
+// allowed-roots rule's refusal from the same place is
+// (TestUnit_AllowedRoots_ARefusalKeepsADeletedSubdocumentAttached): the
+// rollback puts back what the ranges deleted, and the splits themselves cost
+// the document nothing, since the commit merges each back once the items
+// between the halves are gone. A refusal raised inside the drain is taken
+// back there and goes no further: the drain gives back what it changed in
+// the items it integrated, parks them again whole, and the update that
+// filled the gap stands, because the content whose splits passed the budget
+// is not that update's and its sender can do nothing about it (drainParked).
+// Both are pinned by
+// TestUnit_ApplyBudget_ARefusedSplitInADrainParksTheItemBackWhole, which
+// runs the two cases side by side.
 func countSplit(txn *Transaction) {
-	if t := txn.doc.tally(); t != nil && !txn.applyJournal().inDrain() {
-		t.split++
+	t := txn.doc.tally()
+	if t == nil {
+		return
+	}
+	t.split++
+	if t.budget.Split >= 0 && t.split > t.budget.Split {
+		panic(applyBudgetExceeded{})
 	}
 }
 
@@ -1104,9 +1400,10 @@ func countSplit(txn *Transaction) {
 // would otherwise be counted as one. The decode counts them in its first
 // pass, before it allocates a list for any of them (decodeDeleteSet).
 //
-// What the count bounds is the work the ranges make the document do: each
-// range can split a struct the document holds, and a split adds a struct the
-// Structs budget does not count.
+// What the count bounds is the work the ranges make the document do before
+// the split budget can see it: each range can split a struct the document
+// holds, and a split adds a struct Structs does not count and Split does
+// (countSplit).
 func countDecodedRanges(txn *Transaction, n int) {
 	txn.doc.tally().decode(n)
 }
@@ -1140,6 +1437,32 @@ func refuseRootOnBoundedDoc(doc *Doc, name string) error {
 	return ErrRootNotAllowed
 }
 
+// noteRootName charges len(name) against the apply's byte budget where a
+// remote apply's decode is about to resolve a root the document does not
+// hold yet, and so create and keep it (decodeItem's getOrCreateType). It
+// does nothing for a root the document already holds, so one update naming
+// the same root in struct after struct is charged once, and nothing outside
+// an apply.
+//
+// A root name is a string the sender chose and the document keeps for as
+// long as it holds the root, exactly as a map key is (applyTally.integrated)
+// and exactly as an XML element's node name is (typeNameBytes). It used to
+// be the one such string outside Bytes, so Bytes: 1 admitted and retained a
+// root named with a megabyte while a map key of that size was refused
+// (TestUnit_ApplyBudget_BytesCountsARootNameTheUpdateCreates). An
+// allowed-roots list keeps that name out too, when the owner sets one, but a
+// budget alone has to bound it.
+func noteRootName(doc *Doc, name string) {
+	t := doc.tally()
+	if t == nil {
+		return
+	}
+	if _, held := doc.share[name]; held {
+		return
+	}
+	t.bytes += len(name)
+}
+
 // anyScalarBytes is what a decoded lib0 Any scalar - a number, a boolean,
 // null, or the slot an element of an array or an entry of a map takes - is
 // counted as: the two words of an interface value, which is what it costs the
@@ -1148,7 +1471,10 @@ const anyScalarBytes = 16
 
 // contentBytes is the bytes of content a struct carries: its text, its binary
 // and the values it decoded, not the item around them, whose cost the Structs
-// count bounds. A deleted range carries none (it is a length). A type carries
+// count bounds. A deleted range carries none here - it is a length, and the
+// tally charges that length where it charges the item
+// (applyTally.integrated), which is also where the map key an item carries
+// is charged, since neither is part of the content. A type carries
 // only the name an XML element or hook keeps - it is otherwise an empty
 // container the structs under it fill, each counted as it integrates - and
 // that name is as long as its sender made it. A subdocument and a move carry

@@ -100,16 +100,9 @@ func (p *peer) handleMessage(data []byte) {
 			p.applySyncUpdate(subType, update, payload)
 			return
 		}
-		// Peer sent step-1 — send the room's state only to them, cut into the
-		// frames stateFrameBytes allows so that applying one is one short task
-		// on the receiver. Read-only peers may still request state (#59).
-		reply, err := ygsync.EncodeSyncStep2Split(p.room.doc, payload, p.stateMessageBytes())
-		if err != nil {
-			p.server.log().Debug("discarded unappliable sync message",
-				"room", p.roomName, "err", err)
-			return
-		}
-		p.sendSyncSeries(reply)
+		// Peer sent step-1 — answer with the room's state, through
+		// Server.OnStateAnswer when one is set (answerSyncStep1).
+		p.answerSyncStep1(payload)
 
 	case msgAwareness:
 		// Awareness payload is VarBytes-wrapped (y-websocket protocol).

@@ -861,6 +861,7 @@ func decodeItemV2(dec *v2Decoder, doc *Doc, client ClientID, clock uint64, info 
 			if err := refuseRootOnBoundedDoc(doc, name); err != nil {
 				return nil, 0, err
 			}
+			noteRootName(doc, name)
 			parent = doc.getOrCreateType(name)
 		} else {
 			// Parent by item ID.
@@ -898,6 +899,9 @@ func decodeItemV2(dec *v2Decoder, doc *Doc, client ClientID, clock uint64, info 
 		return nil, 0, err
 	}
 	if err := refuseOnBoundedDoc(doc, content); err != nil {
+		return nil, 0, err
+	}
+	if err := refuseContentKind(doc, content); err != nil {
 		return nil, 0, err
 	}
 

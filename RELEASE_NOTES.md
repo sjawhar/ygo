@@ -1,3 +1,62 @@
+## v1.55.1-sami.8
+
+This fork release retains the complete
+[v1.55.1-sami.7 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.7)
+and closes ten ways a remote update could get past the apply budget, the
+allowed-roots rule, or a refusal, that a release review found against Dispatch
+at v1.55.1-sami.7. There are no wire format changes, the series
+`SplitUpdateV1` produces is unchanged, and a document that sets no budget, no
+allowed-roots list, no refused-content set and no scan bound behaves exactly
+as before.
+
+### What a refusal must never do, and now does not
+
+The worst of the ten: a refused update could change the document. A delete
+whose range fell inside a supplementary character's UTF-16 surrogate pair
+split the character, and if the apply was then refused, re-joining the halves
+did not restore it — the character became two replacement characters, no
+observer fired, and re-syncing the full state could not repair it because the
+clocks were already present. The split counter now refuses before the split is
+made, so a refused update leaves the document byte-for-byte as it was.
+
+### What the budget now bounds that it did not
+
+- **Splits a delete makes.** `ApplyBudget.Split` bounds the structs an apply
+  adds by cutting items the document already held; a one-character delete can
+  no longer get past a budget that allows no new structs. `Split` follows the
+  other fields: below zero is no limit, zero allows nothing. A split made
+  while draining the pending queue is charged to `Split` too, but a drain that
+  passes it refuses the drain alone and parks the backlog again whole — the
+  update that filled the gap still lands, because the content whose splits
+  passed the budget is another sender's and the filler can do nothing about
+  it. A caller that wants the hard failure makes it from its own room state.
+- **Parked content.** A struct that waits on a missing clock is counted when
+  it parks, so an update can no longer park unbounded content under a zero
+  budget and have a later tiny update land it all.
+- **A map key, a nested type name, and a retained root name** are counted in
+  `Bytes`; an in-place extension of a parked, garbage-collected range is
+  charged its new length.
+
+### What a sender may no longer reach
+
+- **A root it was never allowed.** The allowed-roots rule is now applied when
+  a write parks, not only when it drains, so a sender restricted to one root
+  can no longer write into another by referencing a container that has not
+  arrived yet and waiting for a trusted peer to create it. A parked write
+  carries the roots of the apply that parked it.
+- **A refused content kind.** `WithRefusedContent` names content kinds a
+  remote apply may not carry, checked even when the kind is nested inside
+  another type.
+
+### New for a caller that weighs a sync
+
+`Server.OnStateAnswer` (package `provider/websocket`) runs before
+`EncodeSyncStep2Split` answers a client's first sync, so a caller can weigh or
+refuse an answer whose encode would otherwise be unbounded. Its reported
+struct count includes the pending queue the answer also carries, and a hook
+that waits reads `StructsNow()` for the room as it stands when it admits the
+answer rather than when it was first called.
+
 ## v1.55.1-sami.7
 
 This fork release retains the complete
