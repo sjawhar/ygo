@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.9] — 2026-11-09
+
+Fork release on [1.55.1-sami.8](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.8),
+correcting one over-charge it introduced. No wire format changes, and a
+document that sets no budget is unchanged.
+
+### Changed
+
+- **`crdt.ApplyBudget.Bytes` no longer counts a deleted range's span.**
+  1.55.1-sami.8 charged a deleted run (a `ContentDeleted` tombstone, and a
+  parked GC range a merge grew) its full claimed clock span. A deleted run
+  carries no content: what the document keeps for it is a range record of two
+  integers, whatever span it names, so the span is no byte cost. The charge
+  refused a fifteen-byte frame claiming 2^40 clocks of a client the document
+  had never seen — a frame that deletes nothing — as if it carried a terabyte,
+  which a reconnecting client's whole-state handoff can legitimately send. A
+  delete is bounded as it was before sami.8: by the number of ranges it
+  carries (`Decoded`), the splits its edges make (`Split`), and the tombstone
+  structs it integrates (`Structs`); only the span now goes uncharged, because
+  it was never a cost. A `Bytes` budget that refused such a delete at sami.8
+  admits it here; nothing a delete was bounded by is loosened.
+
 ## [1.55.1-sami.8] — 2026-11-09
 
 Fork release on [1.55.1-sami.7](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.7),

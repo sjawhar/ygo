@@ -2008,16 +2008,12 @@ func deletedRangeUpdate(root string, length uint64) []byte {
 	return bytes.Clone(enc.Bytes())
 }
 
-// Bytes counts two costs an item's content cannot show: the map key it hangs
-// under, and the length of a deleted run.
-//
-// Both were free. A key is a string the sender sizes and the document keeps
-// for as long as the entry lives, so one struct of one byte of content under
-// a key of a megabyte was admitted and retained under Bytes: 1; and a
-// deleted run carries no content, so a run of a million clocks was admitted
-// under Bytes: 0 and kept as a range in the document's delete set, which
-// every encode of its state carries.
-func TestUnit_ApplyBudget_BytesCountsAMapKeyAndADeletedRange(t *testing.T) {
+// Bytes counts a map key an item hangs under, which the document keeps for as
+// long as the entry lives, but NOT the span of a deleted run, which carries no
+// content and costs the document a range record of two integers whatever span
+// it names. A delete's cost is the number of ranges it carries (Decoded), not
+// their length.
+func TestUnit_ApplyBudget_BytesCountsAMapKeyButNotADeletedRange(t *testing.T) {
 	const base = "hello world"
 
 	t.Run("a map key", func(t *testing.T) {
@@ -2048,28 +2044,21 @@ func TestUnit_ApplyBudget_BytesCountsAMapKeyAndADeletedRange(t *testing.T) {
 		}
 	})
 
-	t.Run("a deleted range", func(t *testing.T) {
-		const length = 1_000
-		update := deletedRangeUpdate("t", length)
-
-		doc := guardedDoc(t, base)
-		doc.SetApplyBudget(func(any) ApplyBudget {
-			return ApplyBudget{Decoded: -1, Structs: -1, Bytes: length - 1, Split: -1}
-		})
-		before := stateOf(doc)
-		refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
-		if refused.Bytes != length {
-			t.Fatalf("the refusal reports %d bytes, want the %d clocks of the deleted run", refused.Bytes, length)
-		}
+	t.Run("a deleted range is not charged its span", func(t *testing.T) {
+		// A deleted run of a span far past any byte budget: it carries no
+		// content, so a byte budget of zero must still admit it, and the span
+		// it claims is not charged.
+		const span = 1 << 40
+		update := deletedRangeUpdate("t", span)
 
 		fits := guardedDoc(t, base)
 		fits.SetApplyBudget(func(any) ApplyBudget {
-			return ApplyBudget{Decoded: -1, Structs: -1, Bytes: length, Split: -1}
+			return ApplyBudget{Decoded: -1, Structs: -1, Bytes: 0, Split: -1}
 		})
 		fitsBefore := stateOf(fits)
 		requireApplied(t, fits, fitsBefore, ApplyUpdateV1(fits, update, nil))
 		if got := fitsBefore.deletes; got == stateOf(fits).deletes {
-			t.Fatalf("the applied run left the delete set at %s, so the length costs the document nothing", got)
+			t.Fatalf("the applied run left the delete set at %s, so nothing was deleted", got)
 		}
 	})
 }

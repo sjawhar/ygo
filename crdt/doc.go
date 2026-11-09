@@ -276,8 +276,11 @@ type ApplyBudget struct {
 	// Bytes is the bytes of content the apply may integrate, counted for a
 	// struct that parks as for one that integrates. Besides the content
 	// itself (contentBytes) it counts the map key an item carries, which the
-	// document keeps for as long as the entry lives, and the length of a
-	// deleted item, which is what the document's delete set holds for it.
+	// document keeps for as long as the entry lives. A deleted item is not
+	// counted: it carries no content, and what the document keeps for it is a
+	// range record of two integers whatever span it names, so its span is no
+	// byte cost. The number of delete ranges an update carries is bounded by
+	// Decoded instead.
 	Bytes int
 	// Split is the structs the apply may make by splitting items the
 	// document already held, which Structs excludes and which an update

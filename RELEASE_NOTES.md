@@ -1,3 +1,36 @@
+## v1.55.1-sami.9
+
+This fork release retains the complete
+[v1.55.1-sami.8 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.8)
+and corrects one over-charge it introduced. There are no wire format changes,
+and a document that sets no budget is unchanged.
+
+### The defect
+
+v1.55.1-sami.8 made `ApplyBudget.Bytes` count a deleted range its full claimed
+clock span. A deleted run carries no content — what the document keeps for it
+is a range record of two integers, whatever span it names — so charging the
+span counted memory that does not exist. A fifteen-byte frame claiming 2^40
+clocks of a client the document had never seen, which deletes nothing, was
+refused as if it carried a terabyte of content. A reconnecting client sends
+exactly such a frame in its whole-state handoff, so the over-charge refused
+legitimate sync, in the same shape v1.55.1-sami.6 was cut to stop.
+
+### The fix
+
+`Bytes` no longer counts a deleted range's span, in either place sami.8
+charged it: an integrated `ContentDeleted` tombstone, and a parked
+garbage-collected range a merge grows. A delete is bounded as it was before
+sami.8 — by the number of ranges it carries (`Decoded`), the splits its edges
+make (`Split`), and the tombstone structs it integrates (`Structs`). Only the
+span goes uncharged, because it was never a cost. Measured: admitting a 2^40
+-clock tombstone allocates about 48 objects, and growing a parked range by
+2^30 clocks about 32 — both independent of the span — while a flood of ten
+thousand distinct delete ranges is still refused by `Decoded`.
+
+A `Bytes` budget that refused such a delete at v1.55.1-sami.8 admits it here.
+Nothing a delete was bounded by is loosened.
+
 ## v1.55.1-sami.8
 
 This fork release retains the complete

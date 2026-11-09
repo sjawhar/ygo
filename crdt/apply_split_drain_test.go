@@ -672,16 +672,13 @@ func parkedClocks(doc *Doc) uint64 {
 	return n
 }
 
-// Bytes counts the deleted range a park adds to a GC struct the queue
-// already held.
-//
-// Such an arrival leaves no struct of its own in the queue - it merges into
-// the struct before it and is gone - so the charge every parked struct gets
-// never reached it, and a budget of Structs: 0 and Bytes: 0 let one update
-// grow a parked range to a million clocks. The clocks are compact, so this
-// is not a heap the owner can be driven out of; it is the accounting the
-// rest of the budget rests on.
-func TestUnit_ApplyBudget_BytesCountsTheRangeAParkGrows(t *testing.T) {
+// A deleted range a park adds to a GC struct the queue already held costs no
+// bytes. The grown clocks are a range the document holds as a range record, a
+// pair of integers whatever span they name, not content; a delete's cost is
+// the number of ranges it carries, not their length. The clocks are compact,
+// so there is no heap an owner can be driven out of, and a budget of Bytes: 0
+// admits the growth.
+func TestUnit_ApplyBudget_ADeletedRangeAParkGrowsCostsNoBytes(t *testing.T) {
 	const grows = 1_000_000
 	park := func() *Doc {
 		doc := New(WithClientID(7))
@@ -694,32 +691,33 @@ func TestUnit_ApplyBudget_BytesCountsTheRangeAParkGrows(t *testing.T) {
 		return doc
 	}
 
+	// Bytes: 0 no longer refuses the growth: a grown deleted range adds no
+	// content, only a wider range record the document holds compactly.
 	doc := park()
 	doc.SetApplyBudget(func(any) ApplyBudget {
 		return ApplyBudget{Decoded: -1, Structs: 0, Bytes: 0, Split: -1}
 	})
-	before := stateOf(doc)
-	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, gcStructUpdate(9, 2, grows), nil), ErrApplyBudget)
-	if refused.Bytes != grows {
-		t.Fatalf("the refusal reports %d bytes, want the %d clocks the park would have added", refused.Bytes, grows)
+	if err := ApplyUpdateV1(doc, gcStructUpdate(9, 2, grows), nil); err != nil {
+		t.Fatalf("a growth of %d clocks was refused under Bytes: 0, but a deleted range is not content: %v", grows, err)
 	}
-	if got := parkedClocks(doc); got != 1 {
-		t.Fatalf("the refused park left %d clocks in the queue, want the one it found", got)
-	}
-
-	// The control: a budget that holds the range takes it, and the queue
-	// still holds one struct - which is why no struct count can see this.
-	fits := park()
-	fits.SetApplyBudget(func(any) ApplyBudget {
-		return ApplyBudget{Decoded: -1, Structs: 0, Bytes: grows, Split: -1}
-	})
-	if err := ApplyUpdateV1(fits, gcStructUpdate(9, 2, grows), nil); err != nil {
-		t.Fatalf("a budget of exactly the range refused it: %v", err)
-	}
-	if got := fits.PendingStats().Items; got != 1 {
+	if got := doc.PendingStats().Items; got != 1 {
 		t.Fatalf("the queue holds %d structs, want the one the arrival merged into", got)
 	}
-	if got := parkedClocks(fits); got != 1+grows {
+	if got := parkedClocks(doc); got != 1+grows {
 		t.Fatalf("the queue holds %d clocks, want the %d the merge grew it to", got, 1+grows)
+	}
+
+	// The control, so this test is an instrument and not a bare assertion:
+	// the arriving GC struct is still bounded, by Decoded, and a budget that
+	// refuses it does. This fires only when the tally is live, so it proves
+	// the Bytes: 0 pass above is "not charged" rather than "not enforced".
+	bounded := park()
+	bounded.SetApplyBudget(func(any) ApplyBudget {
+		return ApplyBudget{Decoded: 0, Structs: -1, Bytes: -1, Split: -1}
+	})
+	before := stateOf(bounded)
+	requireRefused(t, bounded, before, ApplyUpdateV1(bounded, gcStructUpdate(9, 2, grows), nil), ErrApplyBudget)
+	if got := parkedClocks(bounded); got != 1 {
+		t.Fatalf("the refused growth left %d clocks in the queue, want the one it found", got)
 	}
 }

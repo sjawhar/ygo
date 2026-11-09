@@ -278,13 +278,11 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 			// it found it.
 			j.keepQueueFor(s.pending, pl)
 		}
-		var grown uint64
-		pending, grown = s.pending.apply(pl, pending, s.parked != nil && len(s.parked.items) > 0)
-		// An arrival that merged into a queued GC struct leaves no struct of
-		// its own for notePark to charge, and the queue holds its clocks all
-		// the same: deleted range the document keeps and carries in its
-		// encoded state (pendingUpdate.apply, applyTally.integrated).
-		noteParkGrowth(txn, grown)
+		// A GC struct the merge grew gains deleted-range clocks, which the
+		// document holds as a range record, not as bytes of content. A widened
+		// range is no heap, so the grown span is not charged; the arriving GC
+		// struct is bounded like any other, by Decoded and Structs.
+		pending = s.pending.apply(pl, pending, s.parked != nil && len(s.parked.items) > 0)
 	}
 	from := 0
 	if s.pending != nil {

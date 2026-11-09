@@ -1037,15 +1037,21 @@ func (t *applyTally) nestedAll(vals []any) {
 // integrated counts item, a struct of the update the apply has just added to
 // the store or just parked, with the bytes it costs the document to hold.
 //
-// Those bytes are the content's (contentBytes) and two more charges the
-// content itself cannot answer for. A map key is the first: an item under a
-// key carries that key, the document keeps the string for as long as the
-// entry lives, and its length is the sender's to choose, so an update of one
-// struct under a key of a megabyte costs a megabyte the content does not
-// show. A deleted item's length is the second: its content is a length and
-// no bytes, and what the document keeps for it is a range in its delete set,
-// which it carries into every encode of its state, so the length is what to
-// charge (TestUnit_ApplyBudget_BytesCountsAMapKeyAndADeletedRange).
+// Those bytes are the content's (contentBytes) and a map key the content
+// cannot answer for: an item under a key carries that key, the document keeps
+// the string for as long as the entry lives, and its length is the sender's
+// to choose, so an update of one struct under a key of a megabyte costs a
+// megabyte the content does not show
+// (TestUnit_ApplyBudget_BytesCountsAMapKeyButNotADeletedRange).
+//
+// A deleted item is not charged its span. Its content is a length and no
+// bytes, and what the document keeps for it is a range record: a pair of
+// integers whatever span it names. The struct that carries it is bounded like
+// any other - one decoded value against Decoded, one struct against Structs -
+// and the splits its edges make against Split; the span itself is no cost.
+// Charging it read a 2^40-clock delete of a client the document never saw -
+// fifteen bytes on the wire, deleting nothing - as a terabyte of content, and
+// contradicted noteDeleted, where the rule that a delete adds nothing lives.
 func (t *applyTally) integrated(item *Item) {
 	if t == nil {
 		return
@@ -1055,22 +1061,6 @@ func (t *applyTally) integrated(item *Item) {
 	if item.ParentSub != nil {
 		t.bytes += len(*item.ParentSub)
 	}
-	if del, ok := item.Content.(*ContentDeleted); ok {
-		t.bytes += clampedLen(del.Len())
-	}
-}
-
-// clampedLen is n as an int that cannot wrap: a length past what an int
-// holds counts as the largest int, which no budget can be at or above, so
-// an apply carrying one is refused rather than credited by an overflow. It
-// is the 32-bit build that needs it, where a length of four gigabytes wraps
-// to a small or negative number.
-func clampedLen(n uint64) int {
-	const maxInt = int(^uint(0) >> 1)
-	if n > uint64(maxInt) {
-		return maxInt
-	}
-	return int(n)
 }
 
 // integratedErr is ErrApplyBudget when the apply integrated more structs or
@@ -1173,23 +1163,6 @@ func notePark(txn *Transaction, item *Item) {
 	}
 	if t := txn.doc.tally(); t != nil && len(t.roots) > 0 {
 		item.parkedRoots = t.roots
-	}
-}
-
-// noteParkGrowth charges clocks, the deleted range a park added to a GC
-// struct the queue already held (pendingUpdate.apply), against the apply's
-// byte budget. Such an arrival leaves no struct of its own in the queue, so
-// notePark never sees it, and the clocks are a range the document keeps and
-// carries in its encoded state exactly as an integrated deleted item's
-// length is (applyTally.integrated). It adds no struct to the count: the
-// queue holds one struct before and after
-// (TestUnit_ApplyBudget_BytesCountsTheRangeAParkGrows).
-func noteParkGrowth(txn *Transaction, clocks uint64) {
-	if clocks == 0 {
-		return
-	}
-	if t := txn.doc.tally(); t != nil {
-		t.bytes += clampedLen(clocks)
 	}
 }
 

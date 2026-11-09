@@ -348,7 +348,7 @@ func TestUnit_PendingMerge_AWindowKeepsWhatTheWholeQueueKeeps(t *testing.T) {
 			}
 		}
 		// After the park, the index is what a rebuild from the queue gives.
-		out, _ := p.apply(pl, arrived, n%4 == 0)
+		out := p.apply(pl, arrived, n%4 == 0)
 		from := len(p.items)
 		p.items = append(p.items, out...)
 		p.addCover(out, from)
@@ -596,7 +596,7 @@ func TestUnit_PendingMerge_TheIndexFollowsTheQueue(t *testing.T) {
 	p := &pendingUpdate{items: []*Item{item, gcStruct(2, 1, 1)}}
 	arrived := []*Item{{ID: ID{Client: 2, Clock: 0}, Origin: &ID{Client: 9}, Content: NewContentDeleted(2)}}
 	pl := p.plan(refsOf(arrived))
-	run, _ := p.apply(pl, arrived, false)
+	run := p.apply(pl, arrived, false)
 	from := len(p.items)
 	p.items = append(p.items, run...)
 	p.addCover(run, from)
