@@ -52,7 +52,8 @@ func scannedBy(t *testing.T, doc *Doc, update []byte) int {
 // taken at exactly that, by the same document; an answer of zero leaves that
 // apply unbounded; and the V2 form is bounded the same way.
 func TestUnit_IntegrateScanBudget_EachRemoteApplyIsBoundedByTheBudgetItsOriginIsGiven(t *testing.T) {
-	const l, n = 2_000, 20
+	const n = 20
+	l := listLen(2_000)
 	first, second := originAtTheStartFrom(9, 0, n), originAtTheStartFrom(10, 0, n)
 	secondV2, err := UpdateV1ToV2(second)
 	if err != nil {
@@ -127,7 +128,8 @@ func TestUnit_IntegrateScanBudget_ABudgetBoundsADocumentInPlaceOfItsBound(t *tes
 		t.Fatalf("the refused subdocument left state %v", budgeted.StateVector())
 	}
 
-	const l, n = 2_000, 20
+	const n = 20
+	l := listLen(2_000)
 	doc := chainedList(t, l, WithMaxIntegrateScan(1), WithIntegrateScanBudget(unbounded))
 	if err := ApplyUpdateV1(doc, originAtTheStartFrom(9, 0, n), nil); err != nil {
 		t.Fatalf("the budget's zero did not take the bound's place: %v", err)
@@ -144,7 +146,8 @@ func TestUnit_IntegrateScanBudget_ABudgetBoundsADocumentInPlaceOfItsBound(t *tes
 // bounded one item under it refuses it. A local insert between two neighbours
 // scans nothing.
 func TestUnit_IntegrateScanBudget_ATransactionReportsTheItemsItsScansPassed(t *testing.T) {
-	const l, n = 2_000, 20
+	const n = 20
+	l := listLen(2_000)
 	update := originAtTheStartFrom(9, 0, n)
 	scans := scannedBy(t, chainedList(t, l), update)
 	// The first item passes the l-1 items after the list's first, each naming
@@ -177,7 +180,8 @@ func TestUnit_IntegrateScanBudget_ATransactionReportsTheItemsItsScansPassed(t *t
 // passing its allowance: what it integrated is gone, but the work it did is
 // not, and the count stops at the allowance the drain was refused at.
 func TestUnit_IntegrateScanBudget_TheScanCountHoldsADrainThatStaysAndOneTakenBack(t *testing.T) {
-	const l, n = 2_000, 20
+	const n = 20
+	l := listLen(2_000)
 	lastItem := func(doc *Doc) *Item {
 		last := doc.GetText("t").start
 		for last.Right != nil {
@@ -220,7 +224,8 @@ func TestUnit_IntegrateScanBudget_TheScanCountHoldsADrainThatStaysAndOneTakenBac
 // stands. A document with a bound keeps giving the drain an allowance of its
 // own, so its apply may scan up to the bound twice over.
 func TestUnit_IntegrateScanBudget_ABudgetedApplysDrainDrawsOnTheApplysOwnAllowance(t *testing.T) {
-	const l, n = 2_000, 20
+	const n = 20
+	l := listLen(2_000)
 	// The filling update is client 99's clock 0 naming the list's first item
 	// as its left origin, so it passes the l-1 items after it and lands at the
 	// end; each parked item then passes those l-1 and the item of client 99
@@ -291,7 +296,8 @@ func budgetFor(limit int) DocOption {
 // after scanning - and which errors.Is still matches against why it was
 // refused, in the V1 and the V2 form.
 func TestUnit_IntegrateScanBudget_ARefusedApplyReportsTheScansItCost(t *testing.T) {
-	const l, n = 2_000, 20
+	const n = 20
+	l := listLen(2_000)
 	update := originAtTheStartFrom(9, 0, n)
 	updateV2, err := UpdateV1ToV2(update)
 	if err != nil {
@@ -342,7 +348,8 @@ func TestUnit_IntegrateScanBudget_ARefusedApplyReportsTheScansItCost(t *testing.
 // fails after its items integrated keeps them, as it always did, its error is
 // not a refusal, and its committed transaction reports the scans it cost.
 func TestUnit_IntegrateScanBudget_ADocumentWithoutABudgetOrBoundKeepsWhatAFailedApplyIntegrated(t *testing.T) {
-	const l, n = 2_000, 20
+	const n = 20
+	l := listLen(2_000)
 	update := originAtTheStartFrom(9, 0, n)
 	scans := scannedBy(t, chainedList(t, l), update)
 	doc := chainedList(t, l)

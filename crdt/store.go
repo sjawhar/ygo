@@ -25,6 +25,10 @@ type StructStore struct {
 	// pendingDsMoved holds the parked clients given a struct since the last
 	// retry, the only ones whose ranges can apply.
 	pendingDsMoved map[ClientID]struct{}
+	// parkedOutOfState is Doc.SetParkedOutOfState's setting: pending and
+	// pendingDs are kept out of every encode of the document's state and out
+	// of what an apply report counts of it (ApplyReport.StateBytes).
+	parkedOutOfState bool
 
 	// pendingMoves holds, per target client, the ContentMove items whose target
 	// had not integrated when the move did (e.g. a fresh peer applying a merged
@@ -114,8 +118,15 @@ func (h pendingMoveHeap) heapify() {
 type pendingUpdate struct {
 	// items are appended, or emptied in place (nil) when a merge drops them,
 	// so a transaction can record its park as a view of this queue.
-	items   []*Item
-	dead    int         // the nil slots of items
+	items []*Item
+	dead  int // the nil slots of items
+	// bytes is the bytes items hold as ApplyBudget.Bytes counts them, the
+	// map key included (structBytes), kept wherever a struct enters or
+	// leaves the queue or a merge cuts one in place, and summed afresh
+	// wherever a queue is rebuilt (PendingStats.ContentBytes). A queued
+	// struct's key changes only where a merge cuts its front (keep), which
+	// counts it again, or in a drain, which rebuilds the queue.
+	bytes   int
 	missing StateVector // clientID -> store clock at park time for that client
 	// cover is the clocks items span, built on demand and kept by addCover.
 	cover *pendingCover

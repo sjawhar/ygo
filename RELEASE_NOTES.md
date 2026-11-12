@@ -1,3 +1,842 @@
+## v1.55.1-sami.34
+
+This release clears the slot each removal from a long-lived list vacates.
+There are no API or wire format changes.
+
+### An unsubscribed callback is no longer kept alive
+
+Each of the removals below used `s = append(s[:i], s[i+1:]...)`. It shifts
+the elements after `i` left and shortens the slice, but leaves the old last
+element in the backing array, where the slice still reaches it. Removing the
+newest subscription leaves the removed callback itself there, so the
+callback and everything its closure captured - an update it was handed, a
+buffer, a connection - stayed alive until a later subscription took the
+slot. They now use `slices.Delete`, which clears the vacated slot:
+
+- `crdt/doc.go`: the `OnUpdate`, `OnAfterTransaction` and `OnSubdocs`
+  unsubscribes.
+- `crdt/abstract_type.go`: the `ObserveDeep` unsubscribe.
+- `crdt/yarray.go`, `crdt/ymap.go`, `crdt/ytext.go`: the `Observe`
+  unsubscribes.
+- `crdt/yxml.go`: the `YXmlFragment.Observe` and `YXmlElement.Observe`
+  unsubscribes, and `DeleteAttribute` on an element not yet in a document.
+- `crdt/search_marker.go`: the two drops of a search marker, which holds its
+  item.
+- `crdt/idmap.go`: the merge of two attribution ranges, which hold their
+  attributes.
+- `persistence/memory.go`: `MemoryPersistence.DeleteSnapshot`, whose
+  snapshots hold their state.
+- `provider/client/client.go`: the `OnStatus` unsubscribe.
+
+One removal of the same form is left: `attrState.del` in `crdt/ytext.go`,
+whose keys belong to one text operation and go with it.
+
+## v1.55.1-sami.33
+
+This release stops a room from keeping the peers that parked something and
+left, and adds the method that lets it. There are no wire format changes.
+
+### A peer that leaves is forgotten as the origin of what it parked
+
+A document that discards refused drains (`SetDiscardRefusedDrain`) records
+the origin of the apply that parked each struct and delete range, so that a
+discard can name its senders. The WebSocket server applies a peer's frames
+with the peer as their origin, so the record kept each peer that parked
+something, with its connection and buffers, for as long as what it parked
+stayed parked: about 24 KB a peer, measured, and up to 2×4,096+16 peers in a
+room whose parked ranges are capped at 4,096, close to 200 MB.
+
+`Doc.ForgetParkedOrigin(origin)` drops an origin from the record; what it
+parked stays parked, and a later `DrainDiscardedError` does not name it. The
+server calls it as a peer leaves its room. A server that closes a discard's
+senders closes the same peers as before, since a peer that has left has
+nothing left to close; it is handed only the senders still connected.
+
+## v1.55.1-sami.32
+
+This release adds one read method to the apply check's view. There are no
+wire format changes, and a check that does not call it behaves as before.
+
+### Which run of the apply check judges the drain
+
+A document's apply check (`crdt.WithApplyCheck`) runs at most twice on one
+remote apply: on the update, before the drain of the pending queue, where
+the update changed the document, and on the drain, where the drain landed
+something an earlier apply parked. Both runs received the same origin and a
+view, so a check that judges them differently could only count runs, and an
+apply whose update changed nothing - the document held all of it, or its
+structs only parked - has one run, the drain's.
+
+`ApplyView.Drained` now says which run the check is in: false on the
+update's, true on the drain's, for V1 and V2 applies and sync step 2 alike.
+
+## v1.55.1-sami.31
+
+This release fixes two things v1.55.1-sami.27 added, and a test of
+v1.55.1-sami.26's `AnswerOnceStored` change that read a relay before it had
+arrived. There are no API or wire format changes.
+
+### The record of who parked each delete range is bounded
+
+On a document that discards refused drains, the record of who parked each
+delete range kept a set for each apply that newly parked a range, and its
+prune kept every set the pending deletes still overlapped. Frames that each
+park a range next to those already parked compact into one pending range,
+but each added a set, so the record grew with every frame - 50,000 one-clock
+frames kept 50,000 sets for one parked range - and every commit past its
+bound walked all of it. It now keeps one set per sender, compacted as the
+pending deletes are and cut to what they still hold; where the sets of
+several senders still cut the pending ranges finer, it keeps each pending
+range under one of them. After every apply it holds at most twice the parked
+ranges plus 16. A discard still names a sender for each range it discards
+that one was recorded for, but where several senders parked parts of one
+range it can name only one of them.
+
+### The map key a parked struct holds is in the queue's figure
+
+`PendingStats.ContentBytes` left out the map key of a parked struct. A
+struct with no origin - the first write of a key - holds its key from its
+decode on, as long as its sender made it, so the figure missed those keys.
+It now counts each parked struct as `ApplyBudget.Bytes` does, its map key
+included.
+
+### A test that read a relay before it arrived
+
+Two `AnswerOnceStored` tests of a frame that commits nothing read the relay
+of another peer's commit once that commit's store had begun. The store
+begins in the commit, and the relay goes out only once the apply has
+returned, so on a loaded runner a test could read before the relay arrived:
+on GitHub's runner, with Go 1.23 under the race detector, one read an empty
+document. They now read until the relay has arrived. Only tests change.
+
+## v1.55.1-sami.30
+
+This release changes only tests. There are no library, API or wire format
+changes.
+
+### `crdt`'s race run fits its CI step
+
+The CI runs `go test -race -timeout 120s ./...`. With Go 1.23 on GitHub's
+runner, `crdt` took up to 124 s of it, 74 s of that in the tests the series
+base adds. Under the race detector those tests now run smaller: a fifth of
+their rounds, seeds and corpus cases; a fifth of the chained list the
+conflict-scan tests count against, or an eighth of the scan bound where their
+scans must pass it; and, in the delete-set allocation test, an eighth of each
+delete set under an eighth of the default pending cap, measured once. Each
+still checks what it checks at full size, and without the race detector every
+test runs as before.
+
+## v1.55.1-sami.29
+
+This release fixes a close code still lost to a peer that reads slowly. There
+are no API or wire format changes.
+
+### A close code that reaches a peer still reading when the wait ends
+
+The server writes a close frame and waits up to five seconds for the peer's
+own (v1.55.1-sami.15). Writing the frame returns once it is in the socket's
+buffers, which can hold megabytes of what was written before it, so a browser
+applying a large state, or one on a slow link, can reach the frame after those
+five seconds. The server then closed the socket while the browser was still
+sending awareness, which reset the connection and discarded what the browser
+had not yet received, the close frame among it, so it reported 1006 (abnormal
+closure) and not the code.
+
+When the five seconds pass, the server now shuts the connection's write side,
+which sends what the buffers hold and then the end of the stream, and reads
+and drops what the peer still sends until the peer closes its side,
+`PeerWriteTimeout` passes, or the server shuts down; only then does it close
+the socket. The peer leaves its room when the five seconds pass, as before, so
+meanwhile it holds only its socket. The close for a cancel cause that names a
+close code ends the same way.
+
+## v1.55.1-sami.28
+
+This release adds a value limit to the decodes of an update outside an
+apply, and a server option that sets one for a read-only peer's SyncStep2.
+There are no wire format changes, and the existing functions behave exactly
+as before.
+
+### A value limit for the scratch decodes
+
+`DocContainsUpdateV1`, `DiffUpdateV1` and `HeldStructsDifferV1` each decode
+the whole update into a scratch document before they compare or cut it. A
+document's apply budget (`WithApplyBudget`) bounds what an apply decodes, but
+not these: the scratch document has no budget, so a frame dense in values
+costs whatever it holds. `DocContainsUpdateV1Limit`, `DiffUpdateV1Limit` and
+`HeldStructsDifferV1Limit` take a last argument, `values`: the decode stops
+past that many values, counted as `ApplyBudget.Decoded` counts them, before
+the value past it is built, and returns an error wrapping `ErrValueLimit`. A
+limit below zero bounds nothing, which is what the existing functions pass.
+The three functions keep their signatures, so code that holds one as a
+function value still compiles.
+
+### A value limit for a read-only peer's SyncStep2
+
+On a Hocuspocus-framed connection, a read-only peer's SyncStep2 is answered
+SyncStatus(1) when the room already holds all of its update, and deciding
+that decodes the whole update with `DocContainsUpdateV1`, outside any apply.
+`Server.ReadOnlySyncStep2MaxValues`, when positive, stops that decode past
+that many values (`DocContainsUpdateV1Limit`), before the value past it is
+built, and the step is answered 0, as one that does not decode is. Set it to
+the value limit of the room's applies. 0, the default, bounds nothing.
+
+## v1.55.1-sami.27
+
+This release bounds parked delete ranges as parked structs are bounded, and
+reports the content bytes of the pending queue. There are no wire format
+changes, and a document that sets neither new option behaves as before.
+
+### A delete range is judged where it parks
+
+A delete range past what a document holds of its client parks until the
+client's structs arrive, whoever sent it. `ApplyBudget.MayParkDeletes`, when
+set, is asked for each client a range of the update would park under, only
+when one would park, so an apply that parks nothing pays nothing. When it
+answers false the apply is refused with `ErrParkedDeleteRefused` and taken
+back whole, as every refusal of a bounded document is.
+
+### A cap on parked delete ranges of their own
+
+Parked ranges were capped only by `WithMaxPendingItems`, the cap sized for
+parked structs. `WithMaxPendingDeleteRanges` (and
+`Server.MaxPendingDeleteRanges`) caps them apart: an update that would grow
+them past it is refused with `ErrPendingCap` before anything changes, and a
+resend of ranges already parked is admitted.
+
+On a document that discards refused drains, the record of who parked each
+range kept a copy of every parked set per apply, so a frame sent again and
+again grew the heap while the parked ranges stayed the same. It now keeps
+only what each apply newly parked, so the same frame sent again records
+nothing; frames that each park a new range still grew it, until
+v1.55.1-sami.31 bounded it by the parked ranges.
+
+### The content bytes the queue holds
+
+`PendingStats.ContentBytes` is the content bytes the parked structs hold now,
+counted as `ApplyBudget.Bytes` counts a struct's content; the map key is left
+out (v1.55.1-sami.31 counts it). A caller that charges a room for its queue
+reads it after each apply, rather than summing what each apply added, since
+drains, merges and discards take content out of the queue.
+
+## v1.55.1-sami.26
+
+This release changes what `Server.AnswerOnceStored` answers in two cases,
+and adds one opt-in option of the WebSocket server. There are no wire format
+changes, and a server that sets neither option behaves exactly as before.
+
+### A frame that commits nothing takes the verdict of the store in flight
+
+Under `AnswerOnceStored` the answer to a frame waits until the room's
+persistence has stored the commit the frame made. A frame whose apply commits
+nothing - a `SyncStep2`, a resend, the reply to `ResyncPeer`, or a read-only
+peer's `SyncStep2` - was answered as soon as every answer before it was. But
+what such a frame carries can be in the room only because another commit put
+it there: the same peer's earlier frame, or another peer's, whose store was
+still running. When that store then failed, the frame had been answered 1,
+and a client that keeps an edit until it is answered applied dropped an edit
+no store holds.
+
+Each room instance now numbers every commit its persistence is handed, of
+any origin, and every answer of 1 waits until the store of each commit
+numbered by the time the answer was decided is known: the frame's own commit
+when it made one, and the newest store still running when it made none.
+
+### After a commit that was not stored, every answer is 0
+
+Once a commit of a room instance was not stored, every answer the instance
+sends after is 0, whatever frame it answers and whatever store that frame
+waited for: the room holds content no store holds, and any frame may carry
+it. A room loaded again is a new instance and starts clean. A server whose
+adapter fails a store only alongside failing the room loses nothing by it; a
+coalesced batch whose write failed counts as not stored even if a retry
+stores it later.
+
+### `Server.ReadOnlySyncStep2MaxBytes`
+
+A read-only peer's `SyncStep2` is answered 1 when the room holds all of it,
+which ygo decides by decoding the whole update into a scratch document. No
+`OnPeerUpdate` hook sees a read-only peer's update, so nothing a hook sets
+bounds that decode. With `ReadOnlySyncStep2MaxBytes` set, a `SyncStep2` whose
+update is longer than it is answered 0 without being decoded, under Sync and
+SyncReply alike. A client that keeps rows until such a frame is answered 1
+keeps them. 0, the default, decodes every one, as before.
+
+## v1.55.1-sami.25
+
+This release fixes whom the frame that fills a gap is relayed to under
+`Server.RelayIntegratedOnly`, and adds the field of `crdt.ApplyOutcome` that
+decides it. There are no wire format changes, and a server without the option
+behaves exactly as before.
+
+### The frame that fills a gap reaches its own sender too
+
+Under `RelayIntegratedOnly` a frame whose structs park in the room is relayed
+to nobody, and the frame that fills their gap is relayed with what the drain
+of the room's pending queue landed with it. That relay went to every peer but
+the sender of the filling frame, as every relay does. But the sender lacked
+the parked content as much as the others did, since no peer was ever sent it:
+the room and its other peers then held the parked edit, and the sender did
+not, until it next reconnected.
+
+The relay now goes to the sender too when the drain landed something. The
+sender receives its own edit back with it, which a Yjs client applies as a
+no-op. A frame whose drain landed nothing is relayed to the other peers only,
+as before, and the part that integrated of a frame whose apply fails partway
+follows the same rule.
+
+The server reads `crdt.ApplyOutcome.Drained`, which says whether the drain
+that ends the apply integrated a struct an earlier apply parked or applied a
+deletion one parked. A drain the document took back landed nothing. Only an
+apply of `ApplyUpdateV1Outcome` looks for it, and it stops looking once it
+has found something.
+
+The relay frame is also built once now, in one buffer of its exact length.
+It was copied twice more on its way, through `sync.EncodeUpdate` and the
+pooled encoder, and the encoder's pool then kept a buffer as long as the
+update.
+
+## v1.55.1-sami.24
+
+This release changes what the apply check costs, and nothing it does. There
+are no API or wire format changes.
+
+### The apply check costs what each apply touched
+
+A document with an apply check (`crdt.WithApplyCheck`, `Doc.SetApplyCheck`)
+decides for each remote apply whether the apply changed the document, which
+is when its check runs, and whether the drain of the pending queue that ends
+the apply landed anything, which is when the check runs again. Each answer
+was a walk of every client the document holds, made on every apply whatever
+the check then answered, so the cost of one keystroke grew with the number of
+clients that ever wrote to the document.
+
+The apply now reads its delete set and the clocks of the clients it added or
+parked a struct for, which are the only clients whose clocks it can have
+moved. A drain that finds neither parked structs nor parked deletes lands
+nothing, so it is not judged; a drain that finds either is judged as before.
+The check is called for the same applies and the same drains as before, sees
+the same state and refuses the same updates.
+
+## v1.55.1-sami.23
+
+This release adds one opt-in document option. There are no wire format
+changes, and a document that does not set it behaves exactly as before.
+
+### What is parked is not in the state until it lands
+
+A document parks a struct that waits for one it lacks, and a deletion of a
+struct it lacks, in its pending queue, and until now every encode of its
+state carried them, as Yjs's does: a joiner answered with the room's state,
+a copy loaded from it, or a reader of an update log's base then held content
+the room had not landed, and parked it too.
+
+`Doc.SetParkedOutOfState(true)` leaves the queue and the pending deletes out
+of `EncodeStateAsUpdateV1` and `EncodeStateAsUpdateV2`, out of
+`SplitStateAsUpdateV1` (the answer to a sync step 1) and out of the base an
+update log records, so each carries the document's integrated structs and
+deletions only. `ApplyReport.StateBytes` counts the same state: a park adds
+nothing to it, and the drain that lands a parked struct counts it as an
+append to the store. What is parked is kept: a later update that fills its
+gap still drains it, and that commit's update carries it. `Doc.PendingStats`
+and `ApplyReport.Structs` still count it, as memory the document holds, so a
+caller weighing the encoded state reads `StateBytes` or `StructCount`, and
+one weighing what the document holds adds `PendingStats`. `Clone` copies the
+setting, and the WebSocket server's `StateAnswerInfo.Structs` leaves parked
+structs out of an answer's weight under it. Set it before the document is
+handed to any reader.
+
+## v1.55.1-sami.22
+
+This release adds one opt-in document option and the error it returns.
+There are no wire format changes, and a document that does not set the
+option behaves exactly as before.
+
+### A refused drain is discarded, not parked again
+
+A document with a scan bound, a budget or an apply check takes back a drain
+of its pending queue that fails on its own: its apply check refuses what the
+drain landed, its scans pass their allowance, or its splits pass the split
+budget. The update that filled the gap stands, and the backlog is parked
+again whole, so every later update that fills the same gap runs into the same
+refusal, and nothing tells the backlog's senders that their content will not
+land.
+
+`Doc.SetDiscardRefusedDrain(true)` discards instead what the fill released:
+every parked struct whose dependencies the store now holds, or another such
+struct supplies - what a drain run to its end would have integrated, read
+from the clocks alone - and every pending delete range, or the part of one,
+below the clocks the store and those structs reach. What the fill did not
+release stays parked. The update that filled the gap stands as before, and
+the apply returns a `*crdt.DrainDiscardedError` with what it discarded
+(`Structs`, `Ranges`), what the drain's scans passed (`Scanned`), why the
+drain was taken back (`Cause`), and `Senders`: the origins of the applies
+that parked what was discarded, each comparable origin once. The document
+records those origins at each commit that parks something while the option
+is on, so a park made before it was set names nobody. The error wraps
+`ErrApplyCheckDrain`, so the WebSocket and HTTP providers still answer and
+relay the update as applied, and a server can close each sender
+(`errors.As` on the apply's error) so its client sends the content again on
+reconnect.
+
+## v1.55.1-sami.21
+
+This release adds one read-only function to `crdt`. There are no wire format
+changes, and nothing changes for a caller that does not use it.
+
+### Did two documents write the same clocks?
+
+An apply skips every struct at a (client, clock) the document already holds,
+as Yjs does: such a struct is taken to be a resend. When two documents write
+under one client ID, the second one's structs at clocks the room already
+holds are dropped without a word.
+
+`crdt.HeldStructsDifferV1(doc, update, client, from)` reports whether the V1
+update carries a struct of `client`, at a clock from `from` on, that differs
+from what `doc` holds at the same clock: its content unit (a UTF-16 unit of a
+string, a value of an array, or a whole embed, format, binary, type,
+subdocument or move), its origin, its right origin, or, for a unit placed by
+its parent rather than by origins, its parent or its key. Structs cut at other
+clocks do not differ by that alone, since a unit past a struct's first clock
+has the unit before it as its origin. A struct `doc` does not hold, past its
+clock or parked in its pending queue, is not compared; neither is a GC struct,
+nor the content of a unit either side holds as deleted content, whose length,
+origins, parent and key still are. So where the document has collected
+deleted text, a second writer with the same origins but other content there
+reports no difference; comparing content the document no longer holds would
+report one for an honest client whose own text another client deleted.
+
+The update is decoded whole, as `DocContainsUpdateV1` decodes it, without
+integrating it; then, under the document's read lock, each struct of the
+client is found by a binary search and compared unit by unit with what the
+document holds. An update that does not decode returns an error wrapping
+`ErrInvalidUpdate`.
+
+## v1.55.1-sami.20
+
+This release adds one opt-in option of the WebSocket server, an optional
+persistence interface it reads, and two methods that act on one peer: one
+closes it, the other asks it for its state again. There are no wire format
+changes, and a server that does not set the option behaves exactly as before.
+
+### An edit is answered applied once it is stored
+
+Until now a peer was answered `SyncStatus(1)` as soon as the room applied its
+update, before the room's persistence worker had stored it. A client that
+keeps an edit until it is answered applied then dropped it, and when the store
+failed, or the server stopped first, the edit was in no stored copy of the
+room and in no client that would send it again.
+
+`Server.AnswerOnceStored`, on a server with persistence, holds that answer
+until the room's persistence has stored the commit the update made, and
+answers 0 when it was not stored: the adapter call that took it returned an
+error or panicked, or an adapter that implements the new
+`PersistenceAdapterStored` says it did not store it. The client keeps the edit
+and sends it again. Only the answer waits: the update is relayed to the
+room's other peers as soon as the room applies it, as without the option. A
+frame whose apply changed nothing is answered as soon as every answer before
+it is, so each peer's answers still go out in the order its frames arrived,
+and the answers to the frames one coalesced write stores
+(`PersistCoalesceWindow`) wait for that write. On a server without
+persistence nothing stores an update, and the option changes nothing.
+
+`PersistenceAdapterStored.StoreUpdateStored` is `StoreUpdateContext` that
+also says whether the update is stored once the call returns, for an adapter
+that can return nil for an update it dropped (one of a room it has given up
+on, say). Under `AnswerOnceStored` the worker calls it in place of
+`StoreUpdateContext` and `StoreUpdate`; without the option it is never called.
+
+### Closing one peer, and asking one for its state again
+
+`Server.ClosePeer(origin, code, reason)` closes the peer whose updates carry
+`origin` as their transaction origin, the `PeerUpdateInfo.Origin` an
+`OnPeerUpdate` hook is handed, from any goroutine, and reports whether it was
+an open peer of the server. A code `ServeHTTP` would not send closes with 4205
+"Reset Connection", as a hook's refusal does, and nothing the peer sends from
+then on lands. Under `AnswerOnceStored` the close goes out after the answers
+the peer is owed for the frames it sent before the call, so the client reads
+those answers first.
+
+`Server.ResyncPeer(origin)` sends that peer the room's `SyncStep1`, the room's
+state vector, and reports whether it was an open peer of the server. Its
+provider answers with a `SyncStep2` carrying what it holds and the room
+lacks, which the room applies and answers as any other update. So a server
+that answered a frame not applied because part of it parked
+(`AnswerParkedNotApplied`), and later sees the room land that part, can have
+the client send its state again and be answered applied. It is safe from any
+goroutine, with the room's document locked too: the state vector is read on a
+goroutine of its own once the document's lock is free. Under
+`AnswerOnceStored` the `SyncStep1` goes out after the answers the peer is owed
+for the frames it sent before the call.
+
+## v1.55.1-sami.19
+
+This release adds two opt-in options of the WebSocket server and the apply
+function they read. There are no wire format changes, and a server that sets
+neither option behaves exactly as before.
+
+### A frame that parks is not treated as landed
+
+An update a peer sends can carry structs the room cannot integrate yet: their
+client's earlier clocks, or an item they name, have not reached the room. The
+room parks them in its pending queue until the update that fills the gap
+arrives. Until now the server relayed such a frame to the room's other peers
+as it was sent, so they parked it too, and answered the sender
+`SyncStatus(1)`, so a client that keeps an edit until it is answered applied
+dropped it, though the room had not landed it.
+
+`Server.RelayIntegratedOnly` relays each peer update as what its apply
+integrated instead: the commit's own update, the bytes the room's `OnUpdate`
+observers are handed. A frame that only parked is relayed to nobody; the frame
+that fills its gap is relayed with what the room's drain of the queue landed
+with it, so the other peers receive the parked structs once the room holds
+them; a frame the room already held relays nothing, as before; and a frame
+whose apply fails partway relays what it integrated, without what it parked.
+Updates the cluster relay delivers are relayed as before.
+
+`Server.AnswerParkedNotApplied` answers `SyncStatus(0)` for a peer update the
+room applied but left part of parked. What did integrate stands and is
+relayed. The client keeps the edit and sends it again, and once the room holds
+it the room answers 1.
+
+Both read `crdt.ApplyUpdateV1Outcome`, which is `ApplyUpdateV1Held` with an
+`ApplyOutcome`: `Integrated` is the commit's update, encoded for the caller
+when the document has no `OnUpdate` observer, and `Parked` says whether the
+update stood with a struct it carries, or a clock it deletes, past the clocks
+the store holds of its client - parked, merged into a struct the queue held,
+or left out by a drain the document took back. To report it the function scans
+the update's structs and delete set once more, without decoding their
+content. A server with neither option applies through `ApplyUpdateV1Held`, as
+before.
+
+## v1.55.1-sami.18
+
+This release adds one field to `provider/websocket.PeerUpdateInfo`. There are
+no wire format changes, and a hook that does not read it behaves exactly as
+before.
+
+### The connection an update arrived on
+
+`PeerUpdateInfo.Context` is the context of the request `ServeHTTP` served the
+peer's connection on, with the values the embedder put on it: the context
+`Server.OnTokenAuthContext` receives. An `OnPeerUpdate` hook can now tell
+apart the connections of one room that send updates, for example to judge an
+update by what its connection was given when it was admitted. Nothing on the
+context names the connection unless the embedder puts it there, and, as for
+`OnTokenAuthContext`, neither a client disconnect nor `Shutdown` cancels it
+while the hook runs; only a cancel the embedder put on `r.Context()` does.
+
+## v1.55.1-sami.17
+
+This release adds one opt-in document option. There are no wire format
+changes, and a document that sets no check behaves exactly as before.
+
+### A check of what a remote update leaves the document holding
+
+An update's bytes do not show what it does to a document: where each item
+lands, and what a deleted format item leaves formatted, depend on what the
+document already holds. A bound on the document's shape can therefore only be
+measured after the update integrates, and by then the update had committed,
+its observers had run and it had been relayed.
+
+`crdt.WithApplyCheck` and `Doc.SetApplyCheck` set a check that runs after a
+remote apply integrates and before its transaction commits. It receives the
+apply's origin, so an owner can pass its own loads without measuring them, and
+an `ApplyView` of the document as the update left it. An error refuses the
+update: the apply is rolled back whole, as every refusal of a bounded document
+is, so the document is left byte for byte as it was, no observer fires and
+nothing is relayed, and the apply returns a `RefusedUpdateError` wrapping
+`ErrApplyCheck` and the check's own error.
+
+The drain of the pending queue is judged on its own. What it lands was parked
+by other updates, under client IDs no peer has to prove are its own, so
+refusing the update that fills their gap would let one peer have every such
+update refused. A refusal of the drain takes back the drain alone: the update
+stands and commits, and the apply returns an error wrapping
+`ErrApplyCheckDrain` and the check's error, which is not a
+`RefusedUpdateError`. The parked structs are parked again, and each later
+apply that retries them is checked again and stands.
+
+The providers read a refused drain the same way. In `provider/websocket`, the
+peer that sent such an update is answered `SyncStatus(1)` and the update is
+relayed to the room's other peers, so its client does not hold an edit that
+landed as unsent and send it again. An `OnPeerUpdate` hook's `apply` returns
+the error, and the peer is still answered as applied. An update the cluster
+relay delivers goes out to local peers and `Inject` returns no error. The HTTP
+provider answers 204. What the drain would have landed is neither applied nor
+relayed.
+
+A check that panics has the apply, or its drain, taken back the same way, and
+the panic then reaches the caller once the transaction has committed and the
+document's lock is released.
+
+The check runs under the document's write lock, which every content read of
+the document's types takes, so it reads through the view: `TextString`,
+`TextDelta`, `MapGet`, `MapEntries`, `ArraySlice` and `ChangedTypes` take no
+lock and fill no cache, the view holds no transaction to write with, reads only
+its own document, and reads nothing once the check has returned. The check
+runs once for each remote apply that changes the document and once more for a
+drain that lands parked content, so it must cost in proportion to the change.
+A document with a check is a bounded document: it applies every remote update
+whole or not at all, and refuses a remote update carrying a subdocument or a
+move.
+
+## v1.55.1-sami.16
+
+This release rewrites one test comment that named an issue in a tracker
+outside this repository. No code, API, wire format or test name changes.
+
+### A comment that named an issue a reader cannot open
+
+The `provider/websocket` test that checks a large state fits the per-peer
+write queue said its 1.22 MB figure came from a numbered issue in a tracker
+a reader of this repository cannot open; it now says the figure is measured.
+The constant it stands over, 1,220,000 bytes, and the test's name are
+unchanged.
+
+## v1.55.1-sami.15
+
+This release fixes a close code lost on its way to a peer that was still
+sending. There are no API or wire format changes.
+
+### A close code that reaches a peer still sending
+
+The server closes a peer with a code when `OnPeerUpdate` or `OnStateAnswer`
+refuses it (with a `PeerClose`'s code, or 4205), when its token auth fails,
+and when it sends a malformed sync message on Hocuspocus framing. It wrote the
+close frame and closed the socket straight after. A browser that had sent
+frames the server had not yet read, such as awareness it sends while it
+applies a large SyncStep2, had them arrive at a closed socket. That resets the
+connection, and the reset discards whatever the browser had not yet received,
+the close frame among it, so the browser reported 1006 (abnormal closure) and
+not the code. A client that tells refusals apart by their code, to stop
+retrying a permanent one or to back off a transient one, could not tell them
+apart.
+
+The server now does the WebSocket closing handshake: it writes the close
+frame, reads and drops what the peer sends until the peer's own close frame
+arrives, then closes the connection. A peer that has not answered within five
+seconds is closed anyway. That leaves a peer still reading through frames
+queued ahead of the close time to reach it, and keeps a peer that never
+answers, with its place in its room, for five seconds at most. Frames for a
+peer being closed are dropped meanwhile, since nothing after the close frame
+is written, so the room's broadcasts cannot fill its write queue or its
+`PeerWriteQueueBytes` budget and close it as a slow peer before it answers. A
+close frame that cannot be written within `PeerWriteTimeout` closes the
+connection at once, as before.
+
+The close for a cancel cause that names a close code, which an embedder sends
+by cancelling `ServeHTTP`'s request context, and the close the server writes
+at once when the peer's write queue is full had closed the socket straight
+after the frame as well. Both now do the same handshake, and the frames still
+queued behind such a close are dropped as soon as it is written. While the
+server waits for a peer's answer, it drops what the peer sends as it reads it,
+through a small buffer, so a peer cannot make it hold a frame as large as
+`MaxMessageBytes` for nothing.
+
+## v1.55.1-sami.14
+
+This fork release fixes a merge that let a struct parked over clocks a
+document holds take those clocks, and cuts the answer to a SyncStep1 in a
+room holding parked structs or deletions from the room's own structs, as
+v1.55.1-sami.12 cut every other room's. There are no wire format changes.
+
+### A struct parked over clocks a document holds
+
+**Who is affected: stores that merge the updates a document took, and
+documents that hold a struct parked over clocks they hold.** A merge in which
+no two insertions claim one clock returns the same bytes as before.
+
+A struct that names a struct the document lacks parks until that struct
+arrives, even when the document holds the struct's own clocks, as in Yjs.
+`MergeUpdatesV1` and `MergeUpdatesV2` kept, on each clock, the struct that
+started first and was longest, so such a struct took the clocks from the
+structs that held them. A reader of the merge parked it again, and everything
+of its client after it. A stored log of 1,000 keystrokes and one
+1,000-character update of that kind read back as 3 characters.
+`EncodeStateAsUpdateV1`, `EncodeStateAsUpdateV2` and `SplitStateAsUpdateV1`,
+which merge a document's parked structs into its state, read the document
+that applied that log back as 3 characters as well.
+
+Where the struct the old rule keeps names another origin, right origin,
+parent or key than the struct the earliest update carried on that clock, the
+two are different insertions, and the earlier update's struct is now kept.
+The other keeps only the clocks past it, as an apply of the updates in order
+integrates only those. The log above now reads back as 1,000 characters
+through the merge and through each of the three.
+
+A merge cannot tell which struct a document integrated, so a log that stores
+the update after the first 3 keystrokes and ahead of the other 997 still
+merges to 3 characters. A document that applies that log in order holds all
+1,000 and parks the struct; its encoded state, in V1 and V2, and the split of
+it now read back as 1,000 characters, where they read back as 3.
+
+### The answer to a join in a room holding parked structs
+
+v1.55.1-sami.12 cut a room holding parked structs or deletions from its
+encoded state with `crdt.SplitUpdateV1`, which decodes every struct of that
+state, because what the room parks reaches the state through a merge of its
+own. `crdt.SplitStateAsUpdateV1` now cuts such a room from its own structs
+too: it writes each parked struct as `EncodeStateAsUpdateV1` merges it into
+the state, cut at its client's clock in the room, reads back only those, and
+merges them among themselves. The answer is the same bytes, and what it
+allocates for parked structs grows with what the room parks, not with its
+structs. `EncodeStateAsUpdateV1` and `EncodeStateAsUpdateV2` cut each parked
+struct the same way before the merge, which leaves the state they return the
+same bytes.
+
+Measured on a room of 1,000,000 one-character structs, each typed at the
+front, holding one parked struct, three runs a side, one answer cut into
+updates of at most 65,530 bytes; the peak is of heap above the room, sampled
+every 2 ms:
+
+| | v1.55.1-sami.13 | this release |
+| --- | --- | --- |
+| allocations per answer | 6,005,774 to 6,005,994 | 683 to 735 |
+| bytes allocated per answer | 843.8 to 844.4 MB | 8.4 to 9.0 MB |
+| peak heap above the room | 464.3 to 473.5 MB | 8.4 to 9.0 MB |
+| updates in the answer | 108 | 108 |
+
+The same room with nothing parked takes 618 to 685 allocations of 8.4 to
+9.0 MB in v1.55.1-sami.13. Grown to 1,100,000 structs, past the 2^20 structs
+an update's decode accepts, the room with one struct parked was refused with
+`crdt: invalid update`; it is now answered in 119 updates.
+
+The documentation of `Server.OnStateAnswer` and `StateAnswerHook` no longer
+says that such a room decodes its state whole into a merge store.
+
+### How the output was checked
+
+`TestUnit_SplitStateAsUpdateV1_MatchesTheSplitOfTheEncodedState` compares
+`SplitStateAsUpdateV1` with the split of the encoded state byte for byte over
+15 rooms, five receivers each and a sixth for each room holding parked
+structs or deletions, and three update sizes. Seven of the rooms hold parked
+structs or deletions: parked structs and deletions, structs and deletions
+parked behind a clock gap, parked map entries and a parked nested map, and
+four rooms each holding a struct parked over clocks it holds.
+`TestUnit_SplitStateAsUpdateV1_AReceiverEndsHoldingWhatAParkedRoomHolds`
+applies the answer to an empty document for each of the seven and requires
+the room's state vector, content and parked clocks, with nothing parked
+before the last update; it replaces
+`TestUnit_SplitStateAsUpdateV1_CutsARoomHoldingParkedStructsFromItsEncodedState`.
+`TestUnit_PendingQueue_HoldsEachClockOfAClientOnce` checks what the merge of
+the parked structs relies on: the pending queue holds each clock of a client
+once. `TestUnit_EncodeStateAsUpdate_ParkedOverHeldClocks`,
+`TestUnit_MergeUpdates_ParkedOverHeldClocksReadsBackWhole` and
+`TestUnit_EncodeStateAsUpdate_StructStoredAheadOfTheKeystrokesReadsBackWhole`
+check the merge and the reads above.
+
+## v1.55.1-sami.13
+
+This release adds one method to `Doc`. There are no wire format changes, and
+nothing that exists changes.
+
+### How many clients a document holds structs from
+
+`crdt.Doc.ClientCount` is how many clients the document holds structs from.
+What a document costs follows its clients as well as its structs, and a peer
+chooses its own client ID. The same 100,000 one-character structs, each typed
+at the front, are a 683,494-byte state whose encoding allocates 3.9 MB when
+one client wrote them, and a 1,166,983-byte state whose encoding allocates
+30.0 MB when each came from a client of its own. `StructCount` is 100,000 for
+both.
+
+A client counts from the first of its writes that integrates, and stays
+counted when its content is deleted and collected. A client that has only
+deleted is not counted, nor is a client whose every struct is parked, and a
+subdocument's clients are counted by its own `Doc`. The count is the number
+of clients `StateVector` returns.
+
+`ClientCount` takes the document's read lock, so call it outside `Transact`.
+It allocates nothing and takes the same time however many clients the
+document holds.
+
+## v1.55.1-sami.12
+
+This fork release cuts a room's answer to a SyncStep1 from the room's own
+structs. There are no wire format changes: every frame of an answer carries
+the bytes it carried in v1.55.1-sami.10.
+
+### What an answer cost
+
+`sync.EncodeSyncStep2Split` cut a room's state by encoding it with
+`crdt.EncodeStateAsUpdateV1` and handing the bytes to `crdt.SplitUpdateV1`,
+which decoded them back into an item per struct, then encoded each struct
+twice to size it and once more to place it. For a room of 20,000 characters
+typed into the middle, one answer took 80,328 allocations of 9.133 MiB and
+11.5 ms of CPU time.
+
+### What it costs now
+
+`crdt.SplitStateAsUpdateV1` cuts the same series from the document's own
+structs, under the document lock: it writes each struct once, into the update
+being packed, as the decode of the encoded state would have read it, and
+`sync.EncodeSyncStep2Split` calls it. The same answer takes 98 allocations of
+1.585 MiB and 2.7 ms of CPU time.
+
+Measured with `BenchmarkJoinAnswer_FragmentedRoom` and
+`BenchmarkJoinAnswer_MixedRoom`, which time the server's peer handling one
+SyncStep1 and queueing the frames that answer it, 10 samples a side,
+alternating, y-websocket framing, on a shared two-core machine; CPU time is
+the process's user and system time across the same loop:
+
+| | v1.55.1-sami.10 | this release |
+| --- | --- | --- |
+| 20,000 characters typed into the middle | | |
+| allocations per answer | 80,328 | 98 |
+| bytes allocated per answer | 9.133 MiB | 1.585 MiB |
+| CPU time per answer | 11.5 ms | 2.7 ms |
+| frames, and their bytes | 7, 347,056 | 7, 347,056 |
+| 16,000 small structs: map entries, XML, formatted text | | |
+| allocations per answer | 107,320 | 5,154 |
+| bytes allocated per answer | 9.107 MiB | 1.924 MiB |
+| CPU time per answer | 13.1 ms | 3.6 ms |
+| frames, and their bytes | 6, 287,270 | 6, 287,270 |
+
+The single SyncStep2 that v1.55.1-sami.3 replaced with the split, queued
+through the same peer, takes 8 allocations of 1.03 MiB and 1.4 ms for the
+first room, so the split answer still costs about twice its CPU time.
+
+### Rooms holding parked structs
+
+A room holding parked structs or deletions is still cut from its encoded
+state, by `SplitUpdateV1`: what it parks reaches the state only through a
+merge of its own, which the walk over the room's structs does not repeat, so
+its answer costs what it cost in v1.55.1-sami.10. Both cuts place the structs
+with the walk v1.55.1-sami.7 made linear, so a room whose structs chain
+across clients costs neither of them work that grows with the square of its
+clients.
+
+### How the output was checked
+
+`TestUnit_SplitStateAsUpdateV1_MatchesTheSplitOfTheEncodedState` compares
+the two cuts byte for byte over nine rooms, five receivers and three update
+sizes. The rooms hold typed text with and without deletions, interleaved
+clients, a struct whose origin is another client's, structs longer than an
+update, maps, nested types and XML, values the decode reads back as other Go
+types, parked structs and deletions, and collected content.
+`TestUnit_SplitStateAsUpdateV1_CutsARoomHoldingParkedStructsFromItsEncodedState`
+checks that a room holding parked structs is answered with the split of its
+encoded state, which the walk over its own structs does not produce, and that
+a receiver applying that answer holds the room's text and state vector and
+parks what the room parks. Two tests bound the walk's work on 4,000 chained
+clients, one over decoded structs and one over a room's own.
+
+### Also
+
+`crdt.SplitUpdateV1` reads a struct's dependencies as its encoding names
+them: cut at the receiver's clock, a struct names the clock before the cut as
+its origin, and no parent. For an update already cut at the receiver's state
+vector, as `EncodeStateAsUpdateV1` writes one, the series is unchanged. Given
+a whole update and a state vector, it now sends such a struct without waiting
+for the origin of the struct it was cut from, which the receiver does not wait
+for either.
+
+The documentation of `Server.OnStateAnswer` and `StateAnswerHook` says what
+one answer holds: every frame of the room's state at once, and, in a room
+holding parked structs or deletions, that state decoded whole into a merge
+store before it is cut.
+
 ## v1.55.1-sami.11
 
 This release adds one field to the apply report. There are no wire format

@@ -14,7 +14,7 @@ import (
 // then reads as an unbounded twin's, and once an apply drains the queue the
 // deletion applies and the document equals the twin.
 func TestUnit_IntegrateScan_TakenBackDrainKeepsTheParkedDeletes(t *testing.T) {
-	const l = 2_000
+	l := listLen(2_000)
 	parked := [][]byte{
 		itemAfter(99, 1, ID{Client: 5, Clock: 0}, "abc"), // behind client 99's clock 0
 		itemAfter(98, 0, ID{Client: 99, Clock: 2}, "r"),  // the middle of client 99's item

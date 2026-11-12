@@ -1053,6 +1053,12 @@ func (txt *YText) ToDelta() []Delta {
 		doc.mu.RLock()
 		defer doc.mu.RUnlock()
 	}
+	return txt.toDeltaLocked()
+}
+
+// toDeltaLocked is the lock-free body of ToDelta; callers must already hold
+// the doc lock.
+func (txt *YText) toDeltaLocked() []Delta {
 	var deltas []Delta
 	currentAttrs := make(Attributes)
 
@@ -1153,7 +1159,7 @@ func (txt *YText) Observe(fn func(YTextEvent)) func() {
 		}
 		for i, s := range txt.observers {
 			if s.id == id {
-				txt.observers = append(txt.observers[:i], txt.observers[i+1:]...)
+				txt.observers = slices.Delete(txt.observers, i, i+1)
 				return
 			}
 		}
