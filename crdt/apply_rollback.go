@@ -98,7 +98,7 @@ type applyJournal struct {
 	pendingTailValid bool
 	pendingReady     bool
 	pendingDs        parkedDeletesAt
-	pendingMoves     map[ClientID][]*Item
+	pendingMoves     pendingMovesAt
 	// drain is the point the drain began at, once it has; at is the point a
 	// map key's previous value is recorded on.
 	drain *applyPoint
@@ -170,24 +170,35 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 		j.pendingTail, j.pendingTailValid = s.pending.tail, s.pending.tailValid
 	}
 	j.pendingDs = parkedDeletesOf(s)
-	j.pendingMoves = clonePendingMoves(s.pendingMoves)
+	j.pendingMoves = pendingMovesOf(s)
 	state := txn.beginBoundedApply()
 	state.journal = j
 	// After the journal, so its rollback refuses an apply whose callback panics.
 	state.scanLimit = d.applyScanLimit(txn.Origin)
 }
 
-// clonePendingMoves copies the pending moves, each client's slice included:
-// resolvePendingMoves writes the moves that stay into the slice they were in.
-func clonePendingMoves(moves map[ClientID][]*Item) map[ClientID][]*Item {
-	if moves == nil {
-		return nil
+// pendingMovesAt is the store's pending moves as a point of an apply found
+// them: each client's heap copied, since resolvePendingMoves pops it in place,
+// with the counts the store keeps of them.
+type pendingMovesAt struct {
+	moves                  map[ClientID]pendingMoveHeap
+	count, deleted, mapCap int
+}
+
+func pendingMovesOf(s *StructStore) pendingMovesAt {
+	p := pendingMovesAt{count: s.pendingMoveCount, deleted: s.deletedPendingMoves, mapCap: s.pendingMoveMapCap}
+	if s.pendingMoves != nil {
+		p.moves = make(map[ClientID]pendingMoveHeap, len(s.pendingMoves))
+		for c, h := range s.pendingMoves {
+			p.moves[c] = append(pendingMoveHeap(nil), h...)
+		}
 	}
-	out := make(map[ClientID][]*Item, len(moves))
-	for c, list := range moves {
-		out[c] = append([]*Item(nil), list...)
-	}
-	return out
+	return p
+}
+
+// restore puts the store's pending moves back as p found them.
+func (p pendingMovesAt) restore(s *StructStore) {
+	s.pendingMoves, s.pendingMoveCount, s.deletedPendingMoves, s.pendingMoveMapCap = p.moves, p.count, p.deleted, p.mapCap
 }
 
 // parkedMissing is the pending queue's missing map, for a write that parks an
@@ -324,7 +335,7 @@ func drainParked(txn *Transaction, drain func()) {
 	}
 	s := txn.doc.store
 	point := pointNow(txn, s.StateVector())
-	pending, pendingDs, pendingMoves := s.pending, parkedDeletesOf(s), clonePendingMoves(s.pendingMoves)
+	pending, pendingDs, pendingMoves := s.pending, parkedDeletesOf(s), pendingMovesOf(s)
 	// The structs a drain takes out of the queue are listed in the park
 	// record (transactionParked.left); a drain taken back parks them again,
 	// so the list goes back to its length as the drain began.
@@ -350,7 +361,7 @@ func drainParked(txn *Transaction, drain func()) {
 		j.parkedAs = nil
 		s.pending = parkAgain(s, pending)
 		pendingDs.restore(s)
-		s.pendingMoves = pendingMoves
+		pendingMoves.restore(s)
 		if s.parked != nil {
 			clear(s.parked.left[leftLen:])
 			s.parked.left = s.parked.left[:leftLen]
@@ -505,7 +516,7 @@ func (j *applyJournal) rollBack(txn *Transaction) {
 	}
 	s.pending = j.pending
 	j.pendingDs.restore(s)
-	s.pendingMoves = j.pendingMoves
+	j.pendingMoves.restore(s)
 
 	txn.subdocsAdded, txn.subdocsRemoved, txn.subdocsLoaded = nil, nil, nil
 	txn.rearbitrate, txn.movedBefore = nil, nil

@@ -227,7 +227,7 @@ func withUnknownTag(doc *Doc, client ClientID, v2 bool) []byte {
 			enc.WriteVarUint(n)
 		}
 		for _, it := range items {
-			encodeItem(enc, it, 0, doc.store)
+			encodeItem(enc, it, 0)
 		}
 		enc.WriteUint8(0x1f)
 		enc.WriteUint8(1)
@@ -241,7 +241,7 @@ func withUnknownTag(doc *Doc, client ClientID, v2 bool) []byte {
 	e2.writeClient(client)
 	e2.restEnc.WriteVarUint(0)
 	for _, it := range items {
-		encodeItemV2(e2, it, 0, doc.store)
+		encodeItemV2(e2, it, 0)
 	}
 	e2.writeInfo(0x1f)
 	e2.writeParentInfo(true)
@@ -395,5 +395,5 @@ func jsonUpdate() []byte {
 	src := New()
 	text := src.GetText("t")
 	items := []*Item{{ID: ID{Client: 5}, Parent: &text.abstractType, Content: NewContentJSON("a", 1.5, map[string]any{"k": true})}}
-	return encodeStructStoreV1(map[ClientID][]*Item{5: items}, newDeleteSet(), nil, src.store)
+	return encodeStructStoreV1(map[ClientID][]*Item{5: items}, newDeleteSet(), nil)
 }
