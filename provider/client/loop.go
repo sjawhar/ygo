@@ -26,8 +26,9 @@ const dialHandshakeTimeout = 10 * time.Second
 
 // writeTimeout bounds a single control/handshake-path write (session.write:
 // SyncStep1, the Hocuspocus auth token, a SyncStep1 reply, a query-awareness
-// reply — see handleFrame), mirroring provider/websocket's own writeTimeout
-// const. These frames are always small and sent at most once or twice per
+// reply — see handleFrame), mirroring provider/websocket's own per-write
+// deadline (Server.PeerWriteTimeout, which defaults to this same 10 s).
+// These frames are always small and sent at most once or twice per
 // connection, so this deliberately stays a plain, unexported const rather
 // than a var: nothing needs to tune it independently of
 // flushWriteTimeout/closeDrainTimeout below, which cover the payloads that

@@ -387,6 +387,112 @@ func (d *Doc) SetApplyBudget(budget func(origin any) ApplyBudget) {
 	d.applyBudget = budget
 }
 
+// ApplyReport is what one remote apply that committed left the document at:
+// the totals the document stands at once the apply has committed, and the
+// apply's own deltas, which are the four counts ApplyBudget bounds
+// (WithApplyReport).
+type ApplyReport struct {
+	// Structs is the structs the document holds now, those parked in the
+	// pending queue included: a total of what is there, not a sum of what
+	// the applies before this one added. Doc.StructCount counts the store
+	// alone, and a parked struct is held in memory, returned in the
+	// document's encoded state and integrated as soon as its gap is
+	// filled, so an owner bounding what a room costs needs it counted
+	// (Doc.PendingStats).
+	Structs int
+	// Integrated is the structs this apply added of its own, the count
+	// ApplyBudget.Structs bounds: a struct of the update that parked is
+	// counted here, where it parked, and the drain that later lands it
+	// adds nothing (noteIntegrated).
+	Integrated int
+	// Bytes is the content bytes this apply added, the count
+	// ApplyBudget.Bytes bounds: the content itself and the map key an item
+	// carries, for a struct that parked as for one that integrated, and
+	// nothing for a deleted span (applyTally.integrated).
+	Bytes int
+	// Split is the structs this apply made by splitting items the document
+	// already held, the count ApplyBudget.Split bounds, the splits of its
+	// drain of the pending queue included (countSplit).
+	//
+	// A drain whose splits passed ApplyBudget.Split is taken back while
+	// the apply stands, and its splits stay counted here though the
+	// document kept none of them: the take-back gives back the cuts, not
+	// the count, which is what the budget reads to refuse the next one
+	// (drainParked). Structs is of the document either way, so an owner
+	// watching what the room holds reads that and a queue that stops
+	// falling (Doc.PendingStats).
+	Split int
+	// Decoded is the values this apply decoded, the count
+	// ApplyBudget.Decoded bounds.
+	Decoded int
+}
+
+// WithApplyReport reports what each remote update that commits left the
+// document at: as the apply commits, under the lock and inside the
+// transaction that applied it, the document calls report with the apply's
+// origin and an ApplyReport of what the document now holds and what that
+// apply added.
+//
+// It is what makes the library, and not its embedder, the authority on what
+// a document holds. An owner that sizes each update's allowance
+// (WithApplyBudget) from what it can read before the apply reads a number
+// that is both old and short: Doc.StructCount leaves out the structs parked
+// in the pending queue, and an owner keeping running totals of its own
+// instead has to re-derive, from outside, every quantity an apply moves -
+// what parked, what a drain landed, what a delete split, what the commit
+// merged back. Each of those is known here, where the apply ends.
+//
+// Structs is a total and Bytes a delta, and what separates them is what
+// each costs to produce. The struct total is two counters, the store's
+// structs and the pending queue's, which cost 13.4 µs to read together on
+// the rooms measured below: payable on every apply. There is no counter of
+// the bytes a document holds, and the only answer is a whole-state encode,
+// measured on the test pod at 2.96 ms for a mebibyte of prose held in 10
+// structs, 53.0 ms for a 7,792,586-byte state of 494,309 structs and 52.8
+// ms at 600,000 structs, against the 128 ms a browser's keystroke is
+// answered in at the median. An encode per apply would spend two fifths of
+// that answer on the measurement alone, so Bytes is this apply's own, taken
+// off the count the budget already keeps as the apply integrates, and an
+// owner that wants a byte total sums these deltas and encodes when it
+// chooses to.
+//
+// The deltas are exactly the counts of ApplyBudget, so this report and
+// RefusedUpdateError (endRemoteApply) carry the same four numbers by two
+// routes - for a refusal that reached the same point in the apply. A
+// refusal earlier than that stopped counting earlier and carries what it
+// had counted by then, not what the whole update would have come to:
+// measured, an apply reporting Decoded 3 against the same update refused at
+// Decoded 1 by an allowance of one. An apply the document rolled back or
+// refused reports nothing at all - the document is as it was, and its tally
+// is in the error.
+//
+// The totals are read once the commit's merges have run (squashRuns,
+// tryMergeWithLefts), so Structs is the count the next reader of the
+// document finds and not the structs the apply linked: an update that
+// integrates one character beside the same client's last one leaves
+// Integrated at 1 and the total where it was.
+//
+// A document that reports is a bounded document, as one with an apply
+// budget is: it applies every remote update whole or not at all, and
+// refuses a remote update carrying a subdocument or a move. The counts are
+// the journal's, and the journal is what an apply can be taken back to, so
+// a document that only watches is bounded like one that refuses. report
+// runs under the document's lock, so it must not call the document; a panic
+// it raises refuses nothing, the apply having committed, and reaches the
+// caller of the apply once the transaction has committed, as a panic from
+// anything else under Transact does.
+func WithApplyReport(report func(origin any, report ApplyReport)) DocOption {
+	return func(d *Doc) { d.applyReport = report }
+}
+
+// SetApplyReport sets the callback of WithApplyReport on a document already
+// made, or with nil removes it. It takes the document lock.
+func (d *Doc) SetApplyReport(report func(origin any, report ApplyReport)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.applyReport = report
+}
+
 // WithAllowedRoots names the root types a remote update may write under on
 // this document: as each remote apply begins, the document calls roots with
 // the apply's origin, and an update that names, integrates under or deletes
@@ -527,8 +633,9 @@ type Doc struct {
 	maxIntegrateScan    int
 	integrateScanBudget func(origin any) int
 	// applyBudget is the budget of WithApplyBudget, allowedRoots the list of
-	// WithAllowedRoots and refusedContent the kinds of WithRefusedContent,
-	// each nil for none. applying is the running tally
+	// WithAllowedRoots, refusedContent the kinds of WithRefusedContent and
+	// applyReport the callback of WithApplyReport, each nil for none.
+	// applying is the running tally
 	// of the remote apply on this document, between beginRemoteApply and
 	// endRemoteApply and nil at every other time: the decode counts against
 	// the budget through the document, since the decoders it counts in are
@@ -537,6 +644,7 @@ type Doc struct {
 	applyBudget    func(origin any) ApplyBudget
 	allowedRoots   func(origin any) []string
 	refusedContent func(origin any) []ContentKind
+	applyReport    func(origin any, report ApplyReport)
 	applying       *applyTally
 
 	store *StructStore
@@ -692,17 +800,22 @@ func (d *Doc) reattachSubdoc(item *Item, parent *Doc) {
 
 // scanBounded is whether d bounds what its remote updates may do, by a scan
 // bound (WithMaxIntegrateScan), a scan budget (WithIntegrateScanBudget), an
-// apply budget (WithApplyBudget), an allowed-roots list (WithAllowedRoots) or
-// a set of refused content kinds (WithRefusedContent), and so applies each
-// whole or not at all. Its caller holds d.mu.
+// apply budget (WithApplyBudget), an allowed-roots list (WithAllowedRoots), a
+// set of refused content kinds (WithRefusedContent) or a report of what each
+// apply left it at (WithApplyReport), and so applies each whole or not at
+// all. Its caller holds d.mu.
 //
 // The budget, the list and the set are in it because their refusals are
 // rollbacks like the scan bound's: a document that refuses an apply keeps the
 // journal beginRemoteApply takes, and without it there would be nothing to
 // roll an apply back to and the refused update would stand, half integrated.
+// The report is in it because the journal is where the counts it carries are
+// kept (applyTally): a document that only watches is bounded like one that
+// refuses, which is what WithApplyReport says it is.
 func (d *Doc) scanBounded() bool {
 	return d.integrateScanBudget != nil || d.maxIntegrateScan > 0 ||
-		d.applyBudget != nil || d.allowedRoots != nil || d.refusedContent != nil
+		d.applyBudget != nil || d.allowedRoots != nil || d.refusedContent != nil ||
+		d.applyReport != nil
 }
 
 // applyScanLimit is the most items the conflict scans of a remote apply with
@@ -1280,6 +1393,21 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 		}
 
 		phase2, update, cleanup, built := commitLocked(d, txn, r != nil)
+		// The report of a remote apply that committed, after the commit's own
+		// work and under the lock the apply held, so the structs it reports are
+		// the ones the document is left holding and a panicking callback cannot
+		// skip what the commit still owes the document (WithApplyReport).
+		//
+		// It ran before the commit in the first draft of this change, and a
+		// callback that panicked there reached commitLocked as a panicking
+		// transaction, which skips the remote formatting cleanup: after a remote
+		// deletion under such a callback, a later plain insert came out bold.
+		// A panic here is carried like a panic in the event build below - kept
+		// and re-raised after the unlock - so the consumer still hears it and
+		// the document is left whole either way.
+		if reported := reportApplyRecovered(txn); reported != nil && r == nil {
+			r = reported
+		}
 		if built != nil {
 			// A panic while the events were built (a type's prepareFire) is
 			// re-raised below, after the unlock, like a panic in fn, and no

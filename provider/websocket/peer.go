@@ -475,7 +475,7 @@ func (p *peer) sendCloseFrame() {
 	if code != 0 {
 		_ = p.conn.WriteControl(gws.CloseMessage,
 			gws.FormatCloseMessage(code, reason),
-			time.Now().Add(writeTimeout))
+			time.Now().Add(p.server.peerWriteTimeout()))
 	}
 	_ = p.conn.Close()
 }
@@ -1036,7 +1036,7 @@ func (p *peer) writeToConn(data []byte) bool {
 			enc.WriteRaw(data)
 		})
 	}
-	if err := p.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+	if err := p.conn.SetWriteDeadline(time.Now().Add(p.server.peerWriteTimeout())); err != nil {
 		p.server.log().Debug("set write deadline failed; closing", "room", p.roomName, "err", err)
 		p.closeConn()
 		return false

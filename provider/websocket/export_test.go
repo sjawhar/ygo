@@ -77,8 +77,10 @@ func MemoryPersistenceBackoffState(m *MemoryPersistence, room string) (failures 
 	return l.failures, l.retryAt
 }
 
-// WriteTimeout is the deadline writeToConn sets on each write.
-const WriteTimeout = writeTimeout
+// DefaultPeerWriteTimeout is the deadline writeToConn sets on each write
+// when Server.PeerWriteTimeout is unset. Test-only: a test that bounds a
+// teardown bounds it against the number the server uses, not a copy of it.
+const DefaultPeerWriteTimeout = defaultPeerWriteTimeout
 
 // StateFrameBytes is the cap on each frame a peer's SyncStep1 is answered
 // with. Test-only: a test asserting the cap must assert against the one the

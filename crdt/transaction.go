@@ -731,6 +731,13 @@ type boundedApplyState struct {
 	scanSerial          uint32
 	journal             *applyJournal
 	rolledBack          bool
+	// report is what the apply decoded and added, kept at the end of an
+	// apply that will commit, and reportDue is whether the commit has a
+	// report to make of it: the totals it also carries are read at the end
+	// of the transaction, after the merges that decide them
+	// (noteApplyReport, reportApply).
+	report    ApplyReport
+	reportDue bool
 }
 
 // beginBoundedApply returns txn's bounded apply state, made on first use.

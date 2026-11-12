@@ -340,7 +340,8 @@ func refuseRemoteApply(txn *Transaction, err error) error {
 // bounded document's apply failed it rolls the whole apply back and returns
 // err as a RefusedUpdateError carrying what the apply's scans passed and what
 // it decoded and added, which no observer reports for a rolled-back
-// transaction (buildPhase2).
+// transaction (buildPhase2). When it succeeded it keeps the same counts for
+// the report the commit makes (noteApplyReport).
 //
 // It raises no refusal of its own. The struct and byte budget is read where
 // the apply's struct phase ends (refuseOverBudget), before the delete set
@@ -360,6 +361,7 @@ func endRemoteApply(txn *Transaction, err error) error {
 		return err
 	}
 	if err == nil {
+		noteApplyReport(txn, j)
 		return err
 	}
 	j.rollBack(txn)
@@ -372,6 +374,60 @@ func endRemoteApply(txn *Transaction, err error) error {
 		Split:   j.tally.split,
 		Root:    j.tally.root,
 	}
+}
+
+// noteApplyReport keeps what txn's apply decoded and added for the report
+// the commit makes, where the apply has reached its end with no error and so
+// will commit. The counts are the ones a refused apply answers with
+// (RefusedUpdateError), so the two routes report one tally.
+//
+// The report itself is made later, by reportApply at the end of the
+// transaction: the totals it carries are of the document the commit leaves,
+// and the merges that decide them have not run yet.
+func noteApplyReport(txn *Transaction, j *applyJournal) {
+	if txn.doc.applyReport == nil {
+		return
+	}
+	state := txn.boundedApply
+	state.report = ApplyReport{
+		Integrated: j.tally.structs,
+		Bytes:      j.tally.bytes,
+		Split:      j.tally.split,
+		Decoded:    j.tally.decoded,
+	}
+	state.reportDue = true
+}
+
+// reportApply makes the report of txn's remote apply (WithApplyReport),
+// called at the end of the transaction the apply ran in, under the document
+// lock and after the commit's merges (transactInternal). It does nothing for
+// a transaction that ran no apply, for an apply the document refused or
+// rolled back, which noteApplyReport never marked, and for a document with
+// no report callback.
+//
+// The struct total is two counters read here and nowhere else: the structs
+// the store holds, and those the pending queue holds for gaps their senders
+// have still to fill, which the store's count leaves out. The deltas are the
+// apply's own, as the budget counted them.
+// reportApplyRecovered is reportApply with a panicking callback kept rather than
+// raised, so the caller can re-raise it where a panic costs the document
+// nothing (transactInternal's deferred commit).
+func reportApplyRecovered(txn *Transaction) (panicked any) {
+	defer func() { panicked = recover() }()
+	reportApply(txn)
+	return nil
+}
+
+func reportApply(txn *Transaction) {
+	state := txn.boundedApply
+	if state == nil || !state.reportDue {
+		return
+	}
+	state.reportDue = false
+	d := txn.doc
+	report := state.report
+	report.Structs = d.store.Count() + d.store.pending.heldStructs()
+	d.applyReport(txn.Origin, report)
 }
 
 // drainParked runs drain, the apply's drain of the pending queue and pending
