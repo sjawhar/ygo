@@ -95,11 +95,11 @@ func structsRun(client ClientID, start uint64, lens []int, gap int, items bool) 
 // out of clock order, overlapping what it parks, as GC structs and as items,
 // a few per update and many; a third of the updates fail on their delete set
 // and are taken back. After every apply the queue's cover is what its items
-// span.
+// span. Under the race detector it runs a fifth of the rounds.
 func TestUnit_PendingQueue_ARolledBackApplyLeavesTheCoverItsItems(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	checks, rollbacks := 0, 0
-	for round := range 300 {
+	for round := range raceSeeds(300) {
 		doc := New(WithClientID(1), WithMaxIntegrateScan(1000), WithMaxPendingItems(1<<20))
 		for range 40 {
 			client := ClientID(5 + rng.IntN(3))
