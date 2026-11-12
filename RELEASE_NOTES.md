@@ -1,3 +1,19 @@
+## v1.56.0
+
+**Who is affected: code that writes Go integers outside int32 into shared
+types and reads them back with ygo.** JavaScript peers see no change.
+
+An integer outside int32 that a float32 holds exactly, such as 2^31, 2^40 or
+2^53, is now written as lib0 writes the same Number: tag 124 and a float32,
+5 bytes, where ygo wrote tag 123 and a float64, 9 bytes. -2^31 moves from
+tag 125 to tag 124 for the same reason: lib0 writes tag 125 only while the
+magnitude is at most 2^31-1. A JavaScript reader gets the same Number either
+way. A ygo reader now gets these values back from `ReadAny` as a `float32`,
+not a `float64` (or, for -2^31, an `int64`): the type it already got for the
+same value written by a JavaScript peer. Code that type-switches on a decoded
+value should accept `float32` as well as `float64` and `int64`. Integers past
+±2^53 keep tag 122 (BigInt).
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single
