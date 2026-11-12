@@ -34,19 +34,27 @@ against 2.2 without, and in 4.0 with 100,000 structs parked; the first apply to
 find a pending queue reads what it holds once, 2.6 milliseconds for those
 100,000 structs.
 
-The contract is cumulative, not per apply. A total that starts from an encode
-taken while nothing is pending, with no struct and no delete parked
-(`Doc.PendingStats`), and adds each report after it is the length of the
-state's direct form, and is never below the state in either form the encode
-writes. While anything is pending the encode merges the parked parts into the
-document's own encoding, and that merge writes one class of value shorter: an
-integer outside int32 that a float32 holds exactly, such as 2^40, is 9 bytes
-in the direct form and 5 in the merged one. So the total runs 4 bytes a value
-above the state while anything is pending and meets it again when nothing is;
-across 1,800 applies of parks, fills and overwrites of such values the
-largest margin was 728 bytes, for 182 values. An owner takes its base from an
-encode taken while nothing is pending, and holds an encode taken while
-anything is pending as a lower bound of the base.
+The contract is cumulative, not per apply. The encode writes the state
+directly while nothing is pending, with no struct and no delete parked
+(`Doc.PendingStats`), and otherwise merges the parked parts into the
+document's own encoding, and the two forms write two classes of value at
+different lengths. An integer outside int32 that a float32 holds exactly,
+such as 2^40, is 9 bytes in the direct form and 5 merged. An integer in an
+embed or format value that a float64 rounds up to the next power of ten, such
+as 9999999999999999, is its digits in the direct form and a digit longer
+merged, where the document's V1 text is read back as a float64 - as every V1
+decode and Yjs's `JSON.parse` read it, so only a document fed V2 or written
+locally holds one, and none can whose writers send no embed and no format
+value other than a string, a boolean or null. The report counts each value
+at its longer form from the apply that brings it, so a total that starts from
+a room holding neither class is never below the state in either form: it
+runs 4 bytes a wide integer above a merged state and a byte a rounding
+integer above a direct one, at most 588 bytes above across 2,400 applies of
+parks, fills, overwrites, embeds and deletes. A base encode of a room that
+already holds such values is short of the total's form by 4 bytes a wide
+integer if taken while anything is pending, and by a byte a rounding integer
+if taken while nothing is; a room loaded through V1 holds no rounding
+integer, so its base taken while nothing is pending is exact.
 
 Where the report cannot know a part of the state it takes the most that part
 can add, never less:

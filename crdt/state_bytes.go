@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strconv"
 
 	"github.com/reearth/ygo/encoding"
 )
@@ -33,15 +34,16 @@ import (
 // room applies in 4.0 µs with a report and 100,000 structs parked, against
 // 4.3 µs with none parked and 2.2 µs with no report.
 //
-// Every value is counted at what the direct form writes for it, the encode
-// EncodeStateAsUpdateV1 makes while nothing is pending, so a total kept from
-// an encode taken then is the direct form's length. The merged form it
-// writes while anything is pending (withParked) is the same but for one
-// class of value: an integer outside int32 that a float32 holds exactly is
-// a float64 of nine bytes in the direct form (anyIntLen) and, read back as
-// a float64, a float32 of five in the merged form. So the total runs four
-// bytes a value above the state while anything is pending, and meets it when
-// nothing is.
+// EncodeStateAsUpdateV1 writes the direct encode while nothing is pending,
+// and a merge of it with the parked parts otherwise (withParked), and the two
+// forms write two classes of value at different lengths. Each is counted at
+// its longer form, from the apply that brings it to the one that removes it,
+// so the total is at or above the state in either form: an integer outside
+// int32 that a float32 holds exactly is a float64 of nine bytes in the direct
+// form (anyIntLen) and, read back as a float64, a float32 of five merged; an
+// integer in JSON text that a float64 rounds up a digit is a byte longer
+// merged (jsonLen). The total runs four bytes above a merged state for each
+// of the first and a byte above a direct state for each of the second.
 //
 // Some counts the state writes are not kept by the document, and where an
 // apply changes one the report takes the most it can add rather than walk
@@ -258,16 +260,16 @@ func contentLen(c Content, offset uint64, values bool) int {
 		n := uvarLen(uint64(len(vals)))
 		if values {
 			for _, v := range vals {
-				n += strLen(fmtValToJSON(v))
+				n += jsonLen(v)
 			}
 		}
 		return n
 	case *ContentBinary:
 		return uvarLen(uint64(len(ct.Data))) + len(ct.Data)
 	case *ContentEmbed:
-		return strLen(fmtValToJSON(ct.Val))
+		return jsonLen(ct.Val)
 	case *ContentFormat:
-		return strLen(ct.Key) + strLen(fmtValToJSON(ct.Val))
+		return strLen(ct.Key) + jsonLen(ct.Val)
 	case *ContentType:
 		tc, name := typeClassOf(ct)
 		if typeRefHasName(tc) {
@@ -287,6 +289,66 @@ func contentLen(c Content, offset uint64, values bool) int {
 		return uvarLen(uint64(ct.Target.Client)) + uvarLen(ct.Target.Clock) + uvarLen(ct.TargetLen)
 	}
 	// encodeContent writes nothing for any other content.
+	return 0
+}
+
+// jsonLen is what V1 writes for v as JSON text, at the longer of the state's
+// two forms. The direct form prints an integer v holds - an int64 or BigInt
+// a V2 update or a local write brought - as its digits, and the merge an
+// encode with parked state makes reads that text back as a float64
+// (fmtValFromJSON) and prints the float64, a digit longer where it rounds up
+// to the next power of ten: 9999999999999999 becomes 10000000000000000
+// (roundUps). Every V1 decode rounds the same way, so only a document fed V2
+// or written locally holds such an integer.
+func jsonLen(v any) int {
+	n := len(fmtValToJSON(v)) + roundUps(v)
+	return uvarLen(uint64(n)) + n
+}
+
+// roundUps is how many integers v holds whose float64 prints a digit more
+// than they do.
+func roundUps(v any) int {
+	switch t := v.(type) {
+	case int64:
+		return intRoundsUp(t)
+	case int:
+		return intRoundsUp(int64(t))
+	case encoding.BigInt:
+		return intRoundsUp(int64(t))
+	case uint64:
+		if t <= math.MaxInt64 {
+			return intRoundsUp(int64(t))
+		}
+		var f, u [24]byte
+		if len(strconv.AppendFloat(f[:0], float64(t), 'f', -1, 64)) > len(strconv.AppendUint(u[:0], t, 10)) {
+			return 1
+		}
+	case []any:
+		n := 0
+		for _, e := range t {
+			n += roundUps(e)
+		}
+		return n
+	case map[string]any:
+		n := 0
+		for _, e := range t {
+			n += roundUps(e)
+		}
+		return n
+	}
+	return 0
+}
+
+// intRoundsUp is 1 where i's float64 prints a digit more than i, which needs
+// a magnitude past 2^53, from where a float64 no longer holds every integer.
+func intRoundsUp(i int64) int {
+	if i > -(1<<53) && i < 1<<53 {
+		return 0
+	}
+	var f, d [24]byte
+	if len(strconv.AppendFloat(f[:0], float64(i), 'f', -1, 64)) > len(strconv.AppendInt(d[:0], i, 10)) {
+		return 1
+	}
 	return 0
 }
 
@@ -704,7 +766,7 @@ func noteStatePark(txn *Transaction, item *Item) {
 	clock, last := item.ID.Clock, item.ID.Clock+item.Content.Len()
 	grown := structLen(item, 0, true)
 	run, ran := t.parked[c]
-	if t.fresh && !(clock >= end && (!ran || run.entries >= 0 && clock >= run.end)) {
+	if t.fresh && (clock < end || ran && (run.entries < 0 || clock < run.end)) {
 		run, ran = freshPark{entries: -1}, true
 	}
 	queued, known := 0, false
