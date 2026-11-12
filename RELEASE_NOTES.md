@@ -378,6 +378,13 @@ schema has no node for, which no count can catch. `Server.OnStateAnswer`
 lets a server admit the decode a SyncStep1 answer costs before it runs, so a
 join storm cannot run any number of whole-room decodes at once.
 
+`crdt.WithApplyReport` and `Doc.SetApplyReport` tell an owner, as each remote
+apply commits, the document's struct total (parked structs included) and the
+apply's own integrated structs, bytes, splits and decoded values, so a room's
+size can be tracked without a pre-apply estimate or a whole-state encode. A
+refused apply reports nothing. Opt-in; a document without the callback is
+unchanged.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single

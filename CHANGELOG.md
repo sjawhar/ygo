@@ -344,6 +344,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `StateAnswerInfo.StructsNow` reads the figure again for a hook that
   waited before admitting the answer. A `Server` with no hook answers as
   before.
+- **`crdt.WithApplyReport` / `Doc.SetApplyReport`** - a callback invoked as
+  each remote apply commits, under the document lock and inside the apply's
+  transaction, so an owner can track a room's size without keeping its own
+  pre-apply estimate. It carries `Structs` (the document's structs, parked
+  included) as a total and `Integrated`, `Bytes`, `Split` and `Decoded` as the
+  apply's own deltas - the four counts `ApplyBudget` bounds. A refused apply
+  reports nothing. The struct total is two counters rather than a whole-state
+  encode, for the reason the field exists: measured on a 494,309-struct
+  document, the total takes 13 µs against 53 ms to encode. The callback runs
+  behind the commit, so a panic in it propagates to the caller without
+  skipping the commit's own work; it must not read the document (it holds the
+  write lock).
 
 A document that sets no apply budget, no allowed-roots list, no refused
 content kinds and no scan bound keeps no tally, and every count, check and
