@@ -121,8 +121,10 @@ func (item *Item) integrate(txn *Transaction, offset uint64) {
 			item.markGCOrphan()
 			// A struct of a remote update that enters the store, checked
 			// against the document's allowed roots and counted against its
-			// budget where it does (noteIntegrated).
+			// budget, and in the encoded state a report keeps, where it does
+			// (noteIntegrated, noteStateAppend).
 			noteIntegrated(txn, item)
+			noteStateAppend(txn, item)
 			txn.doc.store.Append(item)
 			txn.doc.store.resolvePendingMoves(txn, item.ID.Client)
 			return
@@ -309,8 +311,10 @@ func (item *Item) integrate(txn *Transaction, offset uint64) {
 
 	// Register in the document store, checked against the document's allowed
 	// roots and counted against a remote apply's budget as the struct it
-	// integrates (noteIntegrated).
+	// integrates, and in the encoded state a report keeps (noteIntegrated,
+	// noteStateAppend).
 	noteIntegrated(txn, item)
+	noteStateAppend(txn, item)
 	txn.doc.store.Append(item)
 	if j := txn.applyJournal(); j != nil {
 		j.integrating = nil
@@ -658,6 +662,10 @@ func splitItem(txn *Transaction, item *Item, offset uint64) *Item {
 	if j := txn.applyJournal(); j != nil && j.drained(item) {
 		j.keepParked(item)
 	}
+	// A split adds a struct to the encoded state a report keeps: the right
+	// half's header and the length prefix of each half's content, the content
+	// itself moving (measureSplit).
+	measured := measureSplit(txn, item)
 	rightContent := item.Content.Splice(offset) // mutates item.Content → [0, offset)
 	right := &Item{
 		ID:          ID{Client: item.ID.Client, Clock: item.ID.Clock + offset},
@@ -678,6 +686,7 @@ func splitItem(txn *Transaction, item *Item, offset uint64) *Item {
 	}
 	item.Right = right
 	txn.doc.store.insertItem(right)
+	measured.note(item, right)
 	// A key's entry is its rightmost unit, so Set's origin stays the run's end.
 	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {
 		item.Parent.itemMap[*item.ParentSub] = right

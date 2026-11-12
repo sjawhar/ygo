@@ -356,6 +356,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind the commit, so a panic in it propagates to the caller without
   skipping the commit's own work; it must not read the document (it holds the
   write lock).
+- **`crdt.ApplyReport.StateBytes`** - the bytes the apply's transaction added
+  to the document's encoded state, as `EncodeStateAsUpdateV1(doc, nil)`
+  measures it, so an owner that encodes a document once and adds each
+  report's `StateBytes` keeps the state's length, or more, without encoding
+  again. It is a signed delta: below zero where a delete's content is
+  collected, split halves merge back, or a drain drops a parked struct.
+  `Bytes` is not this number: it is the content the budget charges, and a GC
+  struct or a split half adds state with no content. 24 frames of 900 KiB,
+  each parked behind a gap of its own client, grew the state to 22,119,318
+  bytes, and a 100,000-character run with every other character deleted
+  holds a state of 1,019,797; the report gives 22,118,664 and 725,230, each
+  the encode's growth to the byte. It is counted as the apply makes each
+  change, not by encoding, which
+  takes 53.0 ms on a 494,309-struct document: a keystroke on that document
+  applies in 4.3 µs with the report against 2.2 µs without, and in 4.0 µs
+  with 100,000 structs parked.
+
+  The contract is cumulative. A total that starts from an encode taken while
+  nothing is pending (no struct and no delete parked) is the length of the
+  state's direct form, and never below the state in either form the encode
+  writes. While anything is pending the encode merges the parked parts in and
+  writes an integer outside int32 that a float32 holds exactly, such as 2^40,
+  in 5 bytes rather than 9, so the total runs 4 bytes a value above the state
+  then (728 bytes for 182 values, at most, in 1,800 applies of parks, fills
+  and overwrites) and meets it when nothing is pending. An owner takes its
+  base from an encode taken while nothing is pending; one taken while anything
+  is pending is a lower bound. Where the report cannot know a part of the
+  state it takes the most the part can add: a byte for a delete range added
+  to a client of more than 254 structs where the range count's varuint does
+  not grow, and 2 × (varuint client + varuint clock) for each struct appended,
+  split or merged at clocks a parked struct shares (730 bytes over on the
+  worst of 12,000 applies of re-sent states).
+
+  The report covers its own apply's transaction alone. On a document whose
+  text root was read with `GetText`, the format cleanup that may follow a
+  remote apply is a local transaction of its own, after the report: with GC
+  off, a delete of "abc" reaching a document that holds a concurrent bold of
+  its last character reports 9 while the state grows by 18, the cleanup's
+  delete adding a 9-byte delete-set entry. An owner bounding state counts
+  those commits too.
 
 A document that sets no apply budget, no allowed-roots list, no refused
 content kinds and no scan bound keeps no tally, and every count, check and

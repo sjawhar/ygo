@@ -119,6 +119,11 @@ type pendingUpdate struct {
 	missing StateVector // clientID -> store clock at park time for that client
 	// cover is the clocks items span, built on demand and kept by addCover.
 	cover *pendingCover
+	// stateCover is the clocks items span or spanned, built on demand and
+	// grown by each park, for an apply report's count, and stateExact whether
+	// it is the clocks items span and no more (parkedCover).
+	stateCover map[ClientID]*queuedClocks
+	stateExact bool
 	// tail is the single client's clock past every parked struct, when tail
 	// is valid and no struct of another client parked; it lets a tail append
 	// skip building cover.

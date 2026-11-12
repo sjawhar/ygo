@@ -244,6 +244,11 @@ func integrateClientRuns(txn *Transaction, pending []*Item, step int, done []boo
 // that parked it (checkParkedRoot) - so it drops that one item and the
 // drain goes on.
 func tryIntegrateOrDrop(txn *Transaction, item *Item, dropped *error) (ok bool, waitsOn ClientID, err error) {
+	// A struct that leaves the queue takes what it held in the encoded state
+	// a report keeps with it (measureLeaving); deferred first, it reads ok
+	// once a recovered panic below has set it.
+	leaving := measureLeaving(txn, item)
+	defer func() { leaving.note(ok) }()
 	if dropped == nil {
 		return tryIntegrate(txn, item)
 	}
@@ -281,8 +286,11 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 		// A GC struct the merge grew gains deleted-range clocks, which the
 		// document holds as a range record, not as bytes of content. A widened
 		// range is no heap, so the grown span is not charged; the arriving GC
-		// struct is bounded like any other, by Decoded and Structs.
+		// struct is bounded like any other, by Decoded and Structs. What the
+		// merge changes of the encoded state is a report's (measureQueueMerge).
+		merged := measureQueueMerge(txn, pl)
 		pending = s.pending.apply(pl, pending, s.parked != nil && len(s.parked.items) > 0)
+		merged.note(pl, s.pending)
 	}
 	from := 0
 	if s.pending != nil {

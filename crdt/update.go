@@ -973,8 +973,10 @@ func integrateGroup(txn *Transaction, group []*Item, existingEnd uint64, pending
 				item.ID.Clock += offset
 				item.Content = item.Content.Splice(offset)
 			}
-			// A struct of the update that enters the store (noteIntegrated).
+			// A struct of the update that enters the store (noteIntegrated,
+			// noteStateAppend).
 			noteIntegrated(txn, item)
+			noteStateAppend(txn, item)
 			txn.doc.store.Append(item)
 			// A deferred move whose target is in this GC struct stops waiting.
 			txn.doc.store.resolvePendingMoves(txn, item.ID.Client)
@@ -1942,6 +1944,7 @@ func appendTrimmed(txn *Transaction, item *Item, existingEnd uint64) {
 		item.Content = item.Content.Splice(offset)
 	}
 	noteIntegrated(txn, item)
+	noteStateAppend(txn, item)
 	txn.doc.store.Append(item)
 }
 
