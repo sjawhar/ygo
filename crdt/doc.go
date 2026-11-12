@@ -436,30 +436,40 @@ type ApplyReport struct {
 	// apply to find a queue reads what it holds once, 2.6 ms for those
 	// 100,000, and keeps that reading up as parks change the queue.
 	//
-	// The contract is cumulative, not per apply. A total that starts from an
-	// encode taken while nothing is pending - no struct parked and no delete
-	// parked (Doc.PendingStats) - and adds each report's StateBytes after it
-	// is the length of the state's direct form, and is never below the
-	// state in either form EncodeStateAsUpdateV1 writes: the direct encode
-	// while nothing is pending, and otherwise a merge of it with the parked
-	// parts (withParked), which writes one class of value shorter. An
-	// integer outside int32 that a float32 holds exactly, such as 2^40, in
-	// a ContentAny value or a subdocument's meta, is a float64 of nine bytes
-	// in the direct form and a float32 of five in the merged form, so the
-	// total runs four bytes a value above the state while anything is
-	// pending and meets it again when nothing is: 728 bytes above, for 182
-	// such values, at most across 1,800 applies of parks, fills and
-	// overwrites (TestUnit_ApplyReport_StateBytesTotalStaysAtOrAboveTheStateInBothForms).
+	// The contract is cumulative, not per apply. EncodeStateAsUpdateV1
+	// writes the state in one of two forms: the direct encode while nothing
+	// is pending - no struct parked and no delete parked (Doc.PendingStats)
+	// - and otherwise a merge of it with the parked parts (withParked), which
+	// writes two classes of value at other lengths. An integer outside int32
+	// that a float32 holds exactly, such as 2^40, in a ContentAny value or a
+	// subdocument's meta, is a float64 of nine bytes in the direct form and
+	// a float32 of five merged. An integer in an embed or format value that
+	// a float64 rounds up to the next power of ten, such as
+	// 9999999999999999, is its digits in the direct form and a digit longer
+	// merged, where V1's JSON text is read back as a float64, as every V1
+	// decode and Yjs's JSON.parse read it; so only a document fed V2, which
+	// carries the integer itself, or written locally holds one, and none can
+	// whose writers send no embed and no format value other than a string, a
+	// boolean or null. The report counts each value at its longer form from
+	// the apply that brings it to the one that removes it. So a total that
+	// starts from an encode of a room holding neither class and adds each
+	// report's StateBytes is never below the state in either form: it runs
+	// four bytes above a merged state for each wide integer held, and a byte
+	// above a direct one for each rounding integer, at most 588 bytes above
+	// across 2,400 applies of parks, fills, overwrites, embeds and deletes
+	// (TestUnit_ApplyReport_StateBytesTotalStaysAtOrAboveTheStateInBothForms).
 	// No one apply's report equals its own growth in both forms, and it need
 	// not: a park counts the values it parks at nine bytes, which the state
 	// writes in five, and the fill that empties the queue counts nothing for
-	// the four a value the state then regains. So an owner takes its base
-	// from an encode taken while nothing is pending, and holds an encode
-	// taken while anything is as a lower bound of the base.
+	// the four a value the state then regains. A base encode of a room that
+	// already holds such values is short of the total's form by four bytes a
+	// wide integer if taken while anything is pending, and a byte a rounding
+	// integer if taken while nothing is; a room loaded through V1 holds no
+	// rounding integer, so its base taken while nothing is pending is exact.
 	//
 	// Where the report cannot know a part of the state it takes the most the
-	// part can add, never less, which puts the total above the state's
-	// direct form by a bounded figure in three shapes:
+	// part can add, never less, which puts the total above the state by a
+	// bounded figure in three shapes:
 	//   - a delete range added to a client holding more than 254 structs, whose
 	//     ranges the document does not count: a byte over where the varuint
 	//     counting them does not grow, as at the 1,001st range, which reports

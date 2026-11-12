@@ -407,7 +407,7 @@ func TestUnit_ApplyReport_StateBytesSumsToTheEncodedStateUnderReordering(t *test
 		if err := ApplyUpdateV1(room, baseState(t, base), nil); err != nil {
 			t.Fatalf("the base state was refused: %v", err)
 		}
-		var peers []*statePeer
+		peers := make([]*statePeer, 0, 4)
 		for _, c := range []ClientID{10, 200, 3_000_000_000, 1 << 40} {
 			peers = append(peers, newStatePeer(t, base, c))
 		}
@@ -495,7 +495,7 @@ func TestUnit_StructLenIsWhatEncodeItemWrites(t *testing.T) {
 		NewContentString("plain text"),
 		NewContentString("emoji 😀 and ünïcode"),
 		NewContentDeleted(300),
-		&ContentAny{Vals: []any{nil, true, false, 0, -1, 63, 64, -8191, 1 << 40, -(1 << 60), uint64(1 << 63), int8(3), uint16(70000 % 65536),
+		&ContentAny{Vals: []any{nil, true, false, 0, -1, 63, 64, -8191, int64(1 << 40), int64(-(1 << 60)), uint64(1 << 63), int8(3), uint16(70000 % 65536),
 			float32(1.5), 1.5, 0.1, encoding.BigInt(7), "s", []byte{1, 2, 3}, []any{1, "x", []any{}}, map[string]any{"b": 1, "a": "z"}}},
 		&ContentJSON{Vals: []any{map[string]any{"x": 1.0}, "quoted \"text\"", nil}},
 		&ContentBinary{Data: make([]byte, 200)},
@@ -543,11 +543,17 @@ func TestUnit_StructLenIsWhatEncodeItemWrites(t *testing.T) {
 // and what the encoded state grew by.
 func reportedGrowth(t *testing.T, doc *Doc, update []byte) (reported, grown int) {
 	t.Helper()
+	return reportedGrowthBy(t, doc, update, ApplyUpdateV1)
+}
+
+// reportedGrowthBy is reportedGrowth with apply, V1's or V2's.
+func reportedGrowthBy(t *testing.T, doc *Doc, update []byte, apply func(*Doc, []byte, any) error) (reported, grown int) {
+	t.Helper()
 	var made reports
 	doc.SetApplyReport(made.take)
 	defer doc.SetApplyReport(nil)
 	before := stateLen(doc)
-	if err := ApplyUpdateV1(doc, update, nil); err != nil {
+	if err := apply(doc, update, nil); err != nil {
 		t.Fatalf("the update was refused: %v", err)
 	}
 	switch len(made.made) {
@@ -669,11 +675,11 @@ func TestUnit_ApplyReport_StateBytesNeverFallsShortOfRedeliveredState(t *testing
 	clients := []ClientID{3, 200, 1 << 40}
 	for seed := range uint64(40) {
 		rng := rand.New(rand.NewPCG(seed, 7))
-		var writers []*Doc
+		writers := make([]*Doc, 0, len(clients))
 		for _, c := range clients {
 			writers = append(writers, New(WithClientID(c), WithGC(seed%2 == 0)))
 		}
-		var states [][]byte
+		states := make([][]byte, 0, 60)
 		for step := range 60 {
 			w := writers[rng.IntN(len(writers))]
 			for _, o := range writers {
@@ -754,27 +760,47 @@ func wideIntsHeld(doc *Doc) int {
 	return n
 }
 
-// A total an owner keeps from an encode with nothing pending and the reports
-// after it is the length of the state's direct form, and so at or above the
-// state in either of its forms after every apply. An integer past int32 is
-// nine bytes in the direct form, which EncodeStateAsUpdateV1 writes while
-// nothing is parked, and five in the merged form it writes otherwise
-// (withParked), so the total runs four bytes a value ahead of the state while
-// anything is pending, and meets it again when nothing is: here across new
-// writers' sets, which overwrite a key's values and collect them, sets and
-// deletes parked behind their writers' gaps, and the fills that land them.
+// embedsHeld is how many embeds the room's encoded state writes, each here
+// one integer a float64 rounds up a digit.
+func embedsHeld(doc *Doc) int {
+	n := 0
+	for _, items := range doc.store.clients {
+		for _, it := range items {
+			if _, ok := it.Content.(*ContentEmbed); ok {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// A total an owner keeps from the reports is at or above the state in both
+// forms EncodeStateAsUpdateV1 writes, after every apply: the direct encode
+// while nothing is pending, and its merge with the parked parts otherwise
+// (withParked). Two classes of value are written at different lengths in the
+// two, and the report counts each at its longer one from the apply that
+// brings it: an integer past int32 that a float32 holds exactly is nine bytes
+// in the direct form and five merged, and an integer in an embed that a
+// float64 rounds up a digit, 9999999999999999 from a V2 update, is a byte
+// longer merged. So the total runs four bytes a wide integer above a merged
+// state and a byte an embed above a direct one, across new writers' sets,
+// which overwrite a key's values and collect them, sets and deletes parked
+// behind their writers' gaps, the fills that land them, embeds and their
+// deletes.
 func TestUnit_ApplyReport_StateBytesTotalStaysAtOrAboveTheStateInBothForms(t *testing.T) {
 	keys := []string{"a", "b", "c"}
-	most, mostHeld := 0, 0
+	most, mostF, mostG := 0, 0, 0
 	for seed := range uint64(30) {
 		rng := rand.New(rand.NewPCG(seed, 5))
 		room := New(WithClientID(1), WithGC(seed%2 == 0))
-		total := stateLen(room) // the direct form: nothing is pending
+		deleter := New(WithClientID(2))
+		total := stateLen(room)
 		next := ClientID(100)
 		var parkedSets, parkedDeletes []ClientID
-		for step := range 60 {
+		for step := range 80 {
 			var u []byte
-			switch c := rng.IntN(5); {
+			apply := ApplyUpdateV1
+			switch c := rng.IntN(7); {
 			case c < 2:
 				u = wideInts(next, 0, keys[rng.IntN(len(keys))], 1+rng.IntN(6))
 			case c == 2:
@@ -783,6 +809,24 @@ func TestUnit_ApplyReport_StateBytesTotalStaysAtOrAboveTheStateInBothForms(t *te
 			case c == 3:
 				u = clockDeleteUpdate(next, 0, 1)
 				parkedDeletes = append(parkedDeletes, next)
+			case c == 4:
+				peer := New(WithClientID(next))
+				text := peer.GetText("t")
+				peer.Transact(func(txn *Transaction) {
+					text.InsertEmbed(txn, 0, map[string]any{"v": int64(9999999999999999)}, nil)
+				})
+				u, apply = EncodeStateAsUpdateV2(peer, nil), ApplyUpdateV2
+			case c == 5:
+				if err := ApplyUpdateV1(deleter, EncodeStateAsUpdateV1(room, nil), nil); err != nil {
+					t.Fatalf("seed %d: the deleter refused the room's state: %v", seed, err)
+				}
+				sv, text := deleter.StateVector(), deleter.GetText("t")
+				deleter.Transact(func(txn *Transaction) {
+					if text.Len() > 0 {
+						text.Delete(txn, 0, 1)
+					}
+				})
+				u = EncodeStateAsUpdateV1(deleter, sv)
 			case len(parkedSets) > 0 && (len(parkedDeletes) == 0 || rng.IntN(2) == 0):
 				i := rng.IntN(len(parkedSets))
 				u = wideInts(parkedSets[i], 0, keys[rng.IntN(len(keys))], 1)
@@ -795,7 +839,7 @@ func TestUnit_ApplyReport_StateBytesTotalStaysAtOrAboveTheStateInBothForms(t *te
 				u = wideInts(next, 0, keys[rng.IntN(len(keys))], 1)
 			}
 			next++
-			reported, _ := reportedGrowth(t, room, u)
+			reported, _ := reportedGrowthBy(t, room, u, apply)
 			total += reported
 			state := EncodeStateAsUpdateV1(room, nil)
 			merged, err := MergeUpdatesV1(state)
@@ -805,19 +849,17 @@ func TestUnit_ApplyReport_StateBytesTotalStaysAtOrAboveTheStateInBothForms(t *te
 			if total < len(state) || total < len(merged) {
 				t.Fatalf("seed %d, step %d: the total is %d, below the state's encode of %d or its merged form of %d", seed, step, total, len(state), len(merged))
 			}
-			pending := room.PendingStats()
-			held := wideIntsHeld(room)
-			if pending.Items == 0 && pending.DeleteRanges == 0 {
-				if total != len(state) {
-					t.Fatalf("seed %d, step %d: nothing is pending and the total is %d, not the state's %d", seed, step, total, len(state))
-				}
-			} else if total-len(state) != 4*held {
-				t.Fatalf("seed %d, step %d: the total runs %d bytes ahead of the state, not 4 for each of the %d wide integers held", seed, step, total-len(state), held)
+			f, g := wideIntsHeld(room), embedsHeld(room)
+			want, form := 4*f, "merged"
+			if p := room.PendingStats(); p.Items == 0 && p.DeleteRanges == 0 {
+				want, form = g, "direct"
 			}
-			if margin := total - len(state); margin > most {
-				most, mostHeld = margin, held
+			if margin := total - len(state); margin != want {
+				t.Fatalf("seed %d, step %d: the total runs %d bytes above the %s state, want %d for %d wide integers and %d embeds", seed, step, margin, form, want, f, g)
+			} else if margin > most {
+				most, mostF, mostG = margin, f, g
 			}
 		}
 	}
-	t.Logf("the largest margin: the total %d bytes above the state, with %d wide integers held while something was pending", most, mostHeld)
+	t.Logf("the largest margin: the total %d bytes above the state, holding %d wide integers and %d embeds", most, mostF, mostG)
 }

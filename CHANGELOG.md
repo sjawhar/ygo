@@ -373,16 +373,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applies in 4.3 µs with the report against 2.2 µs without, and in 4.0 µs
   with 100,000 structs parked.
 
-  The contract is cumulative. A total that starts from an encode taken while
-  nothing is pending (no struct and no delete parked) is the length of the
-  state's direct form, and never below the state in either form the encode
-  writes. While anything is pending the encode merges the parked parts in and
-  writes an integer outside int32 that a float32 holds exactly, such as 2^40,
-  in 5 bytes rather than 9, so the total runs 4 bytes a value above the state
-  then (728 bytes for 182 values, at most, in 1,800 applies of parks, fills
-  and overwrites) and meets it when nothing is pending. An owner takes its
-  base from an encode taken while nothing is pending; one taken while anything
-  is pending is a lower bound. Where the report cannot know a part of the
+  The contract is cumulative. The encode writes the state directly while
+  nothing is pending (no struct and no delete parked) and merges the parked
+  parts in otherwise, and the two forms write two classes of value at
+  different lengths: an integer outside int32 that a float32 holds exactly,
+  such as 2^40, is 9 bytes direct and 5 merged, and an integer in an embed or
+  format value that a float64 rounds up a digit, such as 9999999999999999
+  from a V2 update, is a byte longer merged. The report counts each at its
+  longer form, so a total started from a document holding neither is never
+  below the state in either form (588 bytes above at most, in 2,400 applies
+  of parks, fills, overwrites, embeds and deletes). A base encode of a
+  document that already holds such values is short by 4 bytes a wide integer
+  if taken while anything is pending and a byte a rounding integer if taken
+  while nothing is; a document loaded through V1 holds no rounding integer.
+  Where the report cannot know a part of the
   state it takes the most the part can add: a byte for a delete range added
   to a client of more than 254 structs where the range count's varuint does
   not grow, and 2 × (varuint client + varuint clock) for each struct appended,
