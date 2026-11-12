@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"unicode/utf8"
@@ -11,6 +12,18 @@ import (
 	"github.com/reearth/ygo/encoding"
 	"github.com/reearth/ygo/internal/anycodec"
 )
+
+// ErrPendingCap is why a document refuses a remote update that would leave
+// more structs or more delete ranges parked than WithMaxPendingItems allows.
+// It wraps ErrInvalidUpdate, as every refusal of a remote update does, so a
+// caller that only asks whether the update was taken is unaffected.
+//
+// It is told apart from the other refusals because it says something else
+// about the sender. Bytes that do not read mean the sender is broken, and a
+// server may drop it for good; the pending cap means only that this update
+// waits on clocks the document has not seen yet, which is transient, so the
+// sender stays connected and the update lands once its gap is filled.
+var ErrPendingCap = fmt.Errorf("%w: it would park more than the document allows", ErrInvalidUpdate)
 
 // pendingBudget checks whether dependencies can resolve within this update
 // before charging its unresolved structs to the persistent pending limit.
@@ -42,9 +55,12 @@ type pendingBudget struct {
 	clocks StateVector
 	// deleteSet is the update's delete set once the parked-range check read
 	// it whole from deleteSetBytes, the bytes the apply's decoder reaches after
-	// the structs, so the apply does not decode it again.
-	deleteSet     DeleteSet
-	deleteSetRead bool
+	// the structs, so the apply does not decode it again, and
+	// deleteSetRanges is how many ranges that read took off the frame, which
+	// is what the apply counts (countDecodedRanges).
+	deleteSet       DeleteSet
+	deleteSetRead   bool
+	deleteSetRanges int
 }
 
 func newPendingBudget(doc *Doc, initial StateVector, update []byte, v2 bool) pendingBudget {
@@ -144,7 +160,7 @@ func (b *pendingBudget) check() error {
 			break // only the merge itself tells what overlapping structs add
 		}
 		if !result.progressed {
-			return ErrInvalidUpdate
+			return ErrPendingCap
 		}
 	}
 	// An absent dependency cannot be supplied by a later scan. Record compact
@@ -514,7 +530,7 @@ func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining in
 					} else {
 						result.permanent++
 						if pastRoom(result.permanent, remaining, held) {
-							return result, ErrInvalidUpdate
+							return result, ErrPendingCap
 						}
 					}
 					if !blocked && collect != nil && collect.permanent {
@@ -543,7 +559,7 @@ func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining in
 						if clients == 1 && pastRoom(result.pending, remaining, held) {
 							// No other group can fill this group's first blocked head. All
 							// following uncovered non-Skip structs remain permanently pending.
-							return result, ErrInvalidUpdate
+							return result, ErrPendingCap
 						}
 					}
 					if !blocked {

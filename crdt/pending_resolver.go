@@ -263,7 +263,7 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	if s.pending.heldStructs() > 0 && !s.pending.tailAppends(pending) && s.pending.mergesAny(pending) {
 		pl := s.pending.plan(refsOf(pending))
 		if s.pending.heldStructs()+pl.growth() > limit {
-			return ErrInvalidUpdate
+			return ErrPendingCap
 		}
 		if j := txn.applyJournal(); j != nil {
 			// The merge changes the queue in place; a bounded apply's journal
@@ -288,7 +288,7 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	}()
 	for _, item := range pending {
 		if s.pending.heldStructs() >= limit {
-			return ErrInvalidUpdate
+			return ErrPendingCap
 		}
 		if s.pending == nil {
 			s.pending = &pendingUpdate{missing: make(StateVector), tailClient: item.ID.Client, tailValid: true}

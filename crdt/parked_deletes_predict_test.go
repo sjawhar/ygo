@@ -89,7 +89,7 @@ func TestUnit_ApplyUpdate_TheParkedDeletesCheckedAreWhatTheApplyParks(t *testing
 					t.Fatal(err)
 				}
 			}
-			ds, err := deleteSetOf(&pendingBudget{update: update, v2: format.v2})
+			ds, _, err := deleteSetOf(&pendingBudget{update: update, v2: format.v2})
 			if err != nil {
 				t.Fatalf("round %d %s: %v", round, format.name, err)
 			}
@@ -143,7 +143,7 @@ func TestUnit_ApplyUpdate_TheParkedDeletesCheckedAreWhatTheApplyParks(t *testing
 						t.Fatal(err)
 					}
 				}
-				ds, err := deleteSetOf(&pendingBudget{update: update, v2: format.v2})
+				ds, _, err := deleteSetOf(&pendingBudget{update: update, v2: format.v2})
 				if err != nil {
 					t.Fatalf("round %d %s: %v", round, format.name, err)
 				}

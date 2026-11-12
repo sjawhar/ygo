@@ -112,6 +112,11 @@ type applyJournal struct {
 	// integrating is the item integrate has linked into its parent's list and
 	// not yet appended to the store, for a failure between the two.
 	integrating *Item
+	// tally is what the apply decoded and added, and the allowance it may do
+	// so within (WithApplyBudget, WithAllowedRoots). It lives in the journal
+	// because an apply that keeps one is exactly an apply that can be
+	// refused; the document points at it for the decode (Doc.applying).
+	tally applyTally
 }
 
 // applyPoint is a point of an apply a rollback can return the document to.
@@ -122,12 +127,24 @@ type applyPoint struct {
 	newItems int
 	roots    map[string]struct{}
 	mapPrev  map[mapSlot]*Item
+	// fmtPrev is the formatting flags of each type the apply changed them
+	// on, as they were at this point (tookFormatting).
+	fmtPrev map[*abstractType]fmtFlags
 }
 
 // mapSlot names one key of one map-like type.
 type mapSlot struct {
 	parent *abstractType
 	key    string
+}
+
+// fmtFlags is what integrating or deleting a ContentFormat changes on the
+// type it hangs under: the two flags that move a text off the plain path and
+// the counter the format cache reads (abstractType).
+type fmtFlags struct {
+	has   bool
+	clean bool
+	gen   uint64
 }
 
 // pointNow is txn's apply as it stands, with the store's state vector sv.
@@ -159,7 +176,11 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 		return
 	}
 	s := d.store
-	j := &applyJournal{start: pointNow(txn, before), drainOwnAllowance: d.integrateScanBudget == nil}
+	j := &applyJournal{
+		start:             pointNow(txn, before),
+		drainOwnAllowance: d.integrateScanBudget == nil,
+		tally:             applyTally{budget: noApplyBudget},
+	}
 	j.at = &j.start
 	if s.pending != nil {
 		j.pending = s.pending
@@ -173,8 +194,34 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	j.pendingMoves = pendingMovesOf(s)
 	state := txn.beginBoundedApply()
 	state.journal = j
-	// After the journal, so its rollback refuses an apply whose callback panics.
+	// The document points at the journal's tally for the whole apply: the
+	// decoders count against it through the document, since they are shared
+	// with the merge and snapshot decoders, which have no apply
+	// (applyTally). endRemoteApply takes the pointer back.
+	d.applying = &j.tally
+	// The callbacks run after the journal, so its rollback refuses an apply
+	// whose callback panics, and their answers are read once, here, for the
+	// whole apply.
 	state.scanLimit = d.applyScanLimit(txn.Origin)
+	if d.applyBudget != nil {
+		j.tally.budget = d.callApplyBudget(txn.Origin)
+	}
+	if d.allowedRoots != nil {
+		j.tally.roots = d.callAllowedRoots(txn.Origin)
+		// The names the document holds are resolved to their types once,
+		// here, so each item the apply integrates or deletes is checked by
+		// walking up to its root and looking it up (checkItemRoot). A name
+		// the document does not hold yet stays allowed by name: the apply
+		// may be what creates it (decodeItem's refuseRootOnBoundedDoc).
+		if len(j.tally.roots) > 0 {
+			j.tally.allowedTypes = make(map[*abstractType]bool, len(j.tally.roots))
+			for _, name := range j.tally.roots {
+				if shared, held := d.share[name]; held {
+					j.tally.allowedTypes[shared.baseType()] = true
+				}
+			}
+		}
+	}
 }
 
 // pendingMovesAt is the store's pending moves as a point of an apply found
@@ -287,9 +334,15 @@ func refuseRemoteApply(txn *Transaction, err error) error {
 }
 
 // endRemoteApply ends txn's journal and returns the apply's error err. When a
-// bounded document's apply failed it rolls the whole apply back and returns err
-// as a RefusedUpdateError carrying the items the apply's scans passed, which no
-// observer reports for a rolled-back transaction (buildPhase2).
+// bounded document's apply failed it rolls the whole apply back and returns
+// err as a RefusedUpdateError carrying what the apply's scans passed and what
+// it decoded and added, which no observer reports for a rolled-back
+// transaction (buildPhase2).
+//
+// It raises no refusal of its own. The struct and byte budget is read where
+// the apply's struct phase ends (refuseOverBudget), before the delete set
+// and before the drain, because a rollback after either cannot give back
+// what that step changed.
 func endRemoteApply(txn *Transaction, err error) error {
 	state := txn.boundedApply
 	if state == nil {
@@ -297,11 +350,25 @@ func endRemoteApply(txn *Transaction, err error) error {
 	}
 	j := state.journal
 	state.journal = nil
-	if j == nil || err == nil {
+	// The apply's counting ends here, before the commit that follows it
+	// merges the split halves and before the next transaction begins.
+	txn.doc.applying = nil
+	if j == nil {
+		return err
+	}
+	if err == nil {
 		return err
 	}
 	j.rollBack(txn)
-	return &RefusedUpdateError{Err: err, Scanned: txn.scanned}
+	return &RefusedUpdateError{
+		Err:     err,
+		Scanned: txn.scanned,
+		Decoded: j.tally.decoded,
+		Structs: j.tally.structs,
+		Bytes:   j.tally.bytes,
+		Split:   j.tally.split,
+		Root:    j.tally.root,
+	}
 }
 
 // drainParked runs drain, the apply's drain of the pending queue and pending
@@ -461,11 +528,19 @@ func (j *applyJournal) keepParked(item *Item) {
 	j.parkedAs[item] = as
 }
 
+// inDrain is whether the apply is running its drain of the pending queue, the
+// phase whose structs are not the update's: they are what earlier updates
+// parked, and a drain that fails is taken back on its own while the update
+// stands (drainParked). A nil journal is no apply at all and no drain.
+func (j *applyJournal) inDrain() bool {
+	return j != nil && j.drain != nil && j.at == j.drain
+}
+
 // drained is whether item is a struct the running drain added to the store: a
 // parked item it integrated, or a part split from one. A struct the store held
 // before the drain keeps a split the drain made (see the top of this file).
 func (j *applyJournal) drained(item *Item) bool {
-	return j.drain != nil && j.at == j.drain && item.ID.Clock >= j.drain.sv.Clock(item.ID.Client)
+	return j.inDrain() && item.ID.Clock >= j.drain.sv.Clock(item.ID.Client)
 }
 
 // tookMapKey records that a new item is about to replace the value of key in
@@ -480,15 +555,42 @@ func (j *applyJournal) tookMapKey(parent *abstractType, key string) {
 	}
 }
 
+// tookFormatting records parent's formatting flags as they stand, the first
+// time since the current point that the apply changes them: a ContentFormat
+// it integrates (Item.integrate) or deletes (Item.delete) raises them, and
+// nothing lowers them again, so a refused formatting update would otherwise
+// leave a plain text on the formatting-aware path for the rest of the
+// document's life.
+func (j *applyJournal) tookFormatting(parent *abstractType) {
+	if j.at.fmtPrev == nil {
+		j.at.fmtPrev = make(map[*abstractType]fmtFlags)
+	}
+	if _, seen := j.at.fmtPrev[parent]; !seen {
+		j.at.fmtPrev[parent] = fmtFlags{parent.hasFormatting, parent.cleanFormatting, parent.fmtGen}
+	}
+}
+
+// noteFormatting records parent's formatting flags with txn's apply, where
+// the apply is about to change them (tookFormatting). It does nothing
+// outside an apply that can be rolled back.
+func noteFormatting(txn *Transaction, parent *abstractType) {
+	if j := txn.applyJournal(); j != nil {
+		j.tookFormatting(parent)
+	}
+}
+
 // rollBack leaves txn's document as it was when the journal began, and makes
 // the transaction commit as one that changed nothing. It runs under the
 // document lock, before the transaction commits.
 func (j *applyJournal) rollBack(txn *Transaction) {
 	if j.drain != nil {
-		// The drain's own map keys go back first, to what they were when the
-		// drain began, which is what the start's record then takes back further.
+		// The drain's own map keys and formatting flags go back first, to
+		// what they were when the drain began, which is what the start's
+		// record then takes back further.
 		j.restoreMapKeys(j.drain, map[*abstractType]struct{}{})
 		j.drain.mapPrev = nil
+		j.restoreFormatting(j.drain)
+		j.drain.fmtPrev = nil
 	}
 	j.rollBackTo(txn, &j.start)
 
@@ -582,6 +684,13 @@ func (j *applyJournal) rollBackTo(txn *Transaction, point *applyPoint) {
 					continue
 				}
 				x.Deleted = false
+				// A deleted item carrying a subdocument detached it
+				// (Item.delete); alive again, it holds it again, or the
+				// subdocument would stay attached to nothing while the
+				// document still shows it (Doc.reattachSubdoc).
+				if cd, ok := x.Content.(*ContentDoc); ok && cd.Doc != nil {
+					cd.Doc.reattachSubdoc(x, d)
+				}
 				if x.Parent != nil {
 					if x.Content.IsCountable() {
 						x.Parent.length += nativeContentLen(x.Content)
@@ -598,6 +707,8 @@ func (j *applyJournal) rollBackTo(txn *Transaction, point *applyPoint) {
 			delete(d.share, name)
 		}
 	}
+
+	j.restoreFormatting(point)
 
 	for parent := range touched {
 		parent.clearMarkers()
@@ -627,6 +738,14 @@ func (j *applyJournal) restoreMapKeys(point *applyPoint, touched map[*abstractTy
 			slot.parent.itemMap[slot.key] = prev
 		}
 		touched[slot.parent] = struct{}{}
+	}
+}
+
+// restoreFormatting gives each type whose formatting flags the apply raised
+// since point the flags it had there (tookFormatting).
+func (j *applyJournal) restoreFormatting(point *applyPoint) {
+	for t, as := range point.fmtPrev {
+		t.hasFormatting, t.cleanFormatting, t.fmtGen = as.has, as.clean, as.gen
 	}
 }
 
@@ -678,4 +797,431 @@ func refuseOnBoundedDoc(doc *Doc, content Content) error {
 		return errUnboundableContent
 	}
 	return nil
+}
+
+// ErrApplyBudget is why a document with an apply budget (WithApplyBudget)
+// refuses a remote update that decodes or integrates more than the apply's
+// budget allows. It wraps ErrInvalidUpdate, and the apply returns it inside a
+// RefusedUpdateError reporting what the refused apply reached: like every
+// remote update a bounded document refuses, the update leaves the document as
+// it was.
+var ErrApplyBudget = fmt.Errorf("%w: it decodes or adds more than the document allows", ErrInvalidUpdate)
+
+// ErrRootNotAllowed is why a document with an allowed-roots list
+// (WithAllowedRoots) refuses a remote update naming a root outside it. It
+// wraps ErrInvalidUpdate, and the apply returns it inside a
+// RefusedUpdateError whose Root is the name the update named.
+var ErrRootNotAllowed = fmt.Errorf("%w: it names a root the document does not allow", ErrInvalidUpdate)
+
+// applyTally is what one remote apply has decoded and added, and the
+// allowance it may do so within: the budget WithApplyBudget answered for the
+// apply's origin and the roots WithAllowedRoots allowed it, both read once as
+// the apply began (beginRemoteApply).
+//
+// The counts are what RefusedUpdateError reports for a refused apply, since
+// no observer reports a rolled-back transaction, and a document with any
+// bound keeps them whether or not a budget bounds them: the counting is an
+// add and a compare where the apply was already decoding or linking a struct.
+//
+// Every method tolerates a nil receiver, which is an apply with no tally -
+// one on a document with no bound, or a decode with no apply at all, such as
+// the merge decoders' - so that the decoders count without a guard around
+// each value.
+type applyTally struct {
+	// budget is what the apply may decode and add, noApplyBudget when the
+	// document has no budget callback: a field of the budget below zero is no
+	// limit, and zero allows nothing (WithApplyBudget).
+	budget ApplyBudget
+	// roots is what the update may name, or nil or empty for every root.
+	// allowedTypes are those of roots the document holds, resolved as the
+	// apply began, and the ones it names during the apply that the list
+	// allows; rootOf memoises the root above each type an item is parented
+	// to, and one walk fills it for every type the walk passed
+	// (checkItemRoot).
+	roots        []string
+	allowedTypes map[*abstractType]bool
+	rootOf       map[*abstractType]*abstractType
+	// decoded, structs, bytes and split are the counts of WithApplyBudget;
+	// root is the root a refused apply reached that roots does not allow,
+	// empty when the refused item hangs under no root of the document.
+	decoded, structs, bytes, split int
+	root                           string
+}
+
+// noApplyBudget is the budget of an apply on a document with no budget
+// callback: no limit in any measure, so the counts are kept and reported and
+// nothing is refused for them (WithApplyBudget).
+var noApplyBudget = ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1}
+
+// tally is the running tally of the remote apply on d, or nil when no apply
+// is running on it, when d bounds nothing, or when d itself is nil, which a
+// decode outside an apply passes (decodeContent).
+func (d *Doc) tally() *applyTally {
+	if d == nil {
+		return nil
+	}
+	return d.applying
+}
+
+// decode counts n values the apply decoded, and refuses it once they pass the
+// budget, by the panic the apply recovers as ErrApplyBudget
+// (recoveredApplyErr), since the count is checked inside the decode loop,
+// where the allocation it bounds happens: a check after the decode would run
+// once the memory was already taken.
+func (t *applyTally) decode(n int) {
+	if t == nil {
+		return
+	}
+	t.decoded += n
+	if t.budget.Decoded >= 0 && t.decoded > t.budget.Decoded {
+		panic(applyBudgetExceeded{})
+	}
+}
+
+// value counts v, one decoded lib0 Any or JSON value, and everything inside
+// it: the value itself, each element of an array and each entry of a map, at
+// any depth, so a frame whose values nest deeply is counted by what it holds
+// rather than by the one value it holds it in. The recursion is bounded by
+// the depth the decoders accept (anycodec.MaxDepth).
+//
+// It walks a value the decode has already built, so it is used only where
+// the declared length that sized that value was charged first
+// (decodeContent); a lib0 Any is counted off the frame instead, before
+// anything is allocated for it (countAnyRun).
+func (t *applyTally) value(v any) {
+	if t == nil {
+		return
+	}
+	t.decode(1)
+	t.nested(v)
+}
+
+// nested counts what v holds and not v itself, for a value whose own slot was
+// charged with the declared length of the list it arrived in.
+func (t *applyTally) nested(v any) {
+	switch v := v.(type) {
+	case []any:
+		for _, e := range v {
+			t.value(e)
+		}
+	case map[string]any:
+		for _, e := range v {
+			t.value(e)
+		}
+	}
+}
+
+// nestedAll counts what each of vals holds, the values of one content whose
+// own slots the declared length already charged.
+func (t *applyTally) nestedAll(vals []any) {
+	if t == nil {
+		return
+	}
+	for _, v := range vals {
+		t.nested(v)
+	}
+}
+
+// integrated counts item, a struct of the update the apply has just added to
+// the store, with the bytes of content it carries.
+func (t *applyTally) integrated(item *Item) {
+	if t == nil {
+		return
+	}
+	t.structs++
+	t.bytes += contentBytes(item.Content)
+}
+
+// integratedErr is ErrApplyBudget when the apply integrated more structs or
+// more bytes than its budget allows, and nil otherwise.
+func (t *applyTally) integratedErr() error {
+	if t == nil {
+		return nil
+	}
+	if t.budget.Structs >= 0 && t.structs > t.budget.Structs {
+		return ErrApplyBudget
+	}
+	if t.budget.Bytes >= 0 && t.bytes > t.budget.Bytes {
+		return ErrApplyBudget
+	}
+	return nil
+}
+
+// refuseOverBudget is ErrApplyBudget when txn's apply has integrated more
+// structs or more bytes than its budget allows, and nil otherwise. The
+// applies call it where their struct phase ends, before the delete set is
+// decoded and before the pending queue drains (applyV1Txn, applyV2Txn).
+//
+// The counts are final there: the delete set integrates no struct of its
+// own, and the structs it makes by splitting items the document already held
+// are reported as Split, which no budget bounds. Reading the budget there
+// and nowhere later is what keeps two whole classes of damage out of a
+// refusal. A refusal after the delete set had run would have to give back a
+// subdocument the delete detached from its parent, and a refusal after the
+// drain cannot give back what the drain changed in the parked items it
+// integrated - a parked "BC" it trimmed to "C" stays trimmed - so this node
+// would keep a document every peer disagrees with. Neither is reachable
+// through ErrApplyBudget when the budget is read before both
+// (TestUnit_ApplyBudget_ARefusalAfterTheDrainKeepsWhatTheDocumentHeld).
+func refuseOverBudget(txn *Transaction) error {
+	j := txn.applyJournal()
+	if j == nil {
+		return nil
+	}
+	return j.tally.integratedErr()
+}
+
+// noteIntegrated records item with txn's apply, where the apply adds a struct
+// of its update to the store (Item.integrate, integrateGroup, appendTrimmed):
+// it refuses the apply when the item lands under a root the document's
+// allowed-roots list does not name (checkItemRoot), and counts the struct and
+// its bytes against the budget.
+//
+// A struct the drain of the pending queue adds is not the update's and is not
+// counted: refusing the update for what an earlier update parked would let
+// one sender have every later update that fills its gap refused
+// (drainParked). The root check does run for it, since what the list keeps
+// out of a root must stay out of it however it arrives; a drain the check
+// refuses is taken back on its own and its items stay parked.
+func noteIntegrated(txn *Transaction, item *Item) {
+	t := txn.doc.tally()
+	if t == nil {
+		return
+	}
+	t.checkItemRoot(txn.doc, item.Parent)
+	if !txn.applyJournal().inDrain() {
+		t.integrated(item)
+	}
+}
+
+// noteDeleted refuses txn's apply when it deletes an item under a root the
+// document's allowed-roots list does not name (Item.delete). Deleting is not
+// counted against the budget - it adds nothing to the document but the splits
+// the range's edges make, which countSplit reports - and it is bounded by the
+// delete ranges the apply decoded (countDecodedRanges).
+func noteDeleted(txn *Transaction, item *Item) {
+	if t := txn.doc.tally(); t != nil {
+		t.checkItemRoot(txn.doc, item.Parent)
+	}
+}
+
+// checkItemRoot refuses the apply, by the panic it recovers as
+// ErrRootNotAllowed (recoveredApplyErr), when parent - the type an item the
+// apply integrates or deletes hangs under - is under a root the apply's list
+// does not name.
+//
+// The list is a containment rule over the whole update, not a rule about the
+// names the update writes on the wire: an item written beside items the
+// document already holds carries an origin and names no root at all, and a
+// delete range names nothing either, so a check only where the decode
+// resolves a name (refuseRootOnBoundedDoc) would let a sender overwrite and
+// delete inside a root it may not touch. That check stays: it refuses earlier
+// and names the root exactly.
+//
+// The walk up the parents is memoised per type, and one walk answers a whole
+// chain: it climbs only to the first ancestor the apply has already answered
+// and records the root it reached for every type it passed, so an update of
+// n items nested n deep costs one walk rather than one for each item. A type
+// whose parents do not reach a root the document holds - the content of a
+// container the GC collected, say - is refused too: the owner cannot have
+// allowed what is under no root of theirs.
+func (t *applyTally) checkItemRoot(d *Doc, parent *abstractType) {
+	// A GC struct hangs under no type at all: it is a placeholder for clocks
+	// whose content is gone, and it adds nothing to any root.
+	if len(t.roots) == 0 || parent == nil {
+		return
+	}
+	root, known := t.rootOf[parent]
+	if !known {
+		var chain []*abstractType
+		root = parent
+		for {
+			if above, seen := t.rootOf[root]; seen {
+				root = above
+				break
+			}
+			chain = append(chain, root)
+			if root.item == nil || root.item.Parent == nil {
+				break
+			}
+			root = root.item.Parent
+		}
+		if t.rootOf == nil {
+			t.rootOf = make(map[*abstractType]*abstractType, len(chain))
+		}
+		for _, passed := range chain {
+			t.rootOf[passed] = root
+		}
+	}
+	if t.allowedTypes[root] {
+		return
+	}
+	name, isRoot := rootName(d, root)
+	if root.item == nil && isRoot && slices.Contains(t.roots, name) {
+		// A root the document did not hold when the apply began, which this
+		// apply named and the name check let through.
+		t.allowedTypes[root] = true
+		return
+	}
+	t.root = name
+	panic(rootNotAllowed{})
+}
+
+// rootName is the name d holds root under, and false for a type that is no
+// root of d. A root carries its own name once it has been named, and the
+// reverse lookup covers one that has not; the empty name is a name like any
+// other, which is why the lookup says whether it found one rather than
+// answering "" for both. It runs only where an apply is refused or a root the
+// apply itself named is reached.
+func rootName(d *Doc, root *abstractType) (string, bool) {
+	if root.name != "" {
+		return root.name, true
+	}
+	for name, shared := range d.share {
+		if shared.baseType() == root {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// countSplit counts the struct a split added, where the apply splits an item
+// (splitItem). A split is reported and never bounded (WithApplyBudget), and
+// like an integrated struct it is counted only outside the drain.
+func countSplit(txn *Transaction) {
+	if t := txn.doc.tally(); t != nil && !txn.applyJournal().inDrain() {
+		t.split++
+	}
+}
+
+// countDecodedRanges counts n, the delete ranges the apply read, each a value
+// it decoded, and so refuses an update that carries more of them than its
+// budget allows before one of them deletes or splits anything.
+//
+// n is the ranges the decode read off the frame, not the ranges the set it
+// returned holds: the decode sorts each client's ranges and merges the ones
+// that touch, so a frame of a hundred thousand ranges that compact to one
+// would otherwise be counted as one. The decode counts them in its first
+// pass, before it allocates a list for any of them (decodeDeleteSet).
+//
+// What the count bounds is the work the ranges make the document do: each
+// range can split a struct the document holds, and a split adds a struct the
+// Structs budget does not count.
+func countDecodedRanges(txn *Transaction, n int) {
+	txn.doc.tally().decode(n)
+}
+
+// refuseRootOnBoundedDoc is ErrRootNotAllowed for name, a root type a remote
+// apply's decode is about to resolve on doc, when doc's allowed roots do not
+// list it and doc does not hold it already; nil otherwise, which includes
+// every decode outside an apply and every apply whose list is empty
+// (WithAllowedRoots). It records the name, so the refusal reports which root
+// the update named (RefusedUpdateError.Root).
+//
+// A root doc already holds is left to the containment rule (checkItemRoot),
+// which refuses the update at the first item it integrates or deletes under
+// that root. The division is what the two checks are each for: this one says
+// a sender may not create a root the owner did not allow, and containment
+// says a sender may not add to or delete under one. Between them every
+// forged write is still refused, while an update that names a held root and
+// writes nothing under it is not: a peer handing back the whole state of a
+// document names every root the document holds, since the decode resolves
+// each struct's root as it reads it, before the integrate discovers the
+// struct is one the document already has and skips it.
+func refuseRootOnBoundedDoc(doc *Doc, name string) error {
+	t := doc.tally()
+	if t == nil || len(t.roots) == 0 || slices.Contains(t.roots, name) {
+		return nil
+	}
+	if _, held := doc.share[name]; held {
+		return nil
+	}
+	t.root = name
+	return ErrRootNotAllowed
+}
+
+// anyScalarBytes is what a decoded lib0 Any scalar - a number, a boolean,
+// null, or the slot an element of an array or an entry of a map takes - is
+// counted as: the two words of an interface value, which is what it costs the
+// document to hold it.
+const anyScalarBytes = 16
+
+// contentBytes is the bytes of content a struct carries: its text, its binary
+// and the values it decoded, not the item around them, whose cost the Structs
+// count bounds. A deleted range carries none (it is a length). A type carries
+// only the name an XML element or hook keeps - it is otherwise an empty
+// container the structs under it fill, each counted as it integrates - and
+// that name is as long as its sender made it. A subdocument and a move carry
+// none either: a bounded document takes neither from a remote update
+// (refuseOnBoundedDoc).
+func contentBytes(c Content) int {
+	switch c := c.(type) {
+	case *ContentString:
+		return len(c.Str)
+	case *ContentBinary:
+		return len(c.Data)
+	case *ContentAny:
+		return valsBytes(c.Vals)
+	case *ContentJSON:
+		return valsBytes(c.Vals)
+	case *ContentEmbed:
+		return anyBytes(c.Val)
+	case *ContentFormat:
+		return len(c.Key) + anyBytes(c.Val)
+	case *ContentType:
+		return typeNameBytes(c.Type)
+	}
+	return 0
+}
+
+// typeNameBytes is the bytes of the name a type carries of its own: the node
+// name of an XML element and the name of an XML hook, both of them written on
+// the wire by their sender and kept by the document for as long as it holds
+// the type. Every other type carries no name.
+func typeNameBytes(t *abstractType) int {
+	if t == nil {
+		return 0
+	}
+	switch owner := t.owner.(type) {
+	case *YXmlElement:
+		return len(owner.NodeName)
+	case *yxmlHook:
+		return len(owner.hookName)
+	}
+	return 0
+}
+
+// valsBytes is the bytes of the values one content holds.
+func valsBytes(vals []any) int {
+	n := 0
+	for _, v := range vals {
+		n += anyBytes(v)
+	}
+	return n
+}
+
+// anyBytes is the bytes a decoded value holds: text and binary as they are, a
+// scalar as the words it takes, and a container as the sum of its parts with
+// a slot for each. It measures what the value costs the document to hold, not
+// what it took on the wire, which the frame's own length bounds.
+func anyBytes(v any) int {
+	switch v := v.(type) {
+	case string:
+		return len(v)
+	case []byte:
+		return len(v)
+	case []any:
+		n := 0
+		for _, e := range v {
+			n += anyScalarBytes + anyBytes(e)
+		}
+		return n
+	case map[string]any:
+		n := 0
+		for k, e := range v {
+			n += anyScalarBytes + len(k) + anyBytes(e)
+		}
+		return n
+	}
+	return anyScalarBytes
 }

@@ -71,6 +71,17 @@ func (t *rangeTally) merge() {
 	t.clients = merged
 }
 
+// total is how many ranges the pass counted, over every client: the ranges
+// the frame carried, before the sort and merge that follow drop the ones
+// that touch or repeat (countDecodedRanges).
+func (t *rangeTally) total() int {
+	n := 0
+	for _, c := range t.clients {
+		n += c.ranges
+	}
+	return n
+}
+
 // deleteSet returns an ordered set with room for the tally's clients.
 func (t *rangeTally) deleteSet() DeleteSet {
 	return DeleteSet{clients: make(map[ClientID][]DeleteRange, len(t.clients)), order: make([]ClientID, 0, len(t.clients))}
@@ -353,11 +364,11 @@ func checkParkedDeletes(doc *Doc, b *pendingBudget) error {
 	if n, err := parkingRangesBound(b.deleteSetScanner(), b.initial); err != nil || n <= b.deleteRoom {
 		return nil
 	}
-	ds, err := deleteSetOf(b)
+	ds, ranges, err := deleteSetOf(b)
 	if err != nil {
 		return nil
 	}
-	b.deleteSet, b.deleteSetRead = ds, true
+	b.deleteSet, b.deleteSetRead, b.deleteSetRanges = ds, true, ranges
 	clocks, err := structClocksOf(b)
 	if err != nil {
 		return wrapUpdateErr(err)
@@ -366,7 +377,7 @@ func checkParkedDeletes(doc *Doc, b *pendingBudget) error {
 	if after <= limit || after <= before {
 		return nil
 	}
-	return ErrInvalidUpdate
+	return ErrPendingCap
 }
 
 // readStructs reads the update's structs once for the delete-set check, as a
@@ -401,10 +412,10 @@ func (b *pendingBudget) readsDeleteSet() bool {
 }
 
 // deleteSetOf reads the delete set of b's V1 or V2 update, where the walk of
-// its structs found it.
-func deleteSetOf(b *pendingBudget) (DeleteSet, error) {
+// its structs found it, with the ranges it read off the frame.
+func deleteSetOf(b *pendingBudget) (DeleteSet, int, error) {
 	if err := b.walkGroups(); err != nil {
-		return DeleteSet{}, err
+		return DeleteSet{}, 0, err
 	}
 	s := b.deleteSetScanner()
 	if b.v2 {

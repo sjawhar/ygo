@@ -90,7 +90,7 @@ func decodeStructsV2(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteS
 		}
 		out[client] = structs
 	}
-	ds, err := decodeDeleteSetV2(dec)
+	ds, _, err := decodeDeleteSetV2(dec)
 	if err != nil {
 		return nil, DeleteSet{}, wrapUpdateErr(err)
 	}
