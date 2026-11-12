@@ -116,7 +116,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   most `maxBytes` long, except one carrying a single struct a V1 update cannot
   cut (content occupying one clock) and the last, which carries the structs
   the sender itself holds parked. A text item longer than `maxBytes` is cut at
-  a character boundary, never inside one.
+  a character boundary, never inside one. The walk keeps a heap of the
+  structs waiting on each dependency and wakes each into the pass that
+  places it, so a document whose structs chain across clients - the item of
+  client N+1 naming the item of client N as its left origin, which a client
+  can build on purpose - costs work linear in its structs: 40,000 chained
+  clients take about 0.29 s, where a walk that repeats a pass over every
+  client until one places nothing took about 100 s of processor time.
 - **`sync.EncodeSyncStep2Split(doc, step1msg, maxBytes)`** answers a step-1
   message with that series as sync messages, each at most `maxBytes` long:
   Update messages (type 2) and then one SyncStep2 (type 1), last. A receiver
