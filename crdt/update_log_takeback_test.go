@@ -65,7 +65,7 @@ func requireCovers(t *testing.T, update, covering []byte) {
 // gave back, which the room integrates at its next apply that brings a client
 // the queue waits on.
 func TestUnit_UpdateLog_ATakenBackDrainLogsEveryByteTheApplyKept(t *testing.T) {
-	const l = 2_000
+	l := listLen(2_000)
 	parked := [][]byte{
 		itemAfter(99, 1, ID{Client: 5, Clock: 0}, "abc"), // behind client 99's clock 0
 		itemAfter(98, 0, ID{Client: 99, Clock: 2}, "r"),  // the middle of client 99's item

@@ -624,8 +624,8 @@ func TestUnit_ApplyBudget_ADocumentWithOnlyABudgetRollsARefusedApplyBack(t *test
 // structs it had integrated by then, and a document with no bound at all keeps
 // no tally and refuses nothing.
 func TestUnit_ApplyBudget_AScanRefusalReportsWhatTheApplyDecoded(t *testing.T) {
-	const l, n = 2_000, 20
-	doc := chainedList(t, l)
+	const n = 20
+	doc := chainedList(t, listLen(2_000))
 	doc.SetIntegrateScanBudget(func(any) int { return 1 })
 	before := stateOf(doc)
 	update := originAtTheStart(n)
@@ -1031,9 +1031,14 @@ func nestedTypeChain(root string, n int) []byte {
 // update below: 146.3 ms with no list and 272.4 ms under one, a factor of
 // 1.9. The test allows a factor of 5 and 200 ms on top of it, loose enough
 // not to flake on a loaded machine and far under what the repeated walk
-// takes.
+// takes. Under the race detector the chain is a quarter as long: the repeated
+// walk, quadratic in it, would still take far longer than the bound.
 func TestUnit_AllowedRoots_AChainOfNestedTypesIsWalkedOnce(t *testing.T) {
-	const base, nested = "hello world", 32_768
+	const base = "hello world"
+	nested := 32_768
+	if raceEnabled {
+		nested = 8_192
+	}
 	update := nestedTypeChain("deep", nested)
 
 	open := budgetDoc(t, base)

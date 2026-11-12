@@ -322,6 +322,7 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 			s.pending = &pendingUpdate{missing: make(StateVector), tailClient: item.ID.Client, tailValid: true}
 		}
 		s.pending.items = append(s.pending.items, item)
+		s.pending.bytes += contentBytes(item.Content)
 		s.pending.noteTail(item)
 		// parkedMissing copies the map the journal of a bounded document's
 		// apply keeps, so an update the document refuses leaves the clocks its

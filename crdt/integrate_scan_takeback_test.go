@@ -35,7 +35,7 @@ func itemAfter(client ClientID, clock uint64, origin ID, s string) []byte {
 // the document's state then equals the twin's. This is one behaviour under a
 // budget (WithIntegrateScanBudget) and under a bound.
 func TestUnit_IntegrateScan_TakenBackDrainParksTheQueueAgainAsItFoundIt(t *testing.T) {
-	const l = 2_000
+	l := listLen(2_000)
 	parked := [][]byte{
 		itemAfter(99, 1, ID{Client: 5, Clock: 0}, "abc"), // behind client 99's clock 0
 		itemAfter(98, 0, ID{Client: 99, Clock: 2}, "r"),  // the middle of client 99's item
@@ -162,8 +162,8 @@ func TestUnit_IntegrateScan_TakenBackDrainParksTheQueueAgainAsItFoundIt(t *testi
 // reports nothing landed: a caller that relays what a failed apply integrated
 // relays nothing, and the document is as it was.
 func TestUnit_IntegrateScan_RefusedUpdateLandsNothing(t *testing.T) {
-	const l, n = 5_000, 500
-	doc := chainedList(t, l, WithMaxIntegrateScan(testScanBound))
+	bound, l, n := pastTheBound()
+	doc := chainedList(t, l, WithMaxIntegrateScan(bound))
 	before, text := EncodeStateAsUpdateV1(doc, nil), doc.GetText("t").ToString()
 
 	// A deletion of items the document holds rides with the refused insert,
@@ -193,7 +193,7 @@ func TestUnit_IntegrateScan_RefusedUpdateLandsNothing(t *testing.T) {
 // update whose own scans and whose drain each fit the bound applies with its
 // parked item, though the two together pass the bound.
 func TestUnit_IntegrateScan_DrainStartsAFreshAllowance(t *testing.T) {
-	const l = 2_000
+	l := listLen(2_000)
 	first := ID{Client: 5, Clock: 0}
 	fill := itemAfter(99, 0, first, "f")   // client 99's clock 0, scanning the list
 	parked := itemAfter(99, 1, first, "p") // behind it, scanning the list again

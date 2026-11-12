@@ -1053,6 +1053,12 @@ func (txt *YText) ToDelta() []Delta {
 		doc.mu.RLock()
 		defer doc.mu.RUnlock()
 	}
+	return txt.toDeltaLocked()
+}
+
+// toDeltaLocked is the lock-free body of ToDelta; callers must already hold
+// the doc lock.
+func (txt *YText) toDeltaLocked() []Delta {
 	var deltas []Delta
 	currentAttrs := make(Attributes)
 

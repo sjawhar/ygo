@@ -266,6 +266,12 @@ func (m *YMap) Get(key string) (any, bool) {
 		doc.mu.RLock()
 		defer doc.mu.RUnlock()
 	}
+	return m.getLocked(key)
+}
+
+// getLocked is the lock-free body of Get; callers must already hold the doc
+// lock.
+func (m *YMap) getLocked(key string) (any, bool) {
 	if m.detached() {
 		v, ok := m.prelim[key]
 		if !ok {
