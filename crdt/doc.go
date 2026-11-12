@@ -389,8 +389,8 @@ func (d *Doc) SetApplyBudget(budget func(origin any) ApplyBudget) {
 
 // ApplyReport is what one remote apply that committed left the document at:
 // the totals the document stands at once the apply has committed, and the
-// apply's own deltas, which are the four counts ApplyBudget bounds
-// (WithApplyReport).
+// apply's own deltas: the four counts ApplyBudget bounds, and the bytes the
+// apply added to the document's encoded state (WithApplyReport).
 type ApplyReport struct {
 	// Structs is the structs the document holds now, those parked in the
 	// pending queue included: a total of what is there, not a sum of what
@@ -425,6 +425,99 @@ type ApplyReport struct {
 	// Decoded is the values this apply decoded, the count
 	// ApplyBudget.Decoded bounds.
 	Decoded int
+	// StateBytes is the bytes this apply's transaction added to the
+	// document's encoded state, as EncodeStateAsUpdateV1(doc, nil) measures
+	// it, so an owner that encodes a room once and from then on adds each
+	// apply's StateBytes holds the state's length, or more, without encoding
+	// again (the contract is below).
+	// Bytes is not that number: it is the content the budget charges, and a
+	// GC struct or a split half adds state with no content. Nor are the bytes
+	// an update logs, which fell short of the state where an owner summed
+	// them: 24 frames of 900 KiB, each parked behind a gap of its own client,
+	// fired no update and logged nothing while the encoded state reached
+	// 22,119,318 bytes, and a 100,000-character run with every other
+	// character deleted logged 291,366 bytes against an encoded state of
+	// 1,019,797, each delete's splits adding item headers no update carries.
+	// Measured on rooms of those shapes, the 24 frames report 22,118,664 and
+	// the deletes 725,230, each the encode's growth to the byte.
+	//
+	// It is a signed delta, below zero for an apply that leaves the state
+	// smaller: a delete's content is written as its length once the commit
+	// collects it, the commit merges split halves back, and a struct the
+	// drain drops leaves the queue. A total that could only grow would hold
+	// every deleted byte against the room for good, and refuse one that
+	// deletes as much as it writes long before its state reached the cap.
+	//
+	// It is counted where the apply makes each change, not by encoding the
+	// document, which costs 53.0 ms on a 494,309-struct room: each struct
+	// at its encoded length where it integrates or parks, with the skip and
+	// section header it adds; each split at the header and length prefix the
+	// new half adds; the delete set at the ranges it gains; the commit's
+	// merges and collection at what they take out; and a drain that lands
+	// parked structs at what landing changes, what they held parked having
+	// been counted where they parked (state_bytes.go). Measured on the test
+	// pod, a keystroke on that room applies in 4.3 µs with a report against
+	// 2.2 µs without, and in 4.0 µs with 100,000 structs parked: the first
+	// apply to find a queue reads what it holds once, 2.6 ms for those
+	// 100,000, and keeps that reading up as parks change the queue.
+	//
+	// The contract is cumulative, not per apply. A total that starts from an
+	// encode taken while nothing is pending - no struct parked and no delete
+	// parked (Doc.PendingStats) - and adds each report's StateBytes after it
+	// is the length of the state's direct form, and is never below the
+	// state in either form EncodeStateAsUpdateV1 writes: the direct encode
+	// while nothing is pending, and otherwise a merge of it with the parked
+	// parts (withParked), which writes one class of value shorter. An
+	// integer outside int32 that a float32 holds exactly, such as 2^40, in
+	// a ContentAny value or a subdocument's meta, is a float64 of nine bytes
+	// in the direct form and a float32 of five in the merged form, so the
+	// total runs four bytes a value above the state while anything is
+	// pending and meets it again when nothing is: 728 bytes above, for 182
+	// such values, at most across 1,800 applies of parks, fills and
+	// overwrites (TestUnit_ApplyReport_StateBytesTotalStaysAtOrAboveTheStateInBothForms).
+	// No one apply's report equals its own growth in both forms, and it need
+	// not: a park counts the values it parks at nine bytes, which the state
+	// writes in five, and the fill that empties the queue counts nothing for
+	// the four a value the state then regains. So an owner takes its base
+	// from an encode taken while nothing is pending, and holds an encode
+	// taken while anything is as a lower bound of the base.
+	//
+	// Where the report cannot know a part of the state it takes the most the
+	// part can add, never less, which puts the total above the state's
+	// direct form by a bounded figure in three shapes:
+	//   - a delete range added to a client holding more than 254 structs, whose
+	//     ranges the document does not count: a byte over where the varuint
+	//     counting them does not grow, as at the 1,001st range, which reports
+	//     14 against 13 (two where more than 127 ranges join a client of more
+	//     than 32,766 structs), and a byte where a client's first range joins
+	//     a delete set that could hold more than 127 clients;
+	//   - a struct appended, split or merged at clocks a parked struct also
+	//     holds, as where an update re-sends what the room holds parked:
+	//     2 x (the varuint of its client + the varuint of the clock it ends
+	//     at) a struct, 16 bytes for client 2^40 below clock 16,384, and the
+	//     parked copy's length until it leaves the queue. Across 12,000
+	//     applies of the re-sent states of
+	//     TestUnit_ApplyReport_StateBytesNeverFallsShortOfRedeliveredState,
+	//     run at 300 seeds, the most was one apply 730 bytes over its growth;
+	//   - a section of a client the queue holds structs of where what it
+	//     holds is not known exactly (after a refused apply took parks back
+	//     out, or in a drain that dropped a struct of the client): the skip,
+	//     start clock and section header a park can add, and a byte where a
+	//     varuint boundary falls within what the section's count can be.
+	// state_bytes.go names each where it is counted.
+	//
+	// It covers its own apply's transaction alone. On a document whose text
+	// root has been read with GetText - a raw root never runs it - a remote
+	// apply that leaves format markers redundant is followed by the format
+	// cleanup (WithFormatCleanup), a local transaction that commits after
+	// the report and emits its own update, and no report covers it. Measured
+	// with GC off: A deletes "abc" while B bolds its last character, and the
+	// apply that brings A's delete to a room holding B's format reports 9
+	// while the state grows by 18, the cleanup's delete of the redundant
+	// marker adding a delete-set entry of 9 bytes for B's client of
+	// 2^40 + 1. With GC on the same case reports 6 and the state grows by 6.
+	// An owner bounding state counts those commits too.
+	StateBytes int
 }
 
 // WithApplyReport reports what each remote update that commits left the
@@ -442,29 +535,30 @@ type ApplyReport struct {
 // what parked, what a drain landed, what a delete split, what the commit
 // merged back. Each of those is known here, where the apply ends.
 //
-// Structs is a total and Bytes a delta, and what separates them is what
-// each costs to produce. The struct total is two counters, the store's
-// structs and the pending queue's, which cost 13.4 µs to read together on
-// the rooms measured below: payable on every apply. There is no counter of
-// the bytes a document holds, and the only answer is a whole-state encode,
-// measured on the test pod at 2.96 ms for a mebibyte of prose held in 10
-// structs, 53.0 ms for a 7,792,586-byte state of 494,309 structs and 52.8
-// ms at 600,000 structs, against the 128 ms a browser's keystroke is
-// answered in at the median. An encode per apply would spend two fifths of
-// that answer on the measurement alone, so Bytes is this apply's own, taken
-// off the count the budget already keeps as the apply integrates, and an
-// owner that wants a byte total sums these deltas and encodes when it
-// chooses to.
+// Structs is a total and Bytes and StateBytes deltas, and what separates
+// them is what each costs to produce. The struct total is two counters, the
+// store's structs and the pending queue's, which cost 13.4 µs to read
+// together on the rooms measured below: payable on every apply. There is no
+// counter of the bytes a document holds, and the only answer is a
+// whole-state encode, measured on the test pod at 2.96 ms for a mebibyte of
+// prose held in 10 structs, 53.0 ms for a 7,792,586-byte state of 494,309
+// structs and 52.8 ms at 600,000 structs, against the 128 ms a browser's
+// keystroke is answered in at the median. An encode per apply would spend
+// two fifths of that answer on the measurement alone, so the byte counts are
+// this apply's own: Bytes taken off the count the budget already keeps as
+// the apply integrates, and StateBytes counted as the apply changes each
+// part of the encoded state, which an owner that wants the state's length
+// adds to one encode of its own and need not encode again.
 //
-// The deltas are exactly the counts of ApplyBudget, so this report and
-// RefusedUpdateError (endRemoteApply) carry the same four numbers by two
-// routes - for a refusal that reached the same point in the apply. A
+// The four other deltas are exactly the counts of ApplyBudget, so this
+// report and RefusedUpdateError (endRemoteApply) carry the same four numbers
+// by two routes - for a refusal that reached the same point in the apply. A
 // refusal earlier than that stopped counting earlier and carries what it
 // had counted by then, not what the whole update would have come to:
 // measured, an apply reporting Decoded 3 against the same update refused at
 // Decoded 1 by an allowance of one. An apply the document rolled back or
-// refused reports nothing at all - the document is as it was, and its tally
-// is in the error.
+// refused reports nothing at all - the document is as it was, its encoded
+// state included, and its tally is in the error.
 //
 // The totals are read once the commit's merges have run (squashRuns,
 // tryMergeWithLefts), so Structs is the count the next reader of the

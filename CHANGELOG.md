@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.11] — 2026-11-12
+
+Adds one field to the apply report. No wire format changes, and a document
+that sets no report callback behaves exactly as before.
+
+### Added
+
+- **`crdt.ApplyReport.StateBytes`** — the bytes the apply's transaction added
+  to the document's encoded state, as `EncodeStateAsUpdateV1(doc, nil)`
+  measures it, so an owner that encodes a room once and adds each report's
+  `StateBytes` keeps the state's length, or more, without encoding again. It
+  is a signed delta: below zero where a delete's content is collected, split
+  halves merge back, or a drain drops a parked struct. `Bytes` is not this
+  number (it is the content the budget charges), nor are the bytes an update
+  logs, which fell short of the state: 24 frames of 900 KiB parked behind gaps
+  logged nothing while the state reached 22,119,318 bytes, and a
+  100,000-character run with every other character deleted logged 291,366
+  bytes against a state of 1,019,797. On those shapes the report gives
+  22,118,664 and 725,230, each the encode's growth to the byte. It is counted
+  as the apply makes each change, not by encoding (53.0 ms on a 494,309-struct
+  room): a keystroke on that room applies in 4.3 µs with the report against
+  2.2 µs without, and in 4.0 µs with 100,000 structs parked.
+
+  The contract is cumulative. A total that starts from an encode taken while
+  nothing is pending (no struct and no delete parked) is the length of the
+  state's direct form, and never below the state in either form the encode
+  writes. While anything is pending the encode merges the parked parts in and
+  writes an integer outside int32 that a float32 holds exactly, such as 2^40,
+  in 5 bytes rather than 9, so the total runs 4 bytes a value above the state
+  then (728 bytes for 182 values, at most, in 1,800 applies of parks, fills
+  and overwrites) and meets it when nothing is pending. An owner takes its
+  base from an encode taken while nothing is pending; one taken while anything
+  is pending is a lower bound. Where the report cannot know a part of the
+  state it takes the most the part can add: a byte for a delete range added
+  to a client of more than 254 structs where the range count's varuint does
+  not grow, and 2 × (varuint client + varuint clock) for each struct appended,
+  split or merged at clocks a parked struct shares (730 bytes over on the
+  worst of 12,000 applies of re-sent states).
+
+  The report covers its own apply's transaction alone. On a document whose
+  text root was read with `GetText`, the format cleanup that may follow a
+  remote apply is a local transaction of its own, after the report: with GC
+  off, a delete of "abc" reaching a room that holds a concurrent bold of its
+  last character reports 9 while the state grows by 18, the cleanup's delete
+  adding a 9-byte delete-set entry. An owner bounding state counts those
+  commits too.
+
 ## [1.55.1-sami.10] — 2026-11-12
 
 Fork release on [1.55.1-sami.9](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.9),

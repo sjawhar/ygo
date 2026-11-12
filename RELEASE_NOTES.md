@@ -1,3 +1,85 @@
+## v1.55.1-sami.11
+
+This release adds one field to the apply report. There are no wire format
+changes, and a document that sets no report callback behaves exactly as
+before.
+
+### The bytes each apply adds to the encoded state
+
+`crdt.ApplyReport.StateBytes` is the bytes the apply's transaction added to
+the document's encoded state, as `EncodeStateAsUpdateV1(doc, nil)` measures
+it. An owner that encodes a room once and then adds each report's
+`StateBytes` holds the state's length or more, and can refuse an update that
+would take a room past a state cap without encoding the room again.
+
+`Bytes` does not answer this: it is the content the budget charges, and a GC
+struct or a split half adds state with no content. The bytes an update logs do
+not answer it either, and they fell short of the state exactly where an owner
+needed them: 24 frames of 900 KiB, each parked behind a gap of its own client,
+fired no update and logged nothing while the encoded state reached 22,119,318
+bytes; and a 100,000-character run with every other character deleted logged
+291,366 bytes against an encoded state of 1,019,797, because each delete's
+splits add item headers no update carries. On rooms of those shapes the report
+gives 22,118,664 and 725,230 bytes, each the encode's growth to the byte.
+
+It is a signed delta, below zero for an apply that leaves the state smaller: a
+delete's content is written as its length once the commit collects it, split
+halves merge back, and a parked struct a drain drops leaves the queue. A total
+that could only grow would hold every deleted byte against a room for good.
+
+It is counted as the apply makes each change rather than by encoding the
+document, which costs 53.0 milliseconds on a 494,309-struct room. On the test
+pod a keystroke on that room applies in 4.3 microseconds with the report
+against 2.2 without, and in 4.0 with 100,000 structs parked; the first apply to
+find a pending queue reads what it holds once, 2.6 milliseconds for those
+100,000 structs.
+
+The contract is cumulative, not per apply. A total that starts from an encode
+taken while nothing is pending, with no struct and no delete parked
+(`Doc.PendingStats`), and adds each report after it is the length of the
+state's direct form, and is never below the state in either form the encode
+writes. While anything is pending the encode merges the parked parts into the
+document's own encoding, and that merge writes one class of value shorter: an
+integer outside int32 that a float32 holds exactly, such as 2^40, is 9 bytes
+in the direct form and 5 in the merged one. So the total runs 4 bytes a value
+above the state while anything is pending and meets it again when nothing is;
+across 1,800 applies of parks, fills and overwrites of such values the
+largest margin was 728 bytes, for 182 values. An owner takes its base from an
+encode taken while nothing is pending, and holds an encode taken while
+anything is pending as a lower bound of the base.
+
+Where the report cannot know a part of the state it takes the most that part
+can add, never less:
+
+- a delete range added to a client holding more than 254 structs counts one
+  byte over where the varuint counting that client's ranges does not grow, as
+  at the 1,001st range, which reports 14 against 13;
+- a struct appended, split or merged at clocks a parked struct also holds, as
+  where an update re-sends what the room holds parked, counts 2 × (the varuint
+  of its client + the varuint of its clock) over, and the parked copy until it
+  leaves the queue: across 12,000 applies of re-sent states the worst apply
+  was 730 bytes over its growth;
+- a client's section where what the queue holds of it is not known exactly,
+  after a refused apply or a drain that dropped a struct, counts the skip,
+  start clock and section header a park can add.
+
+A park's merge into the queue can drop a parked struct for the copy an update
+re-sends. The report reads what the queue holds before that merge; read after
+it, the copy was counted against a gap the state never had, 2 bytes over on
+10 of 6,000 applies of updates that arrive late and below the state on 129 of
+12,000 applies of re-sent states.
+
+The report covers its own apply's transaction alone. On a document whose text
+root has been read with `GetText` (a raw root never runs it), a remote apply
+that leaves format markers redundant is followed by the format cleanup, a
+local transaction that commits after the report and emits its own update.
+Measured with GC off: A deletes "abc" while B bolds its last character, and
+the apply that brings A's delete to a room holding B's format reports 9 while
+the state grows by 18, the cleanup's delete of the redundant marker adding a
+delete-set entry of 9 bytes for B's client of 2^40 + 1. With GC on the same
+case reports 6 and the state grows by 6. An owner bounding state counts those
+commits too.
+
 ## v1.55.1-sami.10
 
 This fork release retains the complete

@@ -192,6 +192,14 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	}
 	j.pendingDs = parkedDeletesOf(s)
 	j.pendingMoves = pendingMovesOf(s)
+	if d.applyReport != nil {
+		// The report's StateBytes is counted where the apply makes each
+		// change (state_bytes.go); the queue's size as the apply finds it
+		// bounds what the counts it does not keep can be.
+		j.tally.stateOn, j.tally.stateClients = true, -1
+		j.tally.held = s.pending.heldStructs()
+		j.tally.fresh = j.tally.held == 0
+	}
 	state := txn.beginBoundedApply()
 	state.journal = j
 	// The document points at the journal's tally for the whole apply: the
@@ -320,6 +328,13 @@ func ownPendingDs(txn *Transaction, names map[ClientID][]DeleteRange) {
 func parkDeletes(txn *Transaction, ds DeleteSet) {
 	ownPendingDs(txn, ds.clients)
 	txn.doc.store.parkDeletes(ds)
+	if t := txn.doc.tally(); t != nil && t.stateOn {
+		// The clients whose pending deletes the delete set's growth reads
+		// (deleteSetGrowth), so it never walks the whole of them.
+		for c := range ds.clients {
+			t.parkedDeletes = append(t.parkedDeletes, c)
+		}
+	}
 }
 
 // refuseRemoteApply is the error of a remote apply that failed with err
@@ -383,7 +398,10 @@ func endRemoteApply(txn *Transaction, err error) error {
 //
 // The report itself is made later, by reportApply at the end of the
 // transaction: the totals it carries are of the document the commit leaves,
-// and the merges that decide them have not run yet.
+// and the merges that decide them have not run yet. StateBytes is begun
+// here, with what the apply added to the store, the pending queue and the
+// delete set, whose deletions are all made by now; the commit takes off it
+// what its merges and its collection remove (stateDue).
 func noteApplyReport(txn *Transaction, j *applyJournal) {
 	if txn.doc.applyReport == nil {
 		return
@@ -394,8 +412,18 @@ func noteApplyReport(txn *Transaction, j *applyJournal) {
 		Bytes:      j.tally.bytes,
 		Split:      j.tally.split,
 		Decoded:    j.tally.decoded,
+		StateBytes: j.tally.state + deleteSetGrowth(txn, j),
 	}
 	state.reportDue = true
+}
+
+// reportApplyRecovered is reportApply with a panicking callback kept rather than
+// raised, so the caller can re-raise it where a panic costs the document
+// nothing (transactInternal's deferred commit).
+func reportApplyRecovered(txn *Transaction) (panicked any) {
+	defer func() { panicked = recover() }()
+	reportApply(txn)
+	return nil
 }
 
 // reportApply makes the report of txn's remote apply (WithApplyReport),
@@ -408,16 +436,8 @@ func noteApplyReport(txn *Transaction, j *applyJournal) {
 // The struct total is two counters read here and nowhere else: the structs
 // the store holds, and those the pending queue holds for gaps their senders
 // have still to fill, which the store's count leaves out. The deltas are the
-// apply's own, as the budget counted them.
-// reportApplyRecovered is reportApply with a panicking callback kept rather than
-// raised, so the caller can re-raise it where a panic costs the document
-// nothing (transactInternal's deferred commit).
-func reportApplyRecovered(txn *Transaction) (panicked any) {
-	defer func() { panicked = recover() }()
-	reportApply(txn)
-	return nil
-}
-
+// apply's own, as the budget counted them, StateBytes with what the commit's
+// merges and collection took off it.
 func reportApply(txn *Transaction) {
 	state := txn.boundedApply
 	if state == nil || !state.reportDue {
@@ -470,17 +490,22 @@ func drainParked(txn *Transaction, drain func()) {
 		leftLen = len(s.parked.left)
 	}
 	j.drain, j.at = &point, &point
+	// What the report counts of the encoded state reads the queue the drain
+	// takes apart, and goes back with the drain (applyTally.takeBackDrain).
+	counted := j.tally.beginDrain(pending)
 	if j.drainOwnAllowance {
 		txn.boundedApply.scanFrom = txn.scanned
 	}
 	defer func() {
 		r := recover()
 		j.at = &j.start
+		defer j.tally.endDrain()
 		if r == nil {
 			j.parkedAs = nil
 			return
 		}
 		j.rollBackTo(txn, &point)
+		j.tally.takeBackDrain(counted, s)
 		for item, as := range j.parkedAs {
 			*item = as
 		}
@@ -696,8 +721,10 @@ func (j *applyJournal) rollBack(txn *Transaction) {
 		j.pending.missing = j.missing
 		j.pending.ready = j.pendingReady
 		// The apply's parks added their clocks to the queue's cover in place
-		// (addCover), and it holds none of them now.
+		// (addCover), and it holds none of them now. The report's cover keeps
+		// them, covering more than the queue holds (parkedCover).
 		j.pending.cover = nil
+		j.pending.stateExact = false
 		j.pending.tail, j.pending.tailValid = j.pendingTail, j.pendingTailValid
 	}
 	s.pending = j.pending
@@ -1014,6 +1041,38 @@ type applyTally struct {
 	// empty when the refused item hangs under no root of the document.
 	decoded, structs, bytes, split int
 	root                           string
+	// stateOn is whether the apply counts what it adds to the encoded state,
+	// which only a document that reports reads (ApplyReport.StateBytes), and
+	// state is that count as the apply has made it, but for the delete set,
+	// which is read where the apply ends (deleteSetGrowth). stateClients is
+	// the clients the store holds a struct of, read on first need and -1
+	// before (sectionGrowth); arrivedDeleted is the structs the apply appended
+	// deleted, which no delete records (noteStateAppend). drainKept and
+	// drainKeptBy are what the running drain's splits of structs the store
+	// held before it added, and how many of them each client's are, which a
+	// take-back leaves in place (takeBackDrain).
+	//
+	// held is the most structs the pending queue has held during the apply,
+	// which bounds the counts the queue adds to (sectionCountGrowth); fresh is
+	// whether it held none as the apply began, and parked, the structs the
+	// apply then parked of each client, and parkedSections, the clients among
+	// them the state had no section of, make each park's count exact
+	// (noteStatePark). drainQueue is the queue the running drain takes apart,
+	// which the report reads in its place (applyTally.queue), and
+	// parkedDeletes is the clients the apply parked delete ranges of.
+	stateOn        bool
+	state          int
+	stateClients   int
+	arrivedDeleted DeleteSet
+	drainKept      int
+	drainKeptBy    map[ClientID]int
+	held           int
+	fresh          bool
+	parked         map[ClientID]freshPark
+	parkedSections int
+	drainQueue     *pendingUpdate
+	drainMoved     map[ClientID]int
+	parkedDeletes  []ClientID
 }
 
 // noApplyBudget is the budget of an apply on a document with no budget
@@ -1212,6 +1271,7 @@ func noteIntegrated(txn *Transaction, item *Item) {
 // for it (TestUnit_ApplyBudget_CountsTheStructsAnUpdateParks).
 func notePark(txn *Transaction, item *Item) {
 	noteIntegrated(txn, item)
+	noteStatePark(txn, item)
 	if item.Parent != nil {
 		// The root is readable now and was just checked; nothing is left to
 		// decide later.
