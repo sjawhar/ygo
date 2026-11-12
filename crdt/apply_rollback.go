@@ -3,6 +3,7 @@ package crdt
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 )
 
@@ -51,13 +52,19 @@ import (
 //     appends to the parked items' slice, past the length the journal keeps,
 //     or replaces it with a slice of its own (drainPending); it writes the
 //     missing map only to park an item (resolveWithinUpdatePending), and its
-//     first such write copies the map (parkedMissing); and it replaces the
-//     pending deletes rather than writing into them, but for the merge of a
-//     delete range it parks (parkDeletes), which writes into copies of the
-//     clients it names. The parked items themselves are not touched before
-//     the drain, the apply's last step, so the whole apply's rollback needs
-//     no record of their fields; a drain taken back gives back what it
-//     changed of them (drainParked).
+//     first such write copies the map (parkedMissing); and it writes into the
+//     pending deletes only to merge a delete range it parks (parkDeletes) or
+//     to take the ranges a retry applies (retryPendingDs), and each such
+//     write goes to a copy of their map and of the ranges of the clients it
+//     names (ownPendingDs). The count of parked ranges and the clients
+//     moved since the last retry, which the store keeps with them, are kept
+//     as values (parkedDeletesAt). A park also adds to the queue's cover of
+//     clocks (pendingUpdate.addCover), in place, so a rollback drops the
+//     cover and the next park that asks for it builds it from the items
+//     kept. The parked items themselves are not touched before the drain,
+//     the apply's last step, so the whole apply's rollback needs no record of
+//     their fields; a drain taken back gives back what it changed of them
+//     (drainParked).
 //
 // Splits of items the document already held stay: a split leaves the same
 // content, and the transaction's commit merges each split back
@@ -72,12 +79,26 @@ type applyJournal struct {
 	start        applyPoint
 	pending      *pendingUpdate
 	pendingItems []*Item
-	missing      StateVector
+	// pendingDead is pending's count of emptied slots as the apply found it.
+	pendingDead int
+	// pendingItemsOwn is whether pendingItems is the journal's own copy of
+	// the queue's slots, made before a park's merge first emptied or moved
+	// them in place (keepQueueFor).
+	pendingItemsOwn bool
+	// queuedAs is each queued struct a park's merge cut or grew in place, as
+	// the apply found it, its content copied (keepQueueFor).
+	queuedAs map[*Item]Item
+	missing  StateVector
 	// missingCopied is whether pending's missing map is the apply's own copy
 	// (parkedMissing).
 	missingCopied bool
-	pendingDs     DeleteSet
-	pendingMoves  map[ClientID][]*Item
+	// pendingTail and pendingTailValid are the queue's tail record
+	// (pendingUpdate.noteTail) as the apply found it; a park moves it in place.
+	pendingTail      uint64
+	pendingTailValid bool
+	pendingReady     bool
+	pendingDs        parkedDeletesAt
+	pendingMoves     map[ClientID][]*Item
 	// drain is the point the drain began at, once it has; at is the point a
 	// map key's previous value is recorded on.
 	drain *applyPoint
@@ -143,9 +164,12 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	if s.pending != nil {
 		j.pending = s.pending
 		j.pendingItems = s.pending.items
+		j.pendingDead = s.pending.dead
 		j.missing = s.pending.missing
+		j.pendingReady = s.pending.ready
+		j.pendingTail, j.pendingTailValid = s.pending.tail, s.pending.tailValid
 	}
-	j.pendingDs = s.pendingDs
+	j.pendingDs = parkedDeletesOf(s)
 	j.pendingMoves = clonePendingMoves(s.pendingMoves)
 	state := txn.beginBoundedApply()
 	state.journal = j
@@ -178,29 +202,77 @@ func parkedMissing(txn *Transaction) StateVector {
 	return p.missing
 }
 
-// parkDeletes merges ds, delete ranges whose targets the store does not hold
-// yet, into the store's pending deletes. The merge appends to each client's
-// ranges and sorts them in place, so on a document with a scan bound, whose
-// journal shares the pending deletes as the apply found them, it writes into a
-// set whose map is a copy and whose ranges are copies for the clients ds names.
-func parkDeletes(txn *Transaction, ds DeleteSet) {
+// parkedDeletesAt is the store's pending deletes as a point of an apply found
+// them: the set, kept by reference (see the top of this file), the count of
+// its ranges (StructStore.pendingDsRanges) and the clients Append gave a
+// struct since the last retry (StructStore.pendingDsMoved), copied, since
+// Append and retryPendingDs write that set in place.
+type parkedDeletesAt struct {
+	ds     DeleteSet
+	ranges int
+	moved  map[ClientID]struct{}
+}
+
+func parkedDeletesOf(s *StructStore) parkedDeletesAt {
+	return parkedDeletesAt{ds: s.pendingDs, ranges: s.pendingDsRanges, moved: maps.Clone(s.pendingDsMoved)}
+}
+
+// restore puts the store's pending deletes back as p found them.
+func (p parkedDeletesAt) restore(s *StructStore) {
+	s.pendingDs, s.pendingDsRanges, s.pendingDsMoved = p.ds, p.ranges, p.moved
+}
+
+// ownPendingDs gives the store's pending deletes a map of their own, and
+// copies of the ranges of the clients in names, before a write into them
+// during txn's apply on a bounded document: the journal, and the drain, keep
+// the set they found by reference, and a merge (parkDeletes) appends to a
+// client's ranges and sorts them in place, and a retry takes a client's
+// ranges out of the map (StructStore.takeReadyDeletes). It does nothing when
+// txn keeps no journal.
+func ownPendingDs(txn *Transaction, names map[ClientID][]DeleteRange) {
+	if txn.applyJournal() == nil {
+		return
+	}
 	s := txn.doc.store
-	if txn.applyJournal() != nil {
-		shared := s.pendingDs
-		s.pendingDs = DeleteSet{clients: maps.Clone(shared.clients)}
-		if s.pendingDs.clients == nil {
-			s.pendingDs.clients = make(map[ClientID][]DeleteRange)
-		}
-		if shared.order != nil {
-			s.pendingDs.order = append([]ClientID{}, shared.order...)
-		}
-		for c := range ds.clients {
-			if ranges, ok := shared.clients[c]; ok {
-				s.pendingDs.clients[c] = append([]DeleteRange(nil), ranges...)
-			}
+	shared := s.pendingDs
+	s.pendingDs = DeleteSet{clients: maps.Clone(shared.clients)}
+	if s.pendingDs.clients == nil {
+		s.pendingDs.clients = make(map[ClientID][]DeleteRange)
+	}
+	if shared.order != nil {
+		s.pendingDs.order = append([]ClientID{}, shared.order...)
+	}
+	for c := range names {
+		if ranges, ok := shared.clients[c]; ok {
+			s.pendingDs.clients[c] = append([]DeleteRange(nil), ranges...)
 		}
 	}
-	s.pendingDs.Merge(ds)
+}
+
+// parkDeletes merges ds, delete ranges whose targets the store does not hold
+// yet, into the store's pending deletes (StructStore.parkDeletes, which keeps
+// their count), on a bounded document into a set of its own (ownPendingDs).
+// Today no rollback of the whole apply can follow this merge: it is the last
+// step before drainParked, which takes back on its own what it does. The copy
+// guards only a step that can fail being added after it; keep it for that, and
+// do not count on it as more.
+func parkDeletes(txn *Transaction, ds DeleteSet) {
+	ownPendingDs(txn, ds.clients)
+	txn.doc.store.parkDeletes(ds)
+}
+
+// refuseRemoteApply is the error of a remote apply that failed with err
+// before it changed anything: an update it could not read at its header or at
+// a later group it scans first, or one the pending cap refused. Its
+// transaction is refused (Transaction.refused), so its commit encodes and
+// fires nothing (buildPhase2), on any document. On a bounded document err
+// is returned as a RefusedUpdateError, as for an apply the journal took back,
+// with no scans to report.
+func refuseRemoteApply(txn *Transaction, err error) error {
+	if err == nil || !txn.doc.scanBounded() {
+		return err
+	}
+	return &RefusedUpdateError{Err: err}
 }
 
 // endRemoteApply ends txn's journal and returns the apply's error err. When a
@@ -235,8 +307,9 @@ func endRemoteApply(txn *Transaction, err error) error {
 // show, so a dropped one would come back only when its sender next connects,
 // and taking the drain back already keeps the drain's scans from refusing the
 // update. The drain writes into neither the queue it found nor that queue's
-// slice and map (drainPending replaces the queue), nor into the pending
-// deletes (retryParkedDeletes replaces them), so they are kept by reference;
+// slice and map (drainPending replaces the queue), and its retry of the
+// pending deletes writes into a copy of them (ownPendingDs), so they are kept
+// by reference, with their count and moved clients (parkedDeletesAt);
 // it resolves pending moves in place, so those are copied. It does change the
 // parked items it integrates, and the take-back gives each back what it
 // changed: rollBackTo unlinks it and undoes the drain's deletion of it, a
@@ -251,7 +324,14 @@ func drainParked(txn *Transaction, drain func()) {
 	}
 	s := txn.doc.store
 	point := pointNow(txn, s.StateVector())
-	pending, pendingDs, pendingMoves := s.pending, s.pendingDs, clonePendingMoves(s.pendingMoves)
+	pending, pendingDs, pendingMoves := s.pending, parkedDeletesOf(s), clonePendingMoves(s.pendingMoves)
+	// The structs a drain takes out of the queue are listed in the park
+	// record (transactionParked.left); a drain taken back parks them again,
+	// so the list goes back to its length as the drain began.
+	leftLen := 0
+	if s.parked != nil {
+		leftLen = len(s.parked.left)
+	}
 	j.drain, j.at = &point, &point
 	if j.drainOwnAllowance {
 		txn.boundedApply.scanFrom = txn.scanned
@@ -269,10 +349,48 @@ func drainParked(txn *Transaction, drain func()) {
 		}
 		j.parkedAs = nil
 		s.pending = parkAgain(s, pending)
-		s.pendingDs = pendingDs
+		pendingDs.restore(s)
 		s.pendingMoves = pendingMoves
+		if s.parked != nil {
+			clear(s.parked.left[leftLen:])
+			s.parked.left = s.parked.left[:leftLen]
+		}
 	}()
 	drain()
+}
+
+// keepQueueFor records, before a park merges arrivals into the queue the
+// apply found (pendingUpdate.apply), what that merge changes in place, so a
+// rollback gives it back: the queue's slots, which the merge empties and
+// compacts in the slice the journal holds by reference, so the journal takes
+// its own copy of them once; and each queued struct the merge cuts or grows,
+// its content copied. It does nothing for a queue the apply made itself (a
+// drain's), or for a plan that changes no queued struct.
+func (j *applyJournal) keepQueueFor(p *pendingUpdate, pl mergePlan) {
+	if p != j.pending {
+		return
+	}
+	for i, q := range pl.held {
+		k := pl.keepHeld[i]
+		if k == (mergeKeep{start: q.ID.Clock, end: q.ID.Clock + q.Content.Len()}) {
+			continue
+		}
+		if !j.pendingItemsOwn {
+			j.pendingItems, j.pendingItemsOwn = slices.Clone(j.pendingItems), true
+		}
+		if !k.kept() {
+			continue
+		}
+		if _, kept := j.queuedAs[q.Item]; kept {
+			continue
+		}
+		if j.queuedAs == nil {
+			j.queuedAs = make(map[*Item]Item)
+		}
+		as := *q.Item
+		as.Content = q.Content.Copy()
+		j.queuedAs[q.Item] = as
+	}
 }
 
 // parkAgain is found, the pending queue as a drain found it, for after the
@@ -299,14 +417,15 @@ func parkAgain(s *StructStore, found *pendingUpdate) *pendingUpdate {
 	if found == nil {
 		return nil
 	}
-	for _, item := range found.items {
+	items := found.heldItems()
+	for _, item := range items {
 		item.Left, item.Right, item.MovedBy = nil, nil, nil
 	}
 	missing := make(StateVector, len(found.missing))
 	for client, clock := range found.missing {
 		missing[client] = max(clock, s.NextClock(client))
 	}
-	return &pendingUpdate{items: found.items, missing: missing}
+	return &pendingUpdate{items: items, missing: missing}
 }
 
 // keepParked records item, a parked item or a struct the running drain added,
@@ -373,11 +492,19 @@ func (j *applyJournal) rollBack(txn *Transaction) {
 		// What the apply appended past the length kept is dropped, and its
 		// slots cleared so the backing array holds none of the refused items.
 		clear(j.pendingItems[len(j.pendingItems):cap(j.pendingItems)])
-		j.pending.items = j.pendingItems
+		j.pending.items, j.pending.dead = j.pendingItems, j.pendingDead
+		for item, as := range j.queuedAs {
+			*item = as
+		}
 		j.pending.missing = j.missing
+		j.pending.ready = j.pendingReady
+		// The apply's parks added their clocks to the queue's cover in place
+		// (addCover), and it holds none of them now.
+		j.pending.cover = nil
+		j.pending.tail, j.pending.tailValid = j.pendingTail, j.pendingTailValid
 	}
 	s.pending = j.pending
-	s.pendingDs = j.pendingDs
+	j.pendingDs.restore(s)
 	s.pendingMoves = j.pendingMoves
 
 	txn.subdocsAdded, txn.subdocsRemoved, txn.subdocsLoaded = nil, nil, nil
@@ -436,7 +563,7 @@ func (j *applyJournal) rollBackTo(txn *Transaction, point *applyPoint) {
 			}
 			i := sort.Search(len(items), func(i int) bool {
 				it := items[i]
-				return it.ID.Clock+uint64(it.Content.Len()) > r.Clock
+				return it.ID.Clock+it.Content.Len() > r.Clock
 			})
 			for ; i < len(items) && items[i].ID.Clock < end; i++ {
 				x := items[i]
@@ -446,7 +573,7 @@ func (j *applyJournal) rollBackTo(txn *Transaction, point *applyPoint) {
 				x.Deleted = false
 				if x.Parent != nil {
 					if x.Content.IsCountable() {
-						x.Parent.length += x.Content.Len()
+						x.Parent.length += nativeContentLen(x.Content)
 					}
 					touched[x.Parent] = struct{}{}
 				}
@@ -505,7 +632,7 @@ func unlinkItem(x *Item, touched map[*abstractType]struct{}) {
 		x.Right.Left = x.Left
 	}
 	if !x.Deleted && x.Content.IsCountable() {
-		p.length -= x.Content.Len()
+		p.length -= nativeContentLen(x.Content)
 	}
 	x.Left, x.Right = nil, nil
 	touched[p] = struct{}{}
