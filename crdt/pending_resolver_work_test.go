@@ -269,9 +269,12 @@ func TestUnit_PendingResolver_ParkRecordHoldsOnlyWhatParks(t *testing.T) {
 // Parking state uses one lazy pointer, so ordinary transactions and stores
 // stay compact on every supported pointer width. The sizes are this release's
 // composition (v1.55.1-sami.1): #350, #333, the scan budget and #347 add
-// fields of their own beside #340's pointer.
+// fields of their own beside #340's pointer, and ApplyUpdateV1Outcome adds
+// one more, the pointer that receives the commit's update (integrated).
 func TestUnit_Transaction_ParkRecordKeepsItsSize(t *testing.T) {
 	word := unsafe.Sizeof(uintptr(0))
-	require.Equal(t, 31*word, unsafe.Sizeof(Transaction{}))
-	require.Equal(t, 13*word, unsafe.Sizeof(StructStore{}))
+	require.Equal(t, 32*word, unsafe.Sizeof(Transaction{}))
+	// SetParkedOutOfState's flag (StructStore.parkedOutOfState) takes the
+	// store from 13 words to 14.
+	require.Equal(t, 14*word, unsafe.Sizeof(StructStore{}))
 }

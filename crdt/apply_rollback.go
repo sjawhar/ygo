@@ -33,7 +33,8 @@ import (
 // again from the drain); under a budget it draws on what the apply's allowance
 // has left, so one apply's scans, drain included, never pass what the budget
 // gave it. The scans of a drain taken back stay counted
-// (Transaction.IntegrateScanned): the work was done.
+// (Transaction.IntegrateScanned): the work was done. A drain whose result the
+// document's apply check refuses (WithApplyCheck) is taken back the same way.
 //
 // What a rollback has to undo is what integrating and deleting change:
 //   - every struct added since the point it rolls back to, which is every
@@ -79,8 +80,9 @@ type applyJournal struct {
 	start        applyPoint
 	pending      *pendingUpdate
 	pendingItems []*Item
-	// pendingDead is pending's count of emptied slots as the apply found it.
-	pendingDead int
+	// pendingDead and pendingBytes are pending's count of emptied slots and
+	// of content bytes as the apply found it.
+	pendingDead, pendingBytes int
 	// pendingItemsOwn is whether pendingItems is the journal's own copy of
 	// the queue's slots, made before a park's merge first emptied or moved
 	// them in place (keepQueueFor).
@@ -117,6 +119,16 @@ type applyJournal struct {
 	// because an apply that keeps one is exactly an apply that can be
 	// refused; the document points at it for the decode (Doc.applying).
 	tally applyTally
+	// check is the document's apply check (WithApplyCheck), read once as the
+	// apply begins, so an apply runs a check only beside the journal that can
+	// take back what the check refuses.
+	check func(origin any, view *ApplyView) error
+	// touched is the clients the apply added or parked a struct for outside
+	// its drain, kept only beside a check (touch), so whether the update
+	// changed the document is asked of their clocks alone (checkApply);
+	// touchedBuf holds a keystroke's few without an allocation.
+	touched    []ClientID
+	touchedBuf [4]ClientID
 }
 
 // applyPoint is a point of an apply a rollback can return the document to.
@@ -185,7 +197,7 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	if s.pending != nil {
 		j.pending = s.pending
 		j.pendingItems = s.pending.items
-		j.pendingDead = s.pending.dead
+		j.pendingDead, j.pendingBytes = s.pending.dead, s.pending.bytes
 		j.missing = s.pending.missing
 		j.pendingReady = s.pending.ready
 		j.pendingTail, j.pendingTailValid = s.pending.tail, s.pending.tailValid
@@ -195,9 +207,13 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	if d.applyReport != nil {
 		// The report's StateBytes is counted where the apply makes each
 		// change (state_bytes.go); the queue's size as the apply finds it
-		// bounds what the counts it does not keep can be.
+		// bounds what the counts it does not keep can be. A queue out of the
+		// state bounds nothing.
 		j.tally.stateOn, j.tally.stateClients = true, -1
-		j.tally.held = s.pending.heldStructs()
+		j.tally.parkedOut = s.parkedOutOfState
+		if !j.tally.parkedOut {
+			j.tally.held = s.pending.heldStructs()
+		}
 		j.tally.fresh = j.tally.held == 0
 	}
 	state := txn.beginBoundedApply()
@@ -233,6 +249,7 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	if d.refusedContent != nil {
 		j.tally.refusedContent = d.callRefusedContent(txn.Origin)
 	}
+	j.check = d.applyCheck
 }
 
 // pendingMovesAt is the store's pending moves as a point of an apply found
@@ -321,10 +338,11 @@ func ownPendingDs(txn *Transaction, names map[ClientID][]DeleteRange) {
 // parkDeletes merges ds, delete ranges whose targets the store does not hold
 // yet, into the store's pending deletes (StructStore.parkDeletes, which keeps
 // their count), on a bounded document into a set of its own (ownPendingDs).
-// Today no rollback of the whole apply can follow this merge: it is the last
-// step before drainParked, which takes back on its own what it does. The copy
-// guards only a step that can fail being added after it; keep it for that, and
-// do not count on it as more.
+// One step can fail after this merge and roll the whole apply back: the
+// document's apply check of what the update left (checkApply), the last step
+// before drainParked, which takes back on its own what it does. The copy is
+// what lets that rollback give the pending deletes back as the apply found
+// them.
 func parkDeletes(txn *Transaction, ds DeleteSet) {
 	ownPendingDs(txn, ds.clients)
 	txn.doc.store.parkDeletes(ds)
@@ -356,7 +374,9 @@ func refuseRemoteApply(txn *Transaction, err error) error {
 // err as a RefusedUpdateError carrying what the apply's scans passed and what
 // it decoded and added, which no observer reports for a rolled-back
 // transaction (buildPhase2). When it succeeded it keeps the same counts for
-// the report the commit makes (noteApplyReport).
+// the report the commit makes (noteApplyReport), and returns the error of a
+// drain the document's apply check refused (checkDrain), which was taken back
+// while the update stands, or nil.
 //
 // It raises no refusal of its own. The struct and byte budget is read where
 // the apply's struct phase ends (refuseOverBudget), before the delete set
@@ -377,7 +397,21 @@ func endRemoteApply(txn *Transaction, err error) error {
 	}
 	if err == nil {
 		noteApplyReport(txn, j)
-		return err
+		if state.drainTakenBack {
+			// The update stands; a drain taken back on a document that
+			// discards refused drains discarded what its fill released
+			// (discardReleased), and the apply says what.
+			return &DrainDiscardedError{
+				Structs: state.discardedStructs,
+				Ranges:  state.discardedRanges,
+				Scanned: state.drainScanned,
+				Senders: state.discardedSenders,
+				Cause:   state.drainRefused,
+			}
+		}
+		// The update stands; a drain the apply check refused was taken back
+		// (checkDrain), and that is the apply's error.
+		return state.drainRefused
 	}
 	j.rollBack(txn)
 	return &RefusedUpdateError{
@@ -453,11 +487,11 @@ func reportApply(txn *Transaction) {
 // drainParked runs drain, the apply's drain of the pending queue and pending
 // deletes. On a bounded document it is a phase that can fail on its own: under
 // a bound it has an allowance of its own of the bound's size, and under a
-// budget it draws on what the apply's allowance has left. One that fails is
-// taken back to where it began, the pending queue, pending deletes and pending
-// moves are put back as it found them (the queue's clocks raised, parkAgain),
-// and the apply goes on as if the drain had not run; the scans it did stay
-// counted.
+// budget it draws on what the apply's allowance has left. One that fails, or
+// whose result the document's apply check refuses (checkDrain), is taken back
+// to where it began, the pending queue, pending deletes and pending moves are
+// put back as it found them (the queue's clocks raised, parkAgain), and the
+// apply goes on as if the drain had not run; the scans it did stay counted.
 //
 // The queue is put back rather than dropped: a parked item is an edit whose
 // sender was told it was delivered and which the store's state vector does not
@@ -472,7 +506,10 @@ func reportApply(txn *Transaction) {
 // changed: rollBackTo unlinks it and undoes the drain's deletion of it, a
 // parked item the drain integrated, trimmed or split gets back the fields the
 // drain found it with (keepParked), and parkAgain clears the neighbours and
-// the move the drain gave it.
+// the move the drain gave it. On a document that discards refused drains
+// (SetDiscardRefusedDrain) the take-back parks the queue again without what
+// the fill released, and drops the pending deletes below the clocks that
+// reaches (discardReleased).
 func drainParked(txn *Transaction, drain func()) {
 	j := txn.applyJournal()
 	if j == nil {
@@ -482,12 +519,16 @@ func drainParked(txn *Transaction, drain func()) {
 	s := txn.doc.store
 	point := pointNow(txn, s.StateVector())
 	pending, pendingDs, pendingMoves := s.pending, parkedDeletesOf(s), pendingMovesOf(s)
+	// A drain lands only what the queue and the pending deletes hold, so one
+	// that finds both empty has nothing for the apply check to judge.
+	queued := pending.heldStructs() > 0 || len(s.pendingDs.clients) > 0
 	// The structs a drain takes out of the queue are listed in the park
-	// record (#340's transactionParked.left); a drain taken back parks them
-	// again, so the list goes back to its length as the drain began.
-	leftLen := 0
+	// record (#340's transactionParked.left, and gone); a drain taken back
+	// parks them again, so the lists go back to their lengths as the drain
+	// began.
+	leftLen, goneLen := 0, 0
 	if s.parked != nil {
-		leftLen = len(s.parked.left)
+		leftLen, goneLen = len(s.parked.left), len(s.parked.gone)
 	}
 	j.drain, j.at = &point, &point
 	// What the report counts of the encoded state reads the queue the drain
@@ -496,6 +537,7 @@ func drainParked(txn *Transaction, drain func()) {
 	if j.drainOwnAllowance {
 		txn.boundedApply.scanFrom = txn.scanned
 	}
+	scannedBefore := txn.scanned
 	defer func() {
 		r := recover()
 		j.at = &j.start
@@ -510,13 +552,26 @@ func drainParked(txn *Transaction, drain func()) {
 			*item = as
 		}
 		j.parkedAs = nil
-		s.pending = parkAgain(s, pending)
-		pendingDs.restore(s)
-		pendingMoves.restore(s)
 		if s.parked != nil {
 			clear(s.parked.left[leftLen:])
 			s.parked.left = s.parked.left[:leftLen]
+			clear(s.parked.gone[goneLen:])
+			s.parked.gone = s.parked.gone[:goneLen]
 		}
+		if txn.outcome != nil {
+			txn.outcome.Drained = false // the drain taken back landed nothing
+		}
+		pendingMoves.restore(s)
+		if txn.doc.discardRefusedDrain {
+			cause := txn.boundedApply.drainRefused
+			if cause == nil {
+				cause = recoveredApplyErr(r)
+			}
+			discardReleased(txn, pending, pendingDs, txn.scanned-scannedBefore, cause)
+			return
+		}
+		s.pending = parkAgain(s, pending)
+		pendingDs.restore(s)
 		// The failure stays the drain's, the split budget's included: the
 		// drain is taken back, the backlog is parked again whole, and the
 		// update that filled the gap stands.
@@ -544,6 +599,7 @@ func drainParked(txn *Transaction, drain func()) {
 		// "invalid update" for ever and no way to reach the cause.
 	}()
 	drain()
+	checkDrain(txn, j, &point, queued)
 }
 
 // keepQueueFor records, before a park merges arrivals into the queue the
@@ -612,7 +668,7 @@ func parkAgain(s *StructStore, found *pendingUpdate) *pendingUpdate {
 	for client, clock := range found.missing {
 		missing[client] = max(clock, s.NextClock(client))
 	}
-	return &pendingUpdate{items: items, missing: missing}
+	return &pendingUpdate{items: items, missing: missing, bytes: itemsBytes(items)}
 }
 
 // keepParked records item, a parked item or a struct the running drain added,
@@ -714,7 +770,7 @@ func (j *applyJournal) rollBack(txn *Transaction) {
 		// What the apply appended past the length kept is dropped, and its
 		// slots cleared so the backing array holds none of the refused items.
 		clear(j.pendingItems[len(j.pendingItems):cap(j.pendingItems)])
-		j.pending.items, j.pending.dead = j.pendingItems, j.pendingDead
+		j.pending.items, j.pending.dead, j.pending.bytes = j.pendingItems, j.pendingDead, j.pendingBytes
 		for item, as := range j.queuedAs {
 			*item = as
 		}
@@ -1060,6 +1116,9 @@ type applyTally struct {
 	// (noteStatePark). drainQueue is the queue the running drain takes apart,
 	// which the report reads in its place (applyTally.queue), and
 	// parkedDeletes is the clients the apply parked delete ranges of.
+	// parkedOut is whether the document keeps its parked content out of its
+	// state (SetParkedOutOfState), so the count reads no queue and counts no
+	// park, and a struct a drain lands counts as an append.
 	stateOn        bool
 	state          int
 	stateClients   int
@@ -1073,6 +1132,7 @@ type applyTally struct {
 	drainQueue     *pendingUpdate
 	drainMoved     map[ClientID]int
 	parkedDeletes  []ClientID
+	parkedOut      bool
 }
 
 // noApplyBudget is the budget of an apply on a document with no budget
@@ -1172,10 +1232,31 @@ func (t *applyTally) integrated(item *Item) {
 		return
 	}
 	t.structs++
-	t.bytes += contentBytes(item.Content)
+	t.bytes += structBytes(item)
+}
+
+// structBytes is the bytes a struct is charged as content: its content
+// (contentBytes) and the map key it carries, which the document keeps for as
+// long as the entry lives.
+func structBytes(item *Item) int {
+	n := contentBytes(item.Content)
 	if item.ParentSub != nil {
-		t.bytes += len(*item.ParentSub)
+		n += len(*item.ParentSub)
 	}
+	return n
+}
+
+// itemsBytes is the bytes items hold as ApplyBudget.Bytes counts them
+// (structBytes), an emptied slot (nil) counting nothing
+// (PendingStats.ContentBytes).
+func itemsBytes(items []*Item) int {
+	n := 0
+	for _, item := range items {
+		if item != nil {
+			n += structBytes(item)
+		}
+	}
+	return n
 }
 
 // integratedErr is ErrApplyBudget when the apply integrated more structs or
@@ -1223,8 +1304,9 @@ func refuseOverBudget(txn *Transaction) error {
 // of its update to the store (Item.integrate, integrateGroup, appendTrimmed):
 // it refuses the apply when the item lands under a root the document's
 // allowed-roots list does not name (checkItemRoot), or under one the list of
-// the apply that parked it did not name (checkParkedRoot), and counts the
-// struct and its bytes against the budget.
+// the apply that parked it did not name (checkParkedRoot), counts the struct
+// and its bytes against the budget, and records its client for the apply
+// check (touch).
 //
 // A struct the drain of the pending queue adds is not the update's and is not
 // counted: refusing the update for what an earlier update parked would let
@@ -1246,9 +1328,29 @@ func noteIntegrated(txn *Transaction, item *Item) {
 		return
 	}
 	t.checkItemRoot(txn.doc, item.Parent)
-	if !txn.applyJournal().inDrain() {
+	if j := txn.applyJournal(); !j.inDrain() {
 		t.integrated(item)
+		j.touch(item.ID.Client)
 	}
+}
+
+// touch records client, whose struct the apply outside its drain is about to
+// add to the store or park (noteIntegrated), for the apply check: every struct
+// the update adds enters the store through noteIntegrated, so the clients
+// recorded are every client whose clock the update can have moved
+// (Transaction.changesDocAmong). A run of one client's structs is recorded
+// once. It records nothing on a document with no check, or with no journal.
+func (j *applyJournal) touch(client ClientID) {
+	if j == nil || j.check == nil {
+		return
+	}
+	if n := len(j.touched); n > 0 && j.touched[n-1] == client {
+		return
+	}
+	if j.touched == nil {
+		j.touched = j.touchedBuf[:0]
+	}
+	j.touched = append(j.touched, client)
 }
 
 // notePark records item with txn's apply, where the apply puts a struct of

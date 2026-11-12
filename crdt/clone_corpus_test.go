@@ -41,11 +41,17 @@ func cloneCorpus(t *testing.T) []cloneCase {
 // testutil/fixtures and testutil/go_fixtures, and the fuzz corpora in
 // crdt/testdata/fuzz. A seed that does not apply cleanly is kept: the document
 // it leaves - with the structs the apply parked, or those it integrated before
-// failing - is a document a clone must copy too.
+// failing - is a document a clone must copy too. Under the race detector,
+// which makes each clone several times slower, it applies every fifth update.
 func fixtureCloneCases(t *testing.T) []cloneCase {
 	t.Helper()
 	var cases []cloneCase
+	found := 0
 	add := func(name string, update []byte, v2 bool) {
+		found++
+		if raceEnabled && found%5 != 1 {
+			return
+		}
 		doc := New(WithClientID(7))
 		if v2 {
 			_ = ApplyUpdateV2(doc, update, nil)

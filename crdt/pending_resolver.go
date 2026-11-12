@@ -283,6 +283,12 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 			// it found it.
 			j.keepQueueFor(s.pending, pl)
 		}
+		// A queued struct the merge drops leaves the queue for good.
+		for i, q := range pl.held {
+			if !pl.keepHeld[i].kept() {
+				txn.noteGone(q.Item)
+			}
+		}
 		// A GC struct the merge grew gains deleted-range clocks, which the
 		// document holds as a range record, not as bytes of content. A widened
 		// range is no heap, so the grown span is not charged; the arriving GC
@@ -322,6 +328,7 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 			s.pending = &pendingUpdate{missing: make(StateVector), tailClient: item.ID.Client, tailValid: true}
 		}
 		s.pending.items = append(s.pending.items, item)
+		s.pending.bytes += structBytes(item)
 		s.pending.noteTail(item)
 		// parkedMissing copies the map the journal of a bounded document's
 		// apply keeps, so an update the document refuses leaves the clocks its

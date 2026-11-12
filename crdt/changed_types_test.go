@@ -457,9 +457,15 @@ func (h *ctHarness) step(i int) {
 }
 
 // TestUnit_ChangedTypes_RemoteApplyReachesEveryChangedBlock is the randomized
-// contract test: seeded, so every run makes the same operations.
+// contract test: seeded, so every run makes the same operations. Each step
+// renders the whole document, so a seed costs about the square of its steps:
+// 100 under the race detector, where each seed must still run every branch of
+// the check.
 func TestUnit_ChangedTypes_RemoteApplyReachesEveryChangedBlock(t *testing.T) {
-	const steps = 250
+	steps := 250
+	if raceEnabled {
+		steps = 100
+	}
 	for _, seed := range []uint64{1, 2, 3, 0x644} {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			h := newCTHarness(t, seed)

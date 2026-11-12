@@ -83,6 +83,12 @@ type Transaction struct {
 	// landed, when set, receives ApplyUpdateV1Landed's update of what this
 	// failed apply integrated, encoded after the GC as OnUpdate's update is.
 	landed *[]byte
+	// outcome, when set, is ApplyUpdateV1Outcome's report of this apply: the
+	// commit writes its own update to Integrated, the slice OnUpdate
+	// observers are handed, when it changed the document
+	// (collectAndEncodeLocked), and the drain of the pending queue sets
+	// Drained when it lands anything (noteDrained).
+	outcome *ApplyOutcome
 	// deletedFormats holds, per client and sorted, the clocks of the format
 	// markers this remote transaction deleted, recorded for the format
 	// cleanup before the GC.
@@ -98,13 +104,35 @@ type Transaction struct {
 type transactionParked struct {
 	items   []*Item     // the first run is a view of the pending queue
 	deletes []DeleteSet // sharing ranges that nothing changes
+	// fresh is, on a document that discards refused drains, the part of each
+	// set in deletes that the pending deletes did not hold already, which the
+	// record of who parked each range keeps (recordParkedOrigins).
+	fresh []DeleteSet
 	// left is what a drain took out of the queue after the park, so the
 	// structs still parked are found without a pass over the queue; a merge
 	// runs before the transaction's one park and cannot take them.
 	left []*Item
+	// gone is, on a document that discards refused drains, every parked
+	// struct the transaction took out of the queue for good: dropped by a
+	// merge, landed by a drain, or discarded by a refused drain's take-back.
+	// The record of who parked each struct forgets them at the commit
+	// (recordParkedOrigins), so it holds no struct the queue does not. A
+	// drain taken back gives back what it listed, and an apply rolled back
+	// never reaches the commit's record.
+	gone []*Item
 }
 
-// parkRecord allocates the document's record only when a transaction parks.
+// noteGone lists item, a parked struct the transaction took out of the queue
+// for good, on a document that records who parked each struct.
+func (t *Transaction) noteGone(item *Item) {
+	if t.doc.discardRefusedDrain {
+		p := t.parkRecord()
+		p.gone = append(p.gone, item)
+	}
+}
+
+// parkRecord allocates the document's record only when a transaction parks,
+// or takes a parked struct out of the queue for good (noteGone).
 func (t *Transaction) parkRecord() *transactionParked {
 	s := t.doc.store
 	if s.parked == nil {
@@ -123,10 +151,14 @@ func (t *Transaction) noteParked(run []*Item) {
 	p.items = append(p.items, run...)
 }
 
-// noteParkedDeletes records ds, which this transaction parked.
-func (t *Transaction) noteParkedDeletes(ds DeleteSet) {
+// noteParkedDeletes records ds, which this transaction parked, and fresh,
+// the part of it no earlier apply had parked.
+func (t *Transaction) noteParkedDeletes(ds, fresh DeleteSet) {
 	p := t.parkRecord()
 	p.deletes = append(p.deletes, ds)
+	if len(fresh.clients) > 0 {
+		p.fresh = append(p.fresh, fresh)
+	}
 }
 
 // changesDoc reports whether t deleted something or added structs, the
@@ -137,6 +169,23 @@ func (t *Transaction) changesDoc() bool {
 		return true
 	}
 	for client := range t.doc.store.clients {
+		if t.doc.store.NextClock(client) != t.beforeState.Clock(client) {
+			return true
+		}
+	}
+	return false
+}
+
+// changesDocAmong is changesDoc for a transaction that knows the clients it
+// can have added structs for: it reads only their clocks, so it costs what
+// the transaction touched and not the store's client count. clients may name
+// a client twice, or one whose structs only parked; it must name every client
+// the transaction added a struct for, or the answer is changesDoc's no longer.
+func (t *Transaction) changesDocAmong(clients []ClientID) bool {
+	if len(t.deleteSet.clients) > 0 {
+		return true
+	}
+	for _, client := range clients {
 		if t.doc.store.NextClock(client) != t.beforeState.Clock(client) {
 			return true
 		}
@@ -813,6 +862,22 @@ type boundedApplyState struct {
 	// (noteApplyReport, reportApply).
 	report    ApplyReport
 	reportDue bool
+	// drainRefused is the apply's error when the document's apply check
+	// refused what the drain landed and the drain was taken back while the
+	// update stands, and checkPanic is what the check panicked with, raised
+	// to the caller once the transaction has committed (checkDrain,
+	// runCheck).
+	drainRefused error
+	checkPanic   any
+	// drainTakenBack is whether a drain taken back on a document that
+	// discards refused drains discarded what its fill released
+	// (discardReleased), and the rest are what it discarded, what its scans
+	// passed and the origins that parked what it discarded, which the apply
+	// returns as a DrainDiscardedError (endRemoteApply).
+	drainTakenBack                    bool
+	discardedStructs, discardedRanges int
+	drainScanned                      int
+	discardedSenders                  []any
 }
 
 // beginBoundedApply returns txn's bounded apply state, made on first use.
