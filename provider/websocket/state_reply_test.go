@@ -280,7 +280,7 @@ func TestInteg_StateReply_NoSyncStatusBeforeTheSyncStep2(t *testing.T) {
 // The per-peer write queue holds every frame of the largest state the fork is
 // used for without the direct send finding it full, which would close the peer.
 func TestUnit_StateReply_WriteQueueHoldsALargeState(t *testing.T) {
-	// The document INFRA-341 measured, and the frames the handshake queues
+	// A measured 1.22 MB document, and the frames the handshake queues
 	// ahead of the answer (SyncStep1 and awareness).
 	const stateBytes = 1_220_000
 	const handshake = 2

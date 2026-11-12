@@ -649,10 +649,15 @@ func fillGrowth(queue *pendingUpdate, pc *queuedClocks, stored bool, from, to ui
 
 // queue is the pending queue as the apply's current step finds it: during a
 // drain, the queue the drain began from, whose structs are either still in it
-// or landing; at any other time the store's.
+// or landing; at any other time the store's. It is nil on a document whose
+// parked content is out of its state (SetParkedOutOfState), whose state the
+// queue adds nothing to.
 func (t *applyTally) queue(s *StructStore) *pendingUpdate {
-	if t.drainQueue != nil {
+	switch {
+	case t.drainQueue != nil:
 		return t.drainQueue
+	case t.parkedOut:
+		return nil
 	}
 	return s.pending
 }
@@ -758,7 +763,8 @@ type freshPark struct {
 // holds, and the byte a varuint boundary can cost.
 func noteStatePark(txn *Transaction, item *Item) {
 	t := txn.doc.tally()
-	if t == nil || !t.stateOn {
+	if t == nil || !t.stateOn || t.parkedOut {
+		// A park adds nothing to a state that leaves parked content out.
 		return
 	}
 	s := txn.doc.store
@@ -877,7 +883,7 @@ func storeBytesIn(s *StructStore, c ClientID, from, to uint64) int {
 // start clock, that the dropped struct stood in.
 func measureQueueMerge(txn *Transaction, pl mergePlan) queueMerge {
 	t := txn.doc.tally()
-	if t == nil || !t.stateOn {
+	if t == nil || !t.stateOn || t.parkedOut {
 		return queueMerge{}
 	}
 	s, start := txn.doc.store, txn.applyJournal().start.sv
@@ -1085,7 +1091,9 @@ type drainCount struct{ state, clients int }
 // (applyTally.queue).
 func (t *applyTally) beginDrain(queue *pendingUpdate) drainCount {
 	t.drainKept, t.drainKeptBy, t.drainMoved = 0, nil, nil
-	if t.stateOn && queue != nil {
+	// Out of the state, the queue holds nothing the drain's landings move:
+	// each struct it lands is counted as an append (noteStateAppend).
+	if t.stateOn && queue != nil && !t.parkedOut {
 		t.drainQueue = queue
 	}
 	return drainCount{t.state, t.stateClients}
@@ -1128,6 +1136,9 @@ func (t *applyTally) takeBackDrain(at drainCount, s *StructStore) {
 // known (queuedEntries), whether a parked struct shares those clocks, and how
 // many structs the queue holds.
 func commitShare(s *StructStore, c ClientID, from, to uint64) (queued int, known, overlaps bool, held int) {
+	if s.parkedOutOfState {
+		return 0, true, false, 0
+	}
 	pc := s.pending.parkedCover()[c]
 	if pc == nil || pc.spans.len() == 0 {
 		return 0, true, false, 0
@@ -1165,6 +1176,11 @@ func deleteSetGrowth(txn *Transaction, j *applyJournal) int {
 	s := txn.doc.store
 	before, after := j.pendingDs.ds.clients, s.pendingDs.clients
 	arrived, parkedTo := j.tally.arrivedDeleted.clients, j.tally.parkedDeletes
+	if j.tally.parkedOut {
+		// The state's delete set is the store's alone: a parked range adds to
+		// it only once a retry applies it, which txn's delete set then holds.
+		before, after, parkedTo = nil, nil, nil
+	}
 	if len(txn.deleteSet.clients)+len(arrived)+len(parkedTo) == 0 {
 		return 0
 	}

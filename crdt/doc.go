@@ -527,6 +527,12 @@ type ApplyReport struct {
 	// marker adding a delete-set entry of 9 bytes for B's client of
 	// 2^40 + 1. With GC on the same case reports 6 and the state grows by 6.
 	// An owner bounding state counts those commits too.
+	//
+	// On a document whose parked content is out of its state
+	// (SetParkedOutOfState) the state is the store's structs and deletions
+	// alone, and so is the count: a park adds nothing, and the drain that
+	// lands a parked struct counts it as an append to the store. What the
+	// queue holds in memory is in Structs and Doc.PendingStats instead.
 	StateBytes int
 }
 
@@ -681,6 +687,98 @@ func (d *Doc) SetRefusedContent(kinds func(origin any) []ContentKind) {
 	d.refusedContent = kinds
 }
 
+// WithApplyCheck sets a check of what each remote update leaves the document
+// holding, for an owner whose bound can only be measured on the result. An
+// update's bytes do not show what it does to a document: where each item
+// lands, and what a deleted format item leaves formatted, depend on what the
+// document already holds. So as each remote apply (ApplyUpdate and its V1 and
+// V2 forms) has integrated the update's structs and applied its delete set,
+// and before its transaction commits, the document calls check with the
+// apply's origin and a view of the document as the update left it
+// (ApplyView).
+//
+// An error from check refuses the update. The apply is rolled back whole, as
+// every refusal of a bounded document is (apply_rollback.go): the document is
+// left as it was, byte for byte, the transaction commits as one that changed
+// nothing, no observer fires, so OnUpdate relays nothing and an open update
+// log records nothing, and the apply returns a RefusedUpdateError whose Err
+// wraps both ErrApplyCheck and the check's error, so errors.Is and errors.As
+// find either.
+//
+// The drain of the pending queue that ends the apply is judged on its own.
+// What a drain lands is what earlier updates parked, under client IDs no
+// peer has to prove are its own, and the sender whose update fills their gap
+// can neither see it nor send anything smaller, so a refusal of that update
+// would let one peer have every update that fills its gap refused. When the
+// drain lands a parked struct or a parked delete, check runs again on the
+// result, and an error there takes back the drain alone, as a drain past its
+// budget is taken back: the update stands and commits, with its observers,
+// and the apply returns an error wrapping ErrApplyCheckDrain and the check's
+// error, which is no RefusedUpdateError, so the caller can tell it from a
+// refusal of the update. The parked structs are parked again as the drain
+// found them, and the queue is tried again by each apply that brings a client
+// it waits on past the clock the take-back left (parkAgain): while check
+// refuses what that drain lands, every such apply stands and returns
+// ErrApplyCheckDrain again, and pays for one more drain and one more check.
+// An owner sees it there and as a pending queue that stops falling
+// (Doc.PendingStats).
+//
+// A check that panics refuses nothing: the apply, or its drain, is taken back
+// as for an error, and the panic then reaches the caller of the apply once
+// the transaction has committed and the lock is released, as a panic from
+// anything else under Transact does. An owner that wants a panic to be a
+// refusal recovers it in check.
+//
+// check runs under the document's write lock, which the apply holds, and the
+// methods that read a type's content (ToString, ToDelta, Get, ToSlice,
+// Entries, ToJSON and the like) take that lock: called in check, they
+// deadlock, as Transact and the document's Get accessors do. check reads
+// through the view, which takes no lock, reads only this document, fills no
+// cache of it and refuses every read once check has returned, and through
+// the reads that take no lock (Len, YXmlFragment.Children,
+// YXmlElement.GetAttribute); it reads the root types whose handles it
+// resolved before the apply. It cannot write: the view holds no transaction,
+// and every write takes the transaction it writes in.
+//
+// check receives the apply's origin, as the document's other apply
+// callbacks do, so an owner can pass updates it trusts, such as its own load
+// from storage, without measuring them. It is not called for an apply that
+// changed nothing (one whose structs the document already held, or that only
+// parked), for an apply refused before it reached the check, or for a local
+// transaction.
+//
+// Cost: check runs under the document's write lock once for each remote
+// apply that changes the document, after the update integrates and before
+// the commit, and once more for an apply whose drain lands parked content.
+// What it costs is added to each such apply, and every other reader and
+// writer of the document waits for it, so it must cost in proportion to the
+// change and not to the document - ApplyView.ChangedTypes names the types
+// the apply changed - or every keystroke pays for the whole document. To
+// decide whether to call it, the library reads the apply's delete set and
+// the clocks of the clients the apply added structs for, and for a drain
+// that found parked structs or parked deletes walks the store's clients and
+// sums the transaction's delete ranges; a drain that found neither is not
+// judged.
+//
+// A document with a check is a bounded document, as one with an apply budget
+// is: it applies every remote update whole or not at all, and refuses a
+// remote update carrying a subdocument or a move. Each apply reads the check
+// once as it begins, into the journal it keeps, so no apply runs a check
+// without the journal that takes back what the check refuses.
+func WithApplyCheck(check func(origin any, view *ApplyView) error) DocOption {
+	return func(d *Doc) { d.applyCheck = check }
+}
+
+// SetApplyCheck sets the check of WithApplyCheck on a document already made,
+// or with nil removes it, for an owner that loads trusted state first and
+// checks what arrives after it. It takes the document lock, so it waits for
+// an apply in flight, and the next apply reads the check it sets.
+func (d *Doc) SetApplyCheck(check func(origin any, view *ApplyView) error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.applyCheck = check
+}
+
 // updateSub pairs a unique subscription ID with its callback so that
 // unsubscribe closures can find and remove the right entry even when
 // callbacks are removed out-of-order.
@@ -737,8 +835,9 @@ type Doc struct {
 	maxIntegrateScan    int
 	integrateScanBudget func(origin any) int
 	// applyBudget is the budget of WithApplyBudget, allowedRoots the list of
-	// WithAllowedRoots, refusedContent the kinds of WithRefusedContent and
-	// applyReport the callback of WithApplyReport, each nil for none.
+	// WithAllowedRoots, refusedContent the kinds of WithRefusedContent,
+	// applyReport the callback of WithApplyReport and applyCheck the check
+	// of WithApplyCheck, each nil for none.
 	// applying is the running tally
 	// of the remote apply on this document, between beginRemoteApply and
 	// endRemoteApply and nil at every other time: the decode counts against
@@ -749,7 +848,15 @@ type Doc struct {
 	allowedRoots   func(origin any) []string
 	refusedContent func(origin any) []ContentKind
 	applyReport    func(origin any, report ApplyReport)
+	applyCheck     func(origin any, view *ApplyView) error
 	applying       *applyTally
+	// discardRefusedDrain is SetDiscardRefusedDrain's setting, and parkedBy
+	// and parkedDsBy, kept only while it is on, the origin of the apply that
+	// parked each struct and delete set the pending queue holds
+	// (recordParkedOrigins).
+	discardRefusedDrain bool
+	parkedBy            map[*Item]any
+	parkedDsBy          []parkedDeletesBy
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -905,21 +1012,22 @@ func (d *Doc) reattachSubdoc(item *Item, parent *Doc) {
 // scanBounded is whether d bounds what its remote updates may do, by a scan
 // bound (WithMaxIntegrateScan), a scan budget (WithIntegrateScanBudget), an
 // apply budget (WithApplyBudget), an allowed-roots list (WithAllowedRoots), a
-// set of refused content kinds (WithRefusedContent) or a report of what each
-// apply left it at (WithApplyReport), and so applies each whole or not at
-// all. Its caller holds d.mu.
+// set of refused content kinds (WithRefusedContent), a report of what each
+// apply left it at (WithApplyReport) or a check of what each apply left it
+// holding (WithApplyCheck), and so applies each whole or not at all. Its
+// caller holds d.mu.
 //
-// The budget, the list and the set are in it because their refusals are
-// rollbacks like the scan bound's: a document that refuses an apply keeps the
-// journal beginRemoteApply takes, and without it there would be nothing to
-// roll an apply back to and the refused update would stand, half integrated.
-// The report is in it because the journal is where the counts it carries are
-// kept (applyTally): a document that only watches is bounded like one that
-// refuses, which is what WithApplyReport says it is.
+// The budget, the list, the set and the check are in it because their
+// refusals are rollbacks like the scan bound's: a document that refuses an
+// apply keeps the journal beginRemoteApply takes, and without it there would
+// be nothing to roll an apply back to and the refused update would stand,
+// half integrated. The report is in it because the journal is where the
+// counts it carries are kept (applyTally): a document that only watches is
+// bounded like one that refuses, which is what WithApplyReport says it is.
 func (d *Doc) scanBounded() bool {
 	return d.integrateScanBudget != nil || d.maxIntegrateScan > 0 ||
 		d.applyBudget != nil || d.allowedRoots != nil || d.refusedContent != nil ||
-		d.applyReport != nil
+		d.applyReport != nil || d.applyCheck != nil
 }
 
 // applyScanLimit is the most items the conflict scans of a remote apply with
@@ -1396,11 +1504,14 @@ func collectAndEncodeLocked(d *Doc, txn *Transaction) (update []byte) {
 	}
 	logged := len(d.updateLogs) > 0 && (changed || parked != nil)
 	var encoded []byte
-	if (changed && len(d.onUpdate) > 0) || logged {
+	if (changed && (len(d.onUpdate) > 0 || txn.integrated != nil)) || logged {
 		encoded = encodeV1Locked(d, txn.beforeState, cloneDeleteSet(txn.deleteSet))
 		if changed {
 			update = encoded
 		}
+	}
+	if txn.integrated != nil {
+		*txn.integrated = update
 	}
 	if len(d.updateLogs) > 0 {
 		d.appendUpdateLogs(logged, encoded, parked, txn.Origin)
@@ -1408,6 +1519,7 @@ func collectAndEncodeLocked(d *Doc, txn *Transaction) (update []byte) {
 	if txn.landed != nil {
 		*txn.landed = encodeTxnV1Locked(txn)
 	}
+	recordParkedOrigins(d, txn)
 	return update
 }
 
@@ -1497,6 +1609,13 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 		}
 
 		phase2, update, cleanup, built := commitLocked(d, txn, r != nil)
+		// A panic in the document's apply check, kept while the apply or its
+		// drain was taken back, so that the transaction commits whole before
+		// the panic goes on: it is re-raised after the unlock, like a panic in
+		// fn (WithApplyCheck).
+		if checked := checkPanicOf(txn); checked != nil && r == nil {
+			r = checked
+		}
 		// The report of a remote apply that committed, after the commit's own
 		// work and under the lock the apply held, so the structs it reports are
 		// the ones the document is left holding and a panicking callback cannot
@@ -1823,6 +1942,24 @@ func (d *Doc) StructCount() int {
 	return d.store.Count()
 }
 
+// ClientCount returns how many clients the document holds structs from: every
+// client with an item in the document, whether deleted or garbage-collected
+// since, so a client counts from the first of its writes that integrates here
+// and stays counted. It is the number of clients StateVector returns.
+//
+// A client that has only deleted is not counted, nor is a client whose every
+// struct is parked until a missing dependency arrives (PendingStats reports
+// them), and a subdocument's clients are counted by its own Doc.
+//
+// ClientCount allocates nothing and takes the same time however many clients
+// the document holds. It takes the document's read lock, and so must not be
+// called inside a Transact callback (see Transact and GetText).
+func (d *Doc) ClientCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.store.clients)
+}
+
 // EncodeStateAsUpdate encodes the full document state as a V1 binary update.
 func (d *Doc) EncodeStateAsUpdate() []byte {
 	return EncodeStateAsUpdateV1(d, nil)
@@ -1914,7 +2051,11 @@ type PendingStats struct {
 // PendingStats returns a snapshot of the pending-queue state. Cheap; takes
 // a read lock and copies a few values. Intended for operational monitoring
 // of out-of-order delta convergence; see v1.2.0 release notes for the
-// pending-structs machinery this exposes.
+// pending-structs machinery this exposes. It counts what the document holds
+// parked in memory whether or not its encoded state carries it: under
+// SetParkedOutOfState none of it is in the state, so a caller weighing the
+// encoded state reads StructCount or ApplyReport.StateBytes, and one weighing
+// what the document holds adds this.
 func (d *Doc) PendingStats() PendingStats {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

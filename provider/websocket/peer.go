@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -43,7 +44,7 @@ type peer struct {
 	// resync once the queue drains, so the peer converges without a reconnect.
 	needsResync       bool
 	queueClosed       bool          // set under wmu when the frame cap or byte budget closes the peer; later frames are dropped unlogged
-	closeCode         int           // #104: WS close code queued via enqueueClose (0 = none)
+	closeCode         int           // #104: WS close code queued via enqueueClose or sent for a cancel cause (0 = none); see closingLocked
 	closeReason       string        // #104: WS close reason accompanying closeCode
 	limiter           *rate.Limiter // per-peer inbound-message rate limiter; nil = unlimited (#51)
 	readOnly          bool          // sync updates and awareness do not change the room; awareness gets an empty response
@@ -52,6 +53,12 @@ type peer struct {
 	// ctx is the request context ServeHTTP served this connection on, which
 	// Server.OnTokenAuthContext receives.
 	ctx context.Context
+	// answers is what the peer is owed under Server.AnswerOnceStored, in the
+	// order its frames arrived, and storeWait is the store wait of the apply
+	// in hand, which the room's persistence observer takes for that apply's
+	// commit (armStoreWait).
+	answers   peerAnswers
+	storeWait *storeWait
 
 	// disconnectOnce runs handleDisconnect's teardown once when callers race,
 	// such as closeConn() waking the read loop during a ctx-cancel teardown.
@@ -243,9 +250,11 @@ func (p *peer) handleMessage(data []byte) {
 // content) that a peer sent under Sync (tag 0) or SyncReply (tag 4): it applies
 // the update to the room, through Server.OnPeerUpdate when one is set, and
 // broadcasts payload to the room's other peers once the room has applied it,
-// unless the room already held all of it. A read-only peer's update is neither
-// applied nor broadcast (#59). An update the hook refused is not broadcast, and
-// the peer is then closed (see PeerUpdateHook).
+// unless the room already held all of it. With Server.RelayIntegratedOnly it
+// broadcasts what the apply integrated instead (crdt.ApplyOutcome.Integrated),
+// when it integrated anything. A read-only peer's update is neither applied
+// nor broadcast (#59). An update the hook refused is not broadcast, and the
+// peer is then closed (see PeerUpdateHook).
 //
 // On a connection using Hocuspocus framing it answers every such frame with
 // exactly one SyncStatus (tag 8), in the order the frames arrived, so a client
@@ -260,39 +269,97 @@ func (p *peer) handleMessage(data []byte) {
 // does not. Whatever part of such an update did integrate is still broadcast,
 // on either framing. (2) A read-only peer's SyncStep2 whose update does not
 // decode is answered 0, where @hocuspocus/server closes with 4403, which would
-// stop @hocuspocus/provider from reconnecting. A sync message whose own framing
-// does not decode never reaches here: see discardMalformedSync.
+// stop @hocuspocus/provider from reconnecting. With
+// Server.AnswerParkedNotApplied, an applied update the room left part of
+// parked is answered 0 too (crdt.ApplyOutcome.Parked). A sync message whose
+// own framing does not decode never reaches here: see discardMalformedSync.
+//
+// Under Server.AnswerOnceStored the answer to a frame whose apply changed the
+// room waits until the room's persistence has stored that commit, and is 0
+// when it was not stored; the relay does not wait. The answers still go out
+// in the order the frames arrived, a read-only peer's included (a peer an
+// in-band Auth made read-only can still be owed answers), and the close of a
+// peer whose update the hook refused goes out after them (resolveAnswer).
 func (p *peer) applySyncUpdate(subType int, update, payload []byte) {
 	if p.readOnly {
 		if p.hocuspocusFraming {
-			p.sendSyncStatus(subType == ygsync.MsgSyncStep2 && p.roomHolds(update))
+			held := subType == ygsync.MsgSyncStep2 && p.roomHolds(update)
+			if p.server.answersOnceStored() {
+				p.resolveAnswer(p.reserveAnswer(), held, nil)
+			} else {
+				p.sendSyncStatus(held)
+			}
 		}
 		return
 	}
-	applied, held, closeWith := p.applyPeerUpdate(update)
-	if !applied {
-		p.sendSyncStatus(false)
+	var answer *peerAnswer
+	if p.server.answersOnceStored() {
+		answer = p.reserveAnswer()
+		p.storeWait = &storeWait{}
+	}
+	applied, out, closeWith := p.applyPeerUpdate(update)
+	wait := p.storeWait
+	p.storeWait = nil
+	if applied {
+		switch {
+		case p.server.RelayIntegratedOnly:
+			if out.Integrated != nil {
+				p.broadcastSync(ygsync.EncodeUpdate(out.Integrated))
+			}
+		case !out.Held:
+			p.broadcastSync(payload)
+		}
+	}
+	ok := applied && (!p.server.AnswerParkedNotApplied || !out.Parked)
+	if answer == nil {
+		p.sendSyncStatus(ok)
 		if closeWith != nil {
 			p.enqueueClose(closeWith.Code, closeWith.Reason)
 		}
 		return
 	}
-	if !held {
-		p.broadcastSync(payload)
+	if closeWith != nil {
+		// Nothing more from the connection lands, though the close itself
+		// waits for the answers before it.
+		p.inputClosed.Store(true)
 	}
-	p.sendSyncStatus(true)
+	if wait.taken {
+		wait.whenStored(func(stored bool) { p.resolveAnswer(answer, ok && stored, closeWith) })
+		return
+	}
+	p.resolveAnswer(answer, ok, closeWith)
 }
 
-// applyToRoom applies update to the room's document and reports whether the
-// room already held all of it. When the apply fails after part of the update
+// applyToRoom applies update to the room's document and reports what the
+// apply did with it: whether the room already held all of it, and, under
+// Server.RelayIntegratedOnly or Server.AnswerParkedNotApplied, what the
+// commit integrated and whether part of the update parked
+// (crdt.ApplyUpdateV1Outcome). When the apply fails after part of the update
 // integrated or parked, it broadcasts that part, and only that part, to the
-// room's other peers, so they hold what the room holds.
-func (p *peer) applyToRoom(update []byte) (bool, error) {
-	landed, held, err := crdt.ApplyUpdateV1Held(p.room.doc, update, p)
-	if err != nil && landed != nil {
-		p.broadcastSync(ygsync.EncodeUpdate(landed))
+// room's other peers, so they hold what the room holds; under
+// RelayIntegratedOnly only what integrated, as the room's other peers are
+// sent nothing that parked. An update whose drain alone was refused stood
+// whole (updateStood), and its caller relays it as an applied one.
+func (p *peer) applyToRoom(update []byte) (crdt.ApplyOutcome, error) {
+	var (
+		out crdt.ApplyOutcome
+		err error
+	)
+	if p.server.RelayIntegratedOnly || p.server.AnswerParkedNotApplied {
+		out, err = crdt.ApplyUpdateV1Outcome(p.room.doc, update, p)
+	} else {
+		out.Landed, out.Held, err = crdt.ApplyUpdateV1Held(p.room.doc, update, p)
 	}
-	return held, err
+	if !updateStood(err) {
+		relay := out.Landed
+		if p.server.RelayIntegratedOnly {
+			relay = out.Integrated
+		}
+		if relay != nil {
+			p.broadcastSync(ygsync.EncodeUpdate(relay))
+		}
+	}
+	return out, err
 }
 
 // roomHolds reports whether the room's document already holds everything the
@@ -459,25 +526,101 @@ func (p *peer) enqueueClose(code int, reason string) {
 		select {
 		case p.writeCh <- nil:
 		default:
-			// Queue full: best-effort direct close (ordering already at risk).
+			// Queue full: the close frame goes out now, ahead of the queued
+			// frames, which are never written after it (see writeToConn),
+			// and the closing handshake still runs.
 			p.sendCloseFrame()
 		}
 	}()
 }
 
-// sendCloseFrame writes the queued WS close control frame then closes the
-// connection. Called only from the writer goroutine (via runWriter) or the
+// closeHandshakeTimeout is how long a peer that has been sent a close frame
+// has to answer with its own before the server closes the connection anyway.
+// Writing the close frame returns once it is in the socket's send buffer, so a
+// peer that is slow to read, such as a browser applying a large state, first
+// reads everything queued ahead of it in the buffers at both ends; a peer that
+// is closed before it answers, and sends anything meanwhile, loses the frame
+// to the reset that follows. Until the read loop ends, the peer keeps its
+// connection and its place in its room, so one that never answers must not
+// keep them long. Five seconds leaves a slow reader time to reach the frame,
+// and holds a peer that never answers for half of what one write may take by
+// default (defaultPeerWriteTimeout).
+const closeHandshakeTimeout = 5 * time.Second
+
+// sendCloseFrame writes the queued WS close control frame and leaves the
+// connection to the closing handshake (RFC 6455, section 1.4): the read loop,
+// which drops input from enqueueClose on, reads until the peer's close frame
+// arrives or closeHandshakeTimeout passes, and its teardown then closes the
+// connection. Closing right after the frame lost it whenever the peer had sent
+// frames the server had not read: a socket closed with input unread, or that
+// input reaches after the close, is reset, and the reset discards what the
+// peer had not yet received, the close frame among it. A close frame already
+// sent for a cancel cause (closeForCause) begins the same handshake. With no
+// close frame to send, or one that cannot be written, the connection is closed
+// at once. Called only from the writer goroutine (via runWriter) or the
 // enqueueClose full-queue fallback.
 func (p *peer) sendCloseFrame() {
 	p.wmu.Lock()
 	code, reason := p.closeCode, p.closeReason
 	p.wmu.Unlock()
-	if code != 0 {
-		_ = p.conn.WriteControl(gws.CloseMessage,
-			gws.FormatCloseMessage(code, reason),
-			time.Now().Add(p.server.peerWriteTimeout()))
+	if code == 0 {
+		_ = p.conn.Close()
+		return
 	}
-	_ = p.conn.Close()
+	err := p.conn.WriteControl(gws.CloseMessage,
+		gws.FormatCloseMessage(code, reason),
+		time.Now().Add(p.server.peerWriteTimeout()))
+	if err == nil || errors.Is(err, gws.ErrCloseSent) {
+		err = p.conn.SetReadDeadline(time.Now().Add(closeHandshakeTimeout))
+	}
+	if err != nil {
+		_ = p.conn.Close()
+	}
+}
+
+// closeForCause sends the peer the close frame for a cancel cause (see
+// Server.ServeHTTP) and waits out the closing handshake, as sendCloseFrame
+// leaves its close to it: until the read loop ends on the peer's close frame,
+// closeHandshakeTimeout passes, or the server shuts down. The caller closes the
+// connection then. It runs on the connection's own context-watcher goroutine,
+// so the wait holds up no caller. The frame goes out at once, ahead of the
+// queued frames, which are never written after it (see writeToConn), and
+// nothing is queued for the peer from here on (see closingLocked). The read
+// loop drops the peer's input from here on too, since WriteControl can wait on
+// a writer stuck on a peer that has stopped reading. A frame that cannot be
+// written within closeFrameTimeout ends the wait at once. The wait is a timer,
+// not sendCloseFrame's read deadline, because this runs beside the read loop,
+// which clears its read deadline on a peer's first frame.
+func (p *peer) closeForCause(code int, reason string) {
+	p.inputClosed.Store(true)
+	p.wmu.Lock()
+	if p.closeCode == 0 {
+		p.closeCode, p.closeReason = code, reason
+	}
+	p.wmu.Unlock()
+	err := p.conn.WriteControl(gws.CloseMessage,
+		gws.FormatCloseMessage(code, reason),
+		time.Now().Add(closeFrameTimeout))
+	if err != nil && !errors.Is(err, gws.ErrCloseSent) {
+		return
+	}
+	timer := time.NewTimer(closeHandshakeTimeout)
+	defer timer.Stop()
+	select {
+	case <-p.done:
+	case <-p.server.shutdownCh:
+	case <-timer.C:
+	}
+}
+
+// closingLocked reports, with wmu held, whether a close frame is queued for the
+// peer or has been sent to it. No data frame is queued for a closing peer: each
+// enqueue site asks this first, so nothing is queued to be dropped later. RFC
+// 6455 (section 5.5.1) lets an endpoint send no data frame after its Close
+// frame, and frames queued during the closing handshake would fill the queue
+// and close the connection as a slow peer's before the peer had answered.
+func (p *peer) closingLocked() bool {
+	return p.closeCode != 0
 }
 
 // applyAwareness applies an awareness frame from this peer, recording which
@@ -903,9 +1046,10 @@ func (p *peer) broadcast(data []byte, excludeSelf bool) {
 	for _, other := range targets {
 		// Guard against sending to a closed channel: check p.closed under
 		// wmu before attempting the channel send. handleDisconnect sets closed
-		// under wmu before closing writeCh, so this is race-free.
+		// under wmu before closing writeCh, so this is race-free. A closing
+		// peer is skipped too (closingLocked).
 		other.wmu.Lock()
-		if other.closed || other.queueClosed {
+		if other.closed || other.queueClosed || other.closingLocked() {
 			other.wmu.Unlock()
 			continue
 		}
@@ -933,10 +1077,11 @@ func (p *peer) broadcast(data []byte, excludeSelf bool) {
 
 // write enqueues a raw binary message for delivery to this peer via the
 // per-peer writer goroutine. H2: skips the write if the peer has already
-// been marked closed. If the queue is full the peer is disconnected:
-// a dropped handshake reply (sendSync / sendAwareness) leaves the remote
-// peer hung waiting for a response it will never receive. Closing the
-// connection forces a reconnect-and-resync, matching the broadcast contract.
+// been marked closed, or is closing (closingLocked). If the queue is
+// full the peer is disconnected: a dropped handshake reply (sendSync /
+// sendAwareness) leaves the remote peer hung waiting for a response it will
+// never receive. Closing the connection forces a reconnect-and-resync,
+// matching the broadcast contract.
 // A frame over Server.PeerWriteQueueBytes closes it too (see enqueueLocked).
 func (p *peer) write(data []byte) {
 	p.wmu.Lock()
@@ -947,7 +1092,7 @@ func (p *peer) write(data []byte) {
 // writeLocked is write with wmu held, leaving handshake frames outside the
 // byte budget.
 func (p *peer) writeLocked(data []byte, handshake bool) {
-	if p.closed || p.queueClosed {
+	if p.closed || p.queueClosed || p.closingLocked() {
 		return
 	}
 	if full := p.enqueueLocked(data, "direct send", handshake); full {
@@ -1022,7 +1167,9 @@ func (p *peer) runWriter() {
 // when the writer goroutine should exit.
 //
 // A failed write closes the connection with closeConn, because gorilla's read
-// side outlives a write timeout and would keep the peer in its room.
+// side outlives a write timeout and would keep the peer in its room. A write
+// refused because a close frame went out first does not: that close's
+// handshake ends the connection.
 func (p *peer) writeToConn(data []byte) bool {
 	p.wmu.Lock()
 	closed := p.closed
@@ -1042,6 +1189,19 @@ func (p *peer) writeToConn(data []byte) bool {
 		return false
 	}
 	if err := p.conn.WriteMessage(gws.BinaryMessage, data); err != nil {
+		if errors.Is(err, gws.ErrCloseSent) {
+			// The close frame went out ahead of this frame, from enqueueClose's
+			// full-queue fallback or for a cancel cause (closeForCause), and
+			// gorilla writes nothing after it. Closing the connection here
+			// would lose that frame to a reset (see sendCloseFrame). What is
+			// still queued is dropped now rather than held until the handshake
+			// ends; a closing peer is queued nothing more (closingLocked), and
+			// handleDisconnect closes writeCh, which ends this loop.
+			p.server.log().Debug("close frame sent ahead of queued frames; dropping them", "room", p.roomName)
+			for range p.writeCh {
+			}
+			return false
+		}
 		// A write that fails after the server closed the connection is expected.
 		lg := p.server.log()
 		logf := lg.Warn

@@ -83,6 +83,10 @@ type Transaction struct {
 	// landed, when set, receives ApplyUpdateV1Landed's update of what this
 	// failed apply integrated, encoded after the GC as OnUpdate's update is.
 	landed *[]byte
+	// integrated, when set, receives ApplyUpdateV1Outcome's copy of the
+	// commit's own update, the slice OnUpdate observers are handed, when the
+	// commit changed the document (collectAndEncodeLocked).
+	integrated *[]byte
 	// deletedFormats holds, per client and sorted, the clocks of the format
 	// markers this remote transaction deleted, recorded for the format
 	// cleanup before the GC.
@@ -137,6 +141,23 @@ func (t *Transaction) changesDoc() bool {
 		return true
 	}
 	for client := range t.doc.store.clients {
+		if t.doc.store.NextClock(client) != t.beforeState.Clock(client) {
+			return true
+		}
+	}
+	return false
+}
+
+// changesDocAmong is changesDoc for a transaction that knows the clients it
+// can have added structs for: it reads only their clocks, so it costs what
+// the transaction touched and not the store's client count. clients may name
+// a client twice, or one whose structs only parked; it must name every client
+// the transaction added a struct for, or the answer is changesDoc's no longer.
+func (t *Transaction) changesDocAmong(clients []ClientID) bool {
+	if len(t.deleteSet.clients) > 0 {
+		return true
+	}
+	for _, client := range clients {
 		if t.doc.store.NextClock(client) != t.beforeState.Clock(client) {
 			return true
 		}
@@ -813,6 +834,22 @@ type boundedApplyState struct {
 	// (noteApplyReport, reportApply).
 	report    ApplyReport
 	reportDue bool
+	// drainRefused is the apply's error when the document's apply check
+	// refused what the drain landed and the drain was taken back while the
+	// update stands, and checkPanic is what the check panicked with, raised
+	// to the caller once the transaction has committed (checkDrain,
+	// runCheck).
+	drainRefused error
+	checkPanic   any
+	// drainTakenBack is whether a drain taken back on a document that
+	// discards refused drains discarded what its fill released
+	// (discardReleased), and the rest are what it discarded, what its scans
+	// passed and the origins that parked what it discarded, which the apply
+	// returns as a DrainDiscardedError (endRemoteApply).
+	drainTakenBack                    bool
+	discardedStructs, discardedRanges int
+	drainScanned                      int
+	discardedSenders                  []any
 }
 
 // beginBoundedApply returns txn's bounded apply state, made on first use.
