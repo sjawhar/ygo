@@ -814,7 +814,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		return err
 	}
 
-	return nil
+	// The document's apply check judges what the update left, before the
+	// drain, as in the V1 apply (checkApply).
+	return checkApply(txn)
 }
 
 func decodeItemV2(dec *v2Decoder, doc *Doc, client ClientID, clock uint64, info byte) (*Item, uint64, error) {

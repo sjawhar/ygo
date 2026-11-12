@@ -254,6 +254,28 @@ func chainedList(t testing.TB, l int, opts ...DocOption) *Doc {
 	return a
 }
 
+// listLen is l, or a fifth of it under the race detector, for a chainedList
+// whose tests count scans against its own length: each item chainedList types
+// encodes the whole document, so the list costs about the square of its
+// length to build.
+func listLen(l int) int {
+	if raceEnabled {
+		return l / 5
+	}
+	return l
+}
+
+// pastTheBound is a scan bound, and the length of a chainedList and the items
+// of an originAtTheStart update against it whose scans pass the bound:
+// testScanBound, 5,000 and 500, or under the race detector, which makes each
+// scan several times slower, an eighth of testScanBound, 500 and 300.
+func pastTheBound() (bound, l, n int) {
+	if raceEnabled {
+		return testScanBound / 8, 500, 300
+	}
+	return testScanBound, 5_000, 500
+}
+
 // originAtTheStart is an update of n one-character items from client 9, each
 // naming the first item of chainedList's text as its left origin and no right
 // origin. YATA places such an item by scanning right from its origin past every
@@ -309,8 +331,8 @@ func requireUnchanged(t *testing.T, doc *Doc, before []byte, text string, update
 // was and tells no observer: the items that integrated before the bound was
 // reached are taken out again.
 func TestARemoteUpdatesConflictScansAreBounded(t *testing.T) {
-	const l, n = 5_000, 500
-	doc := chainedList(t, l, WithMaxIntegrateScan(testScanBound))
+	bound, l, n := pastTheBound()
+	doc := chainedList(t, l, WithMaxIntegrateScan(bound))
 	before, text := EncodeStateAsUpdateV1(doc, nil), doc.GetText("t").ToString()
 	updates := observed(doc)
 	allocated, took, err := applyMeasured(doc, originAtTheStart(n))
@@ -341,10 +363,11 @@ func TestARemoteUpdatesConflictScansAreBounded(t *testing.T) {
 // A document with a scan bound applies every remote update whole or not at all:
 // an update it refuses partway, for its scans or for bytes that do not decode
 // after structs that did, a deletion among them, leaves the document as it
-// was, so it goes on converging with a peer that never saw the update.
+// was, so it goes on converging with a peer that never saw the update. Under
+// the race detector it runs a fifth of the rounds, half of each kind.
 func TestABoundedDocumentRollsBackAnUpdateItRefusesPartway(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 179))
-	for round := range 40 {
+	for round := range raceSeeds(40) {
 		doc := New(WithClientID(1), WithMaxIntegrateScan(4_000))
 		twin := New(WithClientID(2))
 		text, twinText := doc.GetText("t"), twin.GetText("t")
@@ -498,8 +521,8 @@ func TestABoundedDocumentRefusesASubdocumentFromARemoteUpdate(t *testing.T) {
 
 // The V2 form of a refused update is refused the same way.
 func TestABoundedDocumentRefusesAV2UpdateWhoseScansPassTheBound(t *testing.T) {
-	const l, n = 5_000, 500
-	doc := chainedList(t, l, WithMaxIntegrateScan(testScanBound))
+	bound, l, n := pastTheBound()
+	doc := chainedList(t, l, WithMaxIntegrateScan(bound))
 	before, text := EncodeStateAsUpdateV1(doc, nil), doc.GetText("t").ToString()
 	updates := observed(doc)
 	v2, err := UpdateV1ToV2(originAtTheStart(n))
@@ -550,8 +573,8 @@ func fillTheGap(last *Item) []byte {
 // it is taken back and the items parked again as they were, while the filling
 // update applies.
 func TestAnUpdateThatFillsAGapIsNotChargedWhatWasParkedBehindIt(t *testing.T) {
-	const l, n = 5_000, 500
-	doc := chainedList(t, l, WithMaxIntegrateScan(testScanBound))
+	bound, l, n := pastTheBound()
+	doc := chainedList(t, l, WithMaxIntegrateScan(bound))
 	twin := chainedList(t, l)
 	text := doc.GetText("t")
 	if err := ApplyUpdateV1(doc, parkedBehindAGap(n), nil); err != nil {
@@ -587,7 +610,8 @@ func TestAnUpdateThatFillsAGapIsNotChargedWhatWasParkedBehindIt(t *testing.T) {
 // they leave loads into a document with no bound, after which a bound can be
 // set for what arrives next.
 func TestABoundedDocumentsStateLoadsWhereverItsHistoryPassesTheBound(t *testing.T) {
-	const l, n = 2_000, 300
+	const n = 300
+	l := listLen(2_000)
 	doc := chainedList(t, l, WithMaxIntegrateScan(400*l))
 	for range 2 {
 		before := doc.StateVector().Clock(9)
@@ -678,7 +702,8 @@ func TestConcurrentInsertsAtOnePositionStillConverge(t *testing.T) {
 // A document has no scan bound unless it is given one, and lifted, a bounded
 // document takes the same update in full; a local transaction is never bounded.
 func TestTheConflictScanBoundIsSetOnlyWhereAsked(t *testing.T) {
-	const l, n = 2_000, 200
+	const n = 200
+	l := listLen(2_000)
 	for _, doc := range []*Doc{chainedList(t, l), chainedList(t, l, WithMaxIntegrateScan(-1))} {
 		if err := ApplyUpdateV1(doc, originAtTheStart(n), nil); err != nil {
 			t.Fatal(err)
@@ -737,9 +762,14 @@ func typedInto(t *testing.T, state []byte) []byte {
 // pending deletes again: with 100,000 parked items the keystroke allocated
 // 806,264 bytes on the bounded document against 1,608 on the unbounded one,
 // and with 100,000 parked delete ranges 4,821,112 against 1,607,624 (the
-// unbounded drain's own retry of the pending deletes).
+// unbounded drain's own retry of the pending deletes). Under the race detector
+// 20,000 are parked, whose copies would still pass the 64 KiB the check allows.
 func TestABoundedDocumentsApplyCostsNothingForWhatIsParked(t *testing.T) {
-	const l, n = 100, 100_000
+	const l = 100
+	n := 100_000
+	if raceEnabled {
+		n = 20_000
+	}
 	state := EncodeStateAsUpdateV1(chainedList(t, l), nil)
 	keystroke := typedInto(t, state)
 	for _, parked := range []struct {
