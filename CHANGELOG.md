@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the one in-flight caller discounted is that `Apply`. It returns
   `ErrRoomNotFound` when the name holds a different instance by then, and
   `ErrNotInApply` when nobody is inside the room at all.
+- **`provider/websocket`: `Server.PeerWriteTimeout`** is the deadline on one
+  write to a peer, in the shape of `PeerWriteQueueBytes`. Unset keeps the
+  existing 10-second default, so no deployment's behaviour moves; an embedder
+  with its own slow-peer bound can set a longer one so a reader draining a
+  backlog inside that bound is not dropped by the package default.
 
 ### Fixed
 

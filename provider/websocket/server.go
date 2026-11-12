@@ -47,10 +47,11 @@ func (s *Server) safeHook(name string, fn func()) {
 	fn()
 }
 
-// writeTimeout is applied to every individual WebSocket write. A peer that
-// stops reading will be detected and disconnected within this window, preventing
-// a slow-reader from blocking the broadcast loop for all other peers.
-const writeTimeout = 10 * time.Second
+// defaultPeerWriteTimeout is the deadline on one WebSocket write when
+// Server.PeerWriteTimeout is not set. A peer that stops reading is detected
+// and disconnected within this window, so a slow reader cannot block the
+// broadcast loop for every other peer.
+const defaultPeerWriteTimeout = 10 * time.Second
 
 // closeFrameTimeout bounds the close frame sent for a cancel cause. A peer that
 // cannot take a control frame this quickly is not reading anyway.
@@ -180,6 +181,14 @@ func (s *Server) peerWriteQueueSize() int {
 		return s.PeerWriteQueueSize
 	}
 	return defaultPeerWriteQueueSize
+}
+
+// peerWriteTimeout returns the configured per-write deadline or the default.
+func (s *Server) peerWriteTimeout() time.Duration {
+	if s.PeerWriteTimeout > 0 {
+		return s.PeerWriteTimeout
+	}
+	return defaultPeerWriteTimeout
 }
 
 // SlowPeerPolicy selects how the server reacts when a peer's broadcast write
@@ -1110,6 +1119,28 @@ type Server struct {
 	// alone lets one peer pin many full-state frames; zero or negative
 	// disables it.
 	PeerWriteQueueBytes int64
+
+	// PeerWriteTimeout is the deadline on one write to a peer: each frame
+	// the writer goroutine takes off the queue (writeToConn) and the close
+	// frame a disconnect sends (sendCloseFrame). A write that passes it
+	// closes the connection, which the reader sees as 1006, with no close
+	// frame to say why. Zero (the default) uses 10 s, the deadline this
+	// server used before the field existed.
+	//
+	// It is a field because how slow a reader may be is the embedder's to
+	// say, and this package's constant disagrees with the embedder's own
+	// bound: a reader on a slow link draining a backlog well inside
+	// PeerWriteQueueBytes is making the progress that bound asks for, and
+	// the deadline drops it anyway. Measured on a real deployment, a reader
+	// taking one frame every 250 ms, holding 1.5 MB of a 70 MiB budget,
+	// was dropped as 1006 while the server was keeping it fed. An
+	// embedder that bounds what one peer may hold in bytes sets this to
+	// the time that bound allows it.
+	//
+	// Like the other config fields, set it before serving; it is read
+	// without synchronisation, on each write, and must not be mutated
+	// while the server is handling connections.
+	PeerWriteTimeout time.Duration
 
 	// SlowPeerPolicy selects the reaction when a peer's broadcast write queue
 	// overflows: SlowPeerDisconnect (default) closes the connection; SlowPeerResync

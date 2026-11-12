@@ -101,6 +101,14 @@ changes.
   and a caller that closed a room from inside its own `Apply` switches that
   call to `CloseRoomWithin`, passing the callback's `doc`.
 
+- **`Server.PeerWriteTimeout` sets the deadline on one write to a peer.** It
+  was a fixed 10 seconds, and it still is when the field is unset. A reader
+  on a slow link draining a backlog well inside `PeerWriteQueueBytes` makes
+  the progress that bound asks for and was dropped anyway: a reader taking
+  one frame every 250 ms while holding 1.5 MB of a 70 MiB budget closed as
+  1006. An embedder that bounds what one peer may hold in bytes sets this to
+  the time that bound allows it.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single
