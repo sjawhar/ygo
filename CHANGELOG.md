@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1] — 2026-11-12
+
+### Fixed
+
+- **`encoding`: a Go integer is written as lib0 writes the same Number.**
+  `WriteAny` wrote an integer outside int32 within float64's safe range as
+  tag 123 and a float64, 9 bytes, where lib0's `writeAny` writes one a
+  float32 holds exactly, such as 2^31, 2^40 or 2^53, as tag 124 and a
+  float32, 5 bytes; and it wrote -2^31 as tag 125, where lib0, which tests
+  the magnitude against 2^31-1, writes tag 124. Both now match lib0 0.2.119
+  byte for byte, and so does a `uint64` above `math.MaxInt64`, which takes the
+  same float dispatch. An integer past ±2^53 is still tag 122 (BigInt). A
+  value written as tag 124 reads back from `ReadAny` as a `float32` rather
+  than a `float64` (or, for -2^31, an `int64`), which is what ygo already
+  read back for the same value from a JavaScript peer.
+
 ## [1.55.0] — 2026-10-31
 
 ### Added
