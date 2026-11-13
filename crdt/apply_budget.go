@@ -95,6 +95,10 @@ type applyTally struct {
 	// draining is set while the drain of the parked queue runs: its structs
 	// are not the update's, so they are not counted against Structs or Bytes.
 	draining bool
+	// rootDrops is the client of each parked struct the drain dropped under a
+	// root the list does not allow, which another apply sent; the document
+	// counts them as the apply ends (PendingStats.RootsDropped).
+	rootDrops []ClientID
 	// decoded, structs, bytes and split are RefusedUpdateError's counts, and
 	// root its Root.
 	decoded, structs, bytes, split int
@@ -144,13 +148,24 @@ func beginApplyTally(txn *Transaction) {
 }
 
 // endApplyTally ends txn's tally and returns err, the apply's error, as a
-// RefusedUpdateError carrying the counts when the apply failed.
+// RefusedUpdateError carrying the counts when the apply failed. It counts the
+// parked structs the drain dropped, unless a whole-or-nothing document took
+// the apply back.
 func endApplyTally(txn *Transaction, err error) error {
-	t := txn.doc.counting
+	d := txn.doc
+	t := d.counting
 	if t == nil {
 		return err
 	}
-	txn.doc.counting = nil
+	d.counting = nil
+	if len(t.rootDrops) > 0 && (err == nil || !d.wholeOrNothing) {
+		if d.rootsDropped == nil {
+			d.rootsDropped = make(map[ClientID]int)
+		}
+		for _, client := range t.rootDrops {
+			d.rootsDropped[client]++
+		}
+	}
 	if err == nil {
 		return nil
 	}
@@ -206,40 +221,56 @@ func (t *applyTally) nestedAll(vals []any) {
 
 // noteIntegrated checks item, a struct about to enter txn's document, before
 // it does: it refuses the apply when item would hang under a root the list
-// does not allow (checkItemRoot), and when the update's own structs or bytes
-// would pass the budget with it, and otherwise counts it. A struct the drain
-// of the parked queue adds is checked against the list but not counted: the
-// update that parked it was charged for it (noteParked).
+// does not allow (checkItemRoot), or, parked, under one the list of the apply
+// that sent it does not allow (checkParkedRoot), and when the update's own
+// structs or bytes would pass the budget with it, and otherwise counts it. A
+// struct the drain of the parked queue adds is checked against the lists but
+// not counted: the update that parked it was charged for it (noteParked).
 func noteIntegrated(txn *Transaction, item *Item) {
-	checkParkedRoot(txn.doc, item)
-	t := txn.doc.tally()
+	d := txn.doc
+	checkParkedRoot(d, item)
+	t := d.tally()
 	if t == nil {
 		return
 	}
-	t.checkItemRoot(txn.doc, item.Parent)
+	t.checkItemRoot(d, item.Parent)
 	if !t.draining {
 		t.count(item)
 	}
 }
 
+// parkedFrom is what the document keeps of the apply that parked a struct:
+// its origin, and its roots list when the struct's parent was not known yet.
+// The document keeps it until nothing is parked, so a drain a whole-or-nothing
+// document takes back finds it again.
+type parkedFrom struct {
+	origin any
+	roots  []string
+}
+
 // noteParkedRoot checks item, a struct of the update about to park, against
 // the apply's roots: one whose parent is known is refused when it hangs under
-// a root the list does not allow, and one whose parent is not known yet keeps
-// the list, for the drain that integrates it (checkParkedRoot).
+// a root the list does not allow. The document keeps the apply's origin for
+// the struct, and its list when the parent is not known yet, for the drain
+// that integrates it (checkParkedRoot, dropOutsideRoots).
 func noteParkedRoot(txn *Transaction, item *Item) {
 	t := txn.doc.tally()
-	if t == nil || len(t.roots) == 0 || isGCStruct(item) {
+	if t == nil || isGCStruct(item) {
 		return
 	}
-	if item.Parent != nil {
-		t.checkItemRoot(txn.doc, item.Parent)
-		return
+	from := parkedFrom{origin: txn.Origin}
+	if len(t.roots) > 0 {
+		if item.Parent != nil {
+			t.checkItemRoot(txn.doc, item.Parent)
+		} else {
+			from.roots = t.roots
+		}
 	}
 	d := txn.doc
-	if d.parkedRoots == nil {
-		d.parkedRoots = make(map[*Item][]string)
+	if d.parkedBy == nil {
+		d.parkedBy = make(map[*Item]parkedFrom)
 	}
-	d.parkedRoots[item] = t.roots
+	d.parkedBy[item] = from
 }
 
 // checkParkedRoot refuses the apply integrating item, a parked struct whose
@@ -247,12 +278,8 @@ func noteParkedRoot(txn *Transaction, item *Item) {
 // not in the list of the apply that parked it, so a parked write stays inside
 // its own sender's roots whoever fills its gap.
 func checkParkedRoot(d *Doc, item *Item) {
-	roots, parked := d.parkedRoots[item]
-	if !parked {
-		return
-	}
-	delete(d.parkedRoots, item)
-	if item.Parent == nil {
+	from, parked := d.parkedBy[item]
+	if !parked || len(from.roots) == 0 || item.Parent == nil {
 		return
 	}
 	root := item.Parent
@@ -260,13 +287,43 @@ func checkParkedRoot(d *Doc, item *Item) {
 		root = root.item.Parent
 	}
 	name, isRoot := rootName(d, root)
-	if isRoot && slices.Contains(roots, name) {
+	if isRoot && slices.Contains(from.roots, name) {
 		return
 	}
 	if t := d.tally(); t != nil {
 		t.root = name
 	}
 	panic(rootNotAllowed{})
+}
+
+// dropOutsideRoots reports whether item, a parked struct the drain of txn's
+// apply is dropping because it lands under a root a list does not allow, was
+// sent by another apply than txn's, which then does not fail for it: the
+// document counts the drop for item's client instead
+// (PendingStats.RootsDropped). An apply with the origin of the one that
+// parked the struct fails, since it sent it.
+func dropOutsideRoots(txn *Transaction, item *Item) bool {
+	d := txn.doc
+	from, parked := d.parkedBy[item]
+	if parked && sameOrigin(from.origin, txn.Origin) {
+		return false
+	}
+	if t := d.tally(); t != nil {
+		t.rootDrops = append(t.rootDrops, item.ID.Client)
+		t.root = ""
+	}
+	return true
+}
+
+// sameOrigin reports whether a and b are the same origin, and false for two
+// origins Go cannot compare.
+func sameOrigin(a, b any) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return a == b
 }
 
 // noteParked counts item, a struct of the update about to park behind a

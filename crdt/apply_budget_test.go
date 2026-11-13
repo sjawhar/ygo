@@ -1961,8 +1961,9 @@ func TestUnit_AllowedRoots_RefusesAStructThatParksUnderADisallowedRoot(t *testin
 // apply that parked it. A sender allowed only "m" writes beside an item of
 // "t" that has not arrived; when a trusted peer, allowed every root, brings
 // that item, the drain integrates the parked write under "t", which its
-// sender may not touch, so the write is dropped and the trusted peer's
-// update stands.
+// sender may not touch, so the write is dropped. The trusted peer did not
+// send it: its update applies without an error, and the document counts the
+// drop for the sender's client (PendingStats.RootsDropped).
 func TestUnit_AllowedRoots_AParkedWriteKeepsItsOwnSendersPermissions(t *testing.T) {
 	trusted := New(WithClientID(3))
 	trustedText := trusted.GetText("t")
@@ -1977,23 +1978,105 @@ func TestUnit_AllowedRoots_AParkedWriteKeepsItsOwnSendersPermissions(t *testing.
 	sender.Transact(func(txn *Transaction) { senderText.Insert(txn, 1, "Q", nil) })
 	forged := EncodeStateAsUpdateV1(sender, trusted.StateVector())
 
-	doc := New(WithClientID(7), WithAllowedRoots(func(origin any) []string {
-		if origin == "sender" {
-			return []string{"m"}
-		}
-		return nil
-	}))
+	doc := New(WithClientID(7), WithAllowedRoots(senderOnlyM))
 	if err := ApplyUpdateV1(doc, forged, "sender"); err != nil {
 		t.Fatalf("the write that waits on a missing item was refused at park: %v", err)
 	}
 	if got := doc.PendingStats().Items; got != 1 {
 		t.Fatalf("%d structs parked, want the forged write", got)
 	}
-	if err := ApplyUpdateV1(doc, privateItem, "trusted"); !errors.Is(err, ErrRootNotAllowed) {
-		t.Fatalf("the trusted update returned %v, want ErrRootNotAllowed for the dropped write", err)
+	if err := ApplyUpdateV1(doc, privateItem, "trusted"); err != nil {
+		t.Fatalf("the trusted update, which did not send the dropped write, returned %v", err)
 	}
-	if got := doc.GetText("t").ToString(); got != "Z" || doc.PendingStats().Items != 0 {
-		t.Fatalf("the document reads %q with %d parked, want \"Z\" and none", got, doc.PendingStats().Items)
+	stats := doc.PendingStats()
+	if got := doc.GetText("t").ToString(); got != "Z" || stats.Items != 0 {
+		t.Fatalf("the document reads %q with %d parked, want \"Z\" and none", got, stats.Items)
+	}
+	if got := stats.RootsDropped; len(got) != 1 || got[4] != 1 {
+		t.Fatalf("the drops are reported as %v, want one for client 4", got)
+	}
+}
+
+// senderOnlyM allows the origin "sender" the root "m" alone, and every other
+// origin every root.
+func senderOnlyM(origin any) []string {
+	if origin == "sender" {
+		return []string{"m"}
+	}
+	return nil
+}
+
+// The apply that fills a gap fails for a parked struct the drain drops only
+// when it sent that struct. Here the sender's second edit, a write beside
+// "Z" in "t", parks behind its own first, a key of "m", while the sender may
+// write both roots; the owner then narrows the sender to "m". Another client,
+// allowed "m" alone, forwarding the first edit fills the gap without error,
+// and the drop is counted for client 4; the sender forwarding it itself gets
+// ErrRootNotAllowed.
+func TestUnit_AllowedRoots_TheSenderOfADroppedParkedWriteGetsTheError(t *testing.T) {
+	trusted := New(WithClientID(3))
+	trustedText := trusted.GetText("t")
+	trusted.Transact(func(txn *Transaction) { trustedText.Insert(txn, 0, "Z", nil) })
+	base := EncodeStateAsUpdateV1(trusted, nil)
+
+	sender := New(WithClientID(4))
+	if err := ApplyUpdateV1(sender, base, nil); err != nil {
+		t.Fatal(err)
+	}
+	held := sender.StateVector()
+	m, text := sender.GetMap("m"), sender.GetText("t")
+	sender.Transact(func(txn *Transaction) { m.Set(txn, "a", "x") })
+	first := EncodeStateAsUpdateV1(sender, held)
+	afterFirst := sender.StateVector()
+	sender.Transact(func(txn *Transaction) { text.Insert(txn, 1, "Q", nil) })
+	second := EncodeStateAsUpdateV1(sender, afterFirst)
+
+	for _, filler := range []string{"other", "sender"} {
+		t.Run(filler, func(t *testing.T) {
+			senderRoots := []string{"t", "m"}
+			doc := New(WithClientID(7), WithAllowedRoots(func(origin any) []string {
+				switch origin {
+				case "sender":
+					return senderRoots
+				case "other":
+					return []string{"m"}
+				}
+				return nil
+			}))
+			if err := ApplyUpdateV1(doc, base, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := ApplyUpdateV1(doc, second, "sender"); err != nil {
+				t.Fatalf("the parking update was refused: %v", err)
+			}
+			if got := doc.PendingStats().Items; got != 1 {
+				t.Fatalf("%d structs parked, want the edit behind the gap", got)
+			}
+			senderRoots = []string{"m"}
+			err := ApplyUpdateV1(doc, first, filler)
+			stats := doc.PendingStats()
+			if filler == "sender" {
+				if !errors.Is(err, ErrRootNotAllowed) {
+					t.Fatalf("the sender filling its own gap got %v, want ErrRootNotAllowed", err)
+				}
+				if len(stats.RootsDropped) != 0 {
+					t.Fatalf("the drops are reported as %v, want none: the sender got the error", stats.RootsDropped)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("another client filling the gap got %v, want no error", err)
+				}
+				if got := stats.RootsDropped; len(got) != 1 || got[4] != 1 {
+					t.Fatalf("the drops are reported as %v, want one for client 4", got)
+				}
+			}
+			if got := doc.GetText("t").ToString(); got != "Z" || stats.Items != 0 {
+				t.Fatalf("the document reads %q with %d parked, want \"Z\" and none", got, stats.Items)
+			}
+			if v, _ := doc.GetMap("m").Get("a"); v != "x" {
+				t.Fatalf("the gap's own key holds %v, want \"x\"", v)
+			}
+		})
 	}
 }
 

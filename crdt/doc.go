@@ -47,6 +47,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -234,9 +235,11 @@ func (d *Doc) SetApplyBudget(budget func(origin any) ApplyBudget) {
 // is applied. A struct that parks behind a clock the document lacks is checked
 // when it parks, and one whose parent is not known yet keeps the answer of
 // the apply that parked it. A parked struct that the drain integrates under a
-// root either answer does not name is dropped, and the apply returns
-// ErrRootNotAllowed. Every failed remote apply on the document returns a
-// RefusedUpdateError.
+// root either answer does not name is dropped. The apply that filled its gap
+// does not fail for it, and PendingStats.RootsDropped counts the drop for the
+// struct's client, unless that apply has the origin of the one that parked
+// the struct, which then returns ErrRootNotAllowed. Every failed remote apply
+// on the document returns a RefusedUpdateError.
 func WithAllowedRoots(roots func(origin any) []string) DocOption {
 	return func(d *Doc) { d.allowedRoots = roots }
 }
@@ -310,9 +313,12 @@ type Doc struct {
 	applyBudget  func(origin any) ApplyBudget
 	allowedRoots func(origin any) []string
 	counting     *applyTally
-	// parkedRoots is the allowed-roots list of the apply that parked each
-	// parked struct whose parent was not known yet, nil when none is.
-	parkedRoots map[*Item][]string
+	// parkedBy is what the document keeps of the apply that parked each
+	// parked struct, on a document with a budget or a roots list, and nil
+	// when nothing is parked; rootsDropped counts, by client, the parked
+	// structs a drain dropped under a root another apply's list leaves out.
+	parkedBy     map[*Item]parkedFrom
+	rootsDropped map[ClientID]int
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -1287,6 +1293,13 @@ type PendingStats struct {
 	// MissingFor lists the ClientIDs that pending items reference but
 	// haven't yet received. Sorted ascending. Read-only.
 	MissingFor []ClientID
+
+	// RootsDropped counts, by the client that wrote them, the parked structs
+	// that a drain dropped because they landed under a root the allowed-roots
+	// list does not name (WithAllowedRoots), when the apply that filled their
+	// gap was not the one that sent them: that apply does not fail for them.
+	// It counts from the document's creation and is a copy.
+	RootsDropped map[ClientID]int
 }
 
 // PendingStats returns a snapshot of the pending-queue state. Cheap; takes
@@ -1309,6 +1322,9 @@ func (d *Doc) PendingStats() PendingStats {
 		stats.MissingFor = missing
 	}
 	stats.DeleteRanges = d.store.pendingDsRanges
+	if len(d.rootsDropped) > 0 {
+		stats.RootsDropped = maps.Clone(d.rootsDropped)
+	}
 	return stats
 }
 

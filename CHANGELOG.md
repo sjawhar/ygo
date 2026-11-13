@@ -65,7 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing with `WithWholeOrNothingApplies`. A struct of the update that parks
   behind a clock the document lacks counts when it parks, and the drain that
   later integrates it does not count it against the apply that fills its gap.
-  An option set to limit nothing changes nothing an apply does.
+  A parked struct that lands under a root a list leaves out is dropped; the
+  apply that filled its gap does not fail for it unless it sent it, and
+  `PendingStats.RootsDropped` counts the drop by the struct's client. An
+  option set to limit nothing changes nothing an apply does.
 
 ### Changed
 

@@ -247,6 +247,11 @@ func tryIntegrateOrDrop(txn *Transaction, item *Item, dropped *error) (ok bool, 
 			case integrateScanBudgetExceeded, applyBudgetExceeded:
 				panic(r)
 			}
+			if _, roots := r.(rootNotAllowed); roots && dropOutsideRoots(txn, item) {
+				// Another apply sent the struct; this one does not fail for it.
+				ok, waitsOn, err = true, 0, nil
+				return
+			}
 			*dropped = recoveredApplyErr(r)
 			ok, waitsOn, err = true, 0, nil
 		}

@@ -767,7 +767,7 @@ func drainAfterApply(txn *Transaction, err error) (retErr error) {
 	}
 	if txn.doc.store.pending == nil {
 		// No parked struct is left to carry a list.
-		txn.doc.parkedRoots = nil
+		txn.doc.parkedBy = nil
 	}
 	return retErr
 }
@@ -1167,11 +1167,19 @@ func drainParked(txn *Transaction, drain func(*Transaction) error) (err error) {
 	if journaled {
 		j.beginDrain(txn)
 	}
+	// The parked structs this drain drops are counted only if it stands.
+	var drops int
+	if t := txn.doc.tally(); t != nil {
+		drops = len(t.rootDrops)
+	}
 	defer func() {
 		r := recover()
 		if journaled {
 			if r != nil || err != nil {
 				j.takeBackDrain(txn)
+				if t := txn.doc.tally(); t != nil {
+					t.rootDrops = t.rootDrops[:drops]
+				}
 			} else {
 				j.endDrain()
 			}
