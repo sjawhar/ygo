@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1] — 2026-11-13
+
+### Performance
+
+- **`crdt`: split runs merge back at commit in linear time.** When a
+  transaction splits a run and nothing is inserted between the halves,
+  `tryMergeWithLefts` joins them again at commit. Each join appended its half
+  to the run's whole text and searched and shifted the client's store slice,
+  so a run split n times was copied n times. The halves now merge in client
+  and clock order: each run's text is joined once, and each client's store
+  slice is compacted in one pass. One update of 20,000 items that each split a
+  40,000-character run allocated 420.5 MiB and now allocates 12.0 MiB. The
+  merge conditions are unchanged, so the merged items and the encoded state
+  are as before.
+
 ## [1.55.0] — 2026-10-31
 
 ### Added

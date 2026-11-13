@@ -419,6 +419,26 @@ func BenchmarkConcurrentSamePositionInsert(b *testing.B) {
 	}
 }
 
+// BenchmarkApplyUpdateV1_SplitRunMergedBack applies 2,000 items that each split
+// one 4,000-character run, whose halves all merge back at commit.
+func BenchmarkApplyUpdateV1_SplitRunMergedBack(b *testing.B) { benchSplitRunMergedBack(b, 2_000) }
+
+// benchSplitRunMergedBack applies leftOriginsOnly(n) to a fresh scanDoc(n) on
+// each iteration; building the document is not timed.
+func benchSplitRunMergedBack(b *testing.B, n int) {
+	update := leftOriginsOnly(n)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		doc := scanDoc(b, n)
+		b.StartTimer()
+		if err := ApplyUpdateV1(doc, update, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Search-marker proving harness (Task 8, #181).
 //

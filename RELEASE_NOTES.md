@@ -1,3 +1,17 @@
+## v1.55.1
+
+**Who is affected:** servers that apply updates from peers, where one update
+places many items among the ones a document holds.
+
+**Split runs merge back at commit in linear time.** When a transaction splits
+a run of text and nothing is inserted between the halves, the halves are
+joined again at commit. Each join copied the whole run, so an update that split
+one run n times copied it n times: 20,000 items that each split one
+40,000-character run allocated 420 MiB in one apply. The same apply now
+allocates 12 MiB. The merged items and the encoded state are as before.
+
+**Upgrading.** No API change.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single
