@@ -280,9 +280,13 @@ func noteParked(txn *Transaction, item *Item) {
 }
 
 // count refuses the apply when item would take the update's structs or bytes
-// past the budget, and otherwise counts it.
+// past the budget, and otherwise counts it. Its bytes are its content's and
+// the map key it is set under, which the document keeps while the entry lives.
 func (t *applyTally) count(item *Item) {
 	bytes := contentBytes(item.Content)
+	if item.ParentSub != nil {
+		bytes += len(*item.ParentSub)
+	}
 	if b := t.budget; over(b.Structs, t.structs+1) || over(b.Bytes, t.bytes+bytes) {
 		panic(applyBudgetExceeded{})
 	}
@@ -394,6 +398,24 @@ func refuseRoot(doc *Doc, name string) error {
 	}
 	t.root = name
 	return ErrRootNotAllowed
+}
+
+// noteRootName charges name, a root a remote apply's decode is about to
+// create, against the apply's bytes, since the document keeps the name for as
+// long as it holds the root, and refuses the apply before the root is created
+// when it would pass the budget. A root the document holds costs nothing.
+func noteRootName(doc *Doc, name string) {
+	t := doc.tally()
+	if t == nil {
+		return
+	}
+	if _, held := doc.share[name]; held {
+		return
+	}
+	if over(t.budget.Bytes, t.bytes+len(name)) {
+		panic(applyBudgetExceeded{})
+	}
+	t.bytes += len(name)
 }
 
 // anyScalarBytes is what a decoded scalar, or the slot of an element or an

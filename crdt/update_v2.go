@@ -835,6 +835,7 @@ func decodeItemV2(dec *v2Decoder, doc *Doc, client ClientID, clock uint64, info 
 			if err := refuseRoot(doc, name); err != nil {
 				return nil, 0, err
 			}
+			noteRootName(doc, name)
 			parent = doc.getOrCreateType(name)
 		} else {
 			// Parent by item ID.

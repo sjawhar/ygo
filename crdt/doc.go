@@ -176,8 +176,9 @@ type ApplyBudget struct {
 	// holds are not among them, so Structs never refuses a delete.
 	Structs int
 	// Bytes is the bytes of content those structs may carry: text, binary,
-	// decoded values, a format's key and value, and an XML element's or
-	// hook's name.
+	// decoded values, a format's key and value, an XML element's or hook's
+	// name, and the map key a struct is set under; and the name of each root
+	// the update creates. A deleted range carries none, whatever its span.
 	Bytes int
 	// Split is the structs the apply may make by splitting items the
 	// document holds, which Structs does not count: a delete of a range

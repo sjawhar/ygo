@@ -1321,6 +1321,7 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 			if err := refuseRoot(doc, name); err != nil {
 				return nil, err
 			}
+			noteRootName(doc, name)
 			parent = doc.getOrCreateType(name)
 		} else {
 			// Nested type: referenced by container item's ID.

@@ -49,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Doc.SetApplyBudget` and `Doc.SetAllowedRoots` set them on a document
   already made. An `ApplyBudget` bounds `Decoded`, the values the apply reads,
   counted before it allocates for a declared length; `Structs`, the structs of
-  the update it adds; `Bytes`, the bytes of content they carry; and `Split`,
+  the update it adds; `Bytes`, the bytes of content they carry, the map keys
+  they are set under and the names of roots the update creates; and `Split`,
   the structs it makes by splitting items the document holds, its drain's
   included. A field of zero or below is no limit, as for
   `WithIntegrateScanBudget`, so the zero value bounds nothing and the

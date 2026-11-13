@@ -1375,8 +1375,10 @@ func TestUnit_ApplyBudget_BytesCountsAnXMLTypeName(t *testing.T) {
 	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Decoded: 1, Structs: 1, Bytes: name - 1} })
 	before := stateOf(doc)
 	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
-	if refused.Bytes != 0 || refused.Structs != 0 {
-		t.Fatalf("the refusal reports %d structs and %d bytes, want none: the element passed the budget", refused.Structs, refused.Bytes)
+	// The refusal reports the bytes of the root the update names, which it
+	// counted before the element passed the budget.
+	if refused.Bytes != len("xml") || refused.Structs != 0 {
+		t.Fatalf("the refusal reports %d structs and %d bytes, want none and the root name's %d", refused.Structs, refused.Bytes, len("xml"))
 	}
 	if _, held := doc.share["xml"]; held {
 		t.Fatal("the refused update left its root on the document")
@@ -1904,7 +1906,8 @@ func TestUnit_ApplyBudget_CountsTheStructsAnUpdateParks(t *testing.T) {
 	if got := doc.PendingStats().Items; got != 1 {
 		t.Fatalf("%d structs parked, want the one the update carried", got)
 	}
-	doc.SetApplyBudget(budget(1, 1))
+	// The gap filler's own struct, and the name of the root "t" it creates.
+	doc.SetApplyBudget(budget(1, 2))
 	if err := ApplyUpdateV1(doc, gapStringUpdate(0, "A", nil), nil); err != nil {
 		t.Fatalf("the update that fills the gap was refused: %v", err)
 	}
@@ -1992,4 +1995,55 @@ func TestUnit_AllowedRoots_AParkedWriteKeepsItsOwnSendersPermissions(t *testing.
 	if got := doc.GetText("t").ToString(); got != "Z" || doc.PendingStats().Items != 0 {
 		t.Fatalf("the document reads %q with %d parked, want \"Z\" and none", got, doc.PendingStats().Items)
 	}
+}
+
+// Bytes counts the map key an item is set under, which the document keeps for
+// as long as the entry lives, and the name of a root the update creates,
+// which it keeps for as long as it holds the root: both are strings their
+// sender sized. A root the document already holds is not charged again.
+func TestUnit_ApplyBudget_BytesCountsAMapKeyAndANewRootsName(t *testing.T) {
+	const base = "hello world"
+	bytesOnly := func(n int) func(any) ApplyBudget {
+		return func(any) ApplyBudget { return ApplyBudget{Bytes: n} }
+	}
+
+	t.Run("a map key", func(t *testing.T) {
+		long := strings.Repeat("k", 1_000)
+		update := guardedEdit(t, base, 2, func(txn *Transaction, _ *YText, m *YMap) { m.Set(txn, long, "v") })
+		want := len(long) + len("v")
+
+		doc := guardedDoc(t, base)
+		doc.SetApplyBudget(bytesOnly(want - 1))
+		requireRefused(t, doc, stateOf(doc), ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
+
+		fits := guardedDoc(t, base)
+		fits.SetApplyBudget(bytesOnly(want))
+		requireApplied(t, fits, stateOf(fits), ApplyUpdateV1(fits, update, nil))
+	})
+
+	t.Run("a new root's name", func(t *testing.T) {
+		name := strings.Repeat("r", 1_000)
+		peer := New(WithClientID(2))
+		text := peer.GetText(name)
+		peer.Transact(func(txn *Transaction) { text.Insert(txn, 0, "x", nil) })
+		update := EncodeStateAsUpdateV1(peer, nil)
+		want := len(name) + len("x")
+
+		doc := budgetDoc(t, base)
+		doc.SetApplyBudget(bytesOnly(want - 1))
+		requireRefused(t, doc, stateOf(doc), ApplyUpdateV1(doc, update, nil), ErrApplyBudget)
+		if _, held := doc.share[name]; held {
+			t.Fatal("the refused update left the root it named on the document")
+		}
+
+		fits := budgetDoc(t, base)
+		fits.SetApplyBudget(bytesOnly(want))
+		requireApplied(t, fits, stateOf(fits), ApplyUpdateV1(fits, update, nil))
+
+		// Held already, the root costs its writer nothing more.
+		held := budgetDoc(t, base)
+		held.GetText(name)
+		held.SetApplyBudget(bytesOnly(len("x")))
+		requireApplied(t, held, stateOf(held), ApplyUpdateV1(held, update, nil))
+	})
 }

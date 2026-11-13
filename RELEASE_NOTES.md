@@ -189,16 +189,17 @@ to record what it changes.
 **A budget for each remote apply, and the roots it may write under.**
 `crdt.WithApplyBudget(func(origin any) crdt.ApplyBudget)` bounds, per apply,
 the values it reads (`Decoded`), the structs of the update it adds
-(`Structs`), the bytes of content they carry (`Bytes`) and the structs it
-makes by splitting items the document holds (`Split`). A field of zero or
-below is no limit, as `WithIntegrateScanBudget` reads its bound, so the zero
-value bounds nothing and the smallest limit is 1. `Decoded` is counted as the
-update is read, so a frame that declares millions of values is refused before
-they are in memory. `crdt.WithAllowedRoots(func(origin any) []string)` names
-the root types an apply may write under, at any depth; a struct that parks
-keeps the list of the apply that sent it until it lands. An apply that would
-pass its budget or leave its roots stops before that struct enters the
-document and returns `crdt.ErrApplyBudget` or `crdt.ErrRootNotAllowed` in a
+(`Structs`), the bytes they carry, map keys and new roots' names included
+(`Bytes`), and the structs it makes by splitting items the document holds
+(`Split`). A field of zero or below is no limit, as `WithIntegrateScanBudget`
+reads its bound, so the zero value bounds nothing and the smallest limit is
+1. `Decoded` is counted as the update is read, so a frame that declares
+millions of values is refused before they are in memory.
+`crdt.WithAllowedRoots(func(origin any) []string)` names the root types an
+apply may write under, at any depth; a struct that parks keeps the list of the
+apply that sent it until it lands. An apply that would pass its budget or
+leave its roots stops before that struct enters the document and returns
+`crdt.ErrApplyBudget` or `crdt.ErrRootNotAllowed` in a
 `crdt.RefusedUpdateError` that reports what it decoded and added. A struct
 that waits on a missing clock counts when it parks, so a sender cannot pass
 the budget by writing behind a clock it never sends. The document keeps what
