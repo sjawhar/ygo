@@ -1,18 +1,39 @@
 ## v1.56.0
 
-**Who is affected: code that writes Go integers outside int32 into shared
-types and reads them back with ygo.** JavaScript peers see no change.
+**Who is affected: code that writes Go integers outside int32, or -2^31
+(`math.MinInt32`, which is inside int32), into shared types and reads them back
+with ygo.** JavaScript peers see no change.
 
 An integer outside int32 that a float32 holds exactly, such as 2^31, 2^40 or
 2^53, is now written as lib0 writes the same Number: tag 124 and a float32,
-5 bytes, where ygo wrote tag 123 and a float64, 9 bytes. -2^31 moves from
+5 bytes. Before, ygo wrote tag 123 and a float64, 9 bytes. -2^31 moves from
 tag 125 to tag 124 for the same reason: lib0 writes tag 125 only while the
 magnitude is at most 2^31-1. A JavaScript reader gets the same Number either
-way. A ygo reader now gets these values back from `ReadAny` as a `float32`,
-not a `float64` (or, for -2^31, an `int64`): the type it already got for the
-same value written by a JavaScript peer. Code that type-switches on a decoded
-value should accept `float32` as well as `float64` and `int64`. Integers past
-±2^53 keep tag 122 (BigInt).
+way. Integers past ±2^53 keep tag 122 (BigInt).
+
+A ygo reader now gets these values back from `ReadAny`, and from a replica's
+`Get`, as a `float32`. Before, it got a `float64`, or an `int64` for -2^31. The
+writer's own `Get` still returns the Go value that it set.
+
+The type depends on the value's bits, not only on its range. An integer with
+`2^31-1 < |v| <= 2^53` reads back as a `float32` when its magnitude has at most
+24 significant bits, counted from its highest 1 bit to its lowest 1 bit. A
+float32 then holds it exactly. Otherwise it reads back as a `float64`. For
+example, `int64(1718999973888)` reads back as a `float32`, but
+`int64(1719000000000)` reads back as a `float64`.
+
+So a `v.(float64)` assertion that succeeded for every such integer now fails
+for some of them, and `v.(int64)` fails for -2^31. ygo already returned a
+`float32` for the same values from a JavaScript peer. Code that type-switches
+on a decoded value should accept `float32` as well as `float64` and `int64`.
+
+This reverses a decision in the 1.22.0 changelog. It left the
+float32-versus-float64 tag for large integers as it was, because both tags are
+numerically lossless. They are lossless, but the old tag made a replica's bytes
+differ from the writer's. A replica read `int64(1<<40)` from tag 123 as a
+`float64`, and `WriteAny` writes that `float64` as tag 124. So the replica
+re-encoded the document to different bytes than the writer sent. Now a replica
+re-encodes each value to the same bytes as the writer.
 
 **Who is affected: code that prints ygo documents as JSON, servers that receive
 text as V2 and forward it as V1, and code that reads XML attributes as

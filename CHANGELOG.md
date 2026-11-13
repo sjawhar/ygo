@@ -7,19 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.56.0] — 2026-11-12
 
+### Changed
+
+- **`encoding`: a Go integer is written as lib0 writes the same Number, and
+  some integers now read back as a `float32`.** `WriteAny` wrote an integer
+  outside int32 within float64's safe range as tag 123 and a float64, 9 bytes.
+  lib0's `writeAny` writes one that a float32 holds exactly, such as 2^31, 2^40
+  or 2^53, as tag 124 and a float32, 5 bytes. `WriteAny` also wrote -2^31 as
+  tag 125, but lib0 tests the magnitude against 2^31-1 and writes tag 124. Both
+  now match lib0 0.2.119 byte for byte. So does a `uint64` above
+  `math.MaxInt64`, which takes the same float dispatch. An integer past ±2^53
+  is still tag 122 (BigInt).
+
+  `ReadAny` returns a value written as tag 124 as a `float32`, and so does a
+  replica's `Get`. For an integer from a Go writer, the Go type now depends on
+  the value's bits, not only on its range. An integer with
+  `2^31-1 < |v| <= 2^53`, which includes -2^31, reads back as a `float32` when
+  its magnitude has at most 24 significant bits, counted from its highest 1 bit
+  to its lowest 1 bit. A float32 then holds it exactly. Otherwise it reads back
+  as a `float64`. For example, `int64(1718999973888)` and `int64(1 << 40)` read
+  back as `float32`, but `int64(1719000000000)` and `int64(1<<40 + 1)` read
+  back as `float64`.
+
+  Before this release, an integer in that range read back as a `float64`,
+  except -2^31, which is inside int32 and read back as an `int64`. A `uint64`
+  above `math.MaxInt64` now reads back as a `float32` when a float32 holds
+  `float64(v)`, as for 2^63 and `math.MaxUint64`. ygo already returned these
+  types for the same values from a JavaScript peer.
+
+  This reverses a decision that the 1.22.0 entry records as "Intentionally left
+  as-is": "the large-integer float32-vs-float64 `Any` tag (numerically
+  lossless)". Both tags are lossless, but the old tag made a replica's bytes
+  differ from the writer's. A replica read `int64(1 << 40)` from tag 123 as a
+  `float64`, and `WriteAny` writes that `float64` as tag 124. So the replica
+  re-encoded the document to different bytes than the writer sent. Now a
+  replica re-encodes each value to the same bytes as the writer.
+
 ### Fixed
 
-- **`encoding`: a Go integer is written as lib0 writes the same Number.**
-  `WriteAny` wrote an integer outside int32 within float64's safe range as
-  tag 123 and a float64, 9 bytes, where lib0's `writeAny` writes one a
-  float32 holds exactly, such as 2^31, 2^40 or 2^53, as tag 124 and a
-  float32, 5 bytes; and it wrote -2^31 as tag 125, where lib0, which tests
-  the magnitude against 2^31-1, writes tag 124. Both now match lib0 0.2.119
-  byte for byte, and so does a `uint64` above `math.MaxInt64`, which takes the
-  same float dispatch. An integer past ±2^53 is still tag 122 (BigInt). A
-  value written as tag 124 reads back from `ReadAny` as a `float32` rather
-  than a `float64` (or, for -2^31, an `int64`), which is what ygo already
-  read back for the same value from a JavaScript peer.
 - **`crdt`: a `float32` prints as the number it holds.** `YMap.ToJSON` and
   `YArray.ToJSON` printed a `float32` as `encoding/json` does, with the
   shortest digits that identify the float32. Those digits are a different
