@@ -308,15 +308,14 @@ func (e *Encoder) writeAnyUint(v uint64) {
 
 // writeAnyFloat writes a Number as lib0's writeAny does once it is past the
 // integer check: tag 124 (float32) when the value round-trips through float32
-// exactly (isFloat32Lossless), otherwise tag 123 (float64).
+// exactly (isFloat32Lossless), otherwise tag 123 (float64). It appends
+// directly to stay small enough to inline into WriteAny's hot float64 case.
 func (e *Encoder) writeAnyFloat(v float64) {
 	if isFloat32Lossless(v) {
-		e.WriteUint8(124)
-		e.WriteFloat32(float32(v))
+		e.buf = binary.BigEndian.AppendUint32(append(e.buf, 124), math.Float32bits(float32(v)))
 		return
 	}
-	e.WriteUint8(123)
-	e.WriteFloat64(v)
+	e.buf = binary.BigEndian.AppendUint64(append(e.buf, 123), math.Float64bits(v))
 }
 
 // isFloat32Lossless reports whether the float64 value round-trips through
