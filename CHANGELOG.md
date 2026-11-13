@@ -38,9 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sender, tries the queue again when its drain has more of its bound left than
   that drain began with, or no bound. Such a document refuses every remote
   update that carries a move or a subdocument. Each remote apply on it
-  allocates a journal of 208 bytes, and one whose drain tries parked items
-  also a copy of the state vector and of what the apply changed so far. Off,
-  the default, nothing changes.
+  allocates at least 208 bytes to record what it changes, and one whose drain
+  tries parked items also a copy of the state vector and of that record so
+  far. Off, the default, nothing changes.
 
 ## [1.55.1] — 2026-11-13
 

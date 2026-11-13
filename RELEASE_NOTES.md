@@ -37,7 +37,8 @@ trips the bound is rolled back on its own, the apply that filled the gap still
 succeeds, and a later apply tries the queue again when its drain has more of
 its bound left than that drain began with. Such a document refuses every
 remote update that carries a move or a subdocument, with
-`crdt.ErrInvalidUpdate`. Each remote apply on it allocates a 208-byte journal.
+`crdt.ErrInvalidUpdate`. Each remote apply on it allocates at least 208 bytes
+to record what it changes.
 
 **Upgrading.** No change is needed.
 

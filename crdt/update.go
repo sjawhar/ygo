@@ -36,12 +36,13 @@ const (
 // ErrInvalidUpdate is returned when a binary update cannot be decoded.
 var ErrInvalidUpdate = errors.New("crdt: invalid update")
 
-// ErrIntegrateScanBudget is returned by a remote apply whose conflict scans
-// would pass the bound WithIntegrateScanBudget set for its origin. The apply
-// aborted partway and the document keeps what it integrated, which
-// ApplyUpdateV1Landed reports; the same update sent again carries on from
-// there. On a document with WithWholeOrNothingApplies it keeps nothing. It
-// wraps ErrInvalidUpdate, as the pending cap's error does.
+// ErrIntegrateScanBudget, which wraps ErrInvalidUpdate as the pending cap's
+// error does, is returned by a remote apply whose conflict scans would pass the
+// bound WithIntegrateScanBudget set for its origin. The apply aborted partway
+// and the document keeps what it integrated, which ApplyUpdateV1Landed reports,
+// and the same update sent again carries on from there until an item whose
+// scan alone passes the bound, where each send from then on stops with nothing
+// landed; a document with WithWholeOrNothingApplies keeps nothing of the apply.
 var ErrIntegrateScanBudget = fmt.Errorf("%w: its conflict scans pass the document's bound", ErrInvalidUpdate)
 
 // integrateScanBudgetExceeded is the panic Item.integrate raises when a
@@ -900,13 +901,13 @@ func (txn *Transaction) drainable() bool {
 	return txn.doc.store.retryable(p.missing)
 }
 
-// drainParked runs drain, the drain of the parked queue that ends an apply.
-// When the drain's scans reach what the apply left of the bound, the drain
-// keeps what it integrated, or on a document with whole-or-nothing applies is
-// rolled back to where it began, and parks the rest again without failing the
-// apply, whose sender did not send the parked items; a later apply, from any
-// sender, tries them again (drainable). Every other panic is raised again,
-// after that rollback.
+// drainParked runs drain, the drain of the parked queue that ends an apply,
+// and raises again every panic but the bound's, after rolling the drain back
+// on a document with whole-or-nothing applies. When the drain's scans reach
+// what the apply left of the bound, the drain keeps what it integrated, or on
+// such a document is rolled back to where it began, and parks the rest again
+// without failing the apply, whose sender did not send the parked items; a
+// later apply, from any sender, tries them again (drainable).
 func drainParked(txn *Transaction, drain func(*Transaction)) {
 	s := txn.doc.store
 	j := txn.doc.applying

@@ -68,8 +68,9 @@ func editsThenScans(t *testing.T, state []byte, n int) (edits, update []byte) {
 // A remote apply that fails on a document with whole-or-nothing applies, past
 // the bound or for bytes that do not decode after structs that did, leaves the
 // document byte for byte as it was, a map key it replaced included, and hands
-// its observers nothing, every time it is sent. The document then goes on like
-// one that never saw it. Without the option the same apply keeps the edits.
+// its observers nothing, every time it is sent, and the document then goes on
+// like one that never saw it. Without the option the same apply keeps the
+// edits.
 func TestAWholeOrNothingApplyThatFailsLeavesTheDocumentAsItWas(t *testing.T) {
 	const l, n, bound = 200, 20, 1_000
 	state := listAndMap(t, l)
@@ -264,12 +265,12 @@ func TestAWholeOrNothingDocumentRefusesRemoteMovesAndSubdocuments(t *testing.T) 
 
 // When the drain of the parked queue trips what the apply left of the bound,
 // the drain is rolled back whole: the queue is parked again byte for byte as
-// the drain found it, and the apply that filled the gap stands and reports
-// only its own item. Each send of the parked items, which trip the bound
-// themselves, is refused. A later apply from another sender whose drain has
-// more of the bound left than that drain began with tries the queue once,
-// and the applies after it spend nothing on it; an apply with no bound, as
-// from another node, completes it.
+// the drain found it, the apply that filled the gap stands and reports only its
+// own item, and each send of the parked items, which trip the bound themselves,
+// is refused. A later apply from another sender whose drain has more of the
+// bound left than that drain began with tries the queue once, and the applies
+// after it spend nothing on it; an apply with no bound, as from another node,
+// completes it.
 func TestAWholeOrNothingDrainPastTheBoundIsRolledBackAndTheApplyStands(t *testing.T) {
 	const l, n, bound = 200, 20, 1_000
 	state := EncodeStateAsUpdateV1(chainedList(t, l), nil)
@@ -364,8 +365,8 @@ func itemAfter(client ClientID, clock uint64, origin ID, s string) []byte {
 
 // A drain rolled back gives back what it changed of a parked item: client 99's
 // "abc", which the drain integrated and the next parked item's origin then
-// split, is parked again whole. Without the option the drain keeps "abc". Once
-// client 99's item arrives again, relayed, both parked items apply.
+// split, is parked again whole, where without the option the drain keeps "abc".
+// Once client 99's item arrives again, relayed, both parked items apply.
 func TestAWholeOrNothingDrainGivesBackAParkedItemItSplit(t *testing.T) {
 	const l = 200
 	state := EncodeStateAsUpdateV1(chainedList(t, l), nil)

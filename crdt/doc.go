@@ -118,37 +118,30 @@ func WithMaxPendingItems(n int) DocOption {
 }
 
 // WithIntegrateScanBudget bounds the items the conflict scans of one remote
-// apply (ApplyUpdate and its V1 and V2 forms) may pass, by the apply's origin:
-// budget is called with the origin before the apply takes the document's lock,
-// so applies on several goroutines may call it at once, and zero or negative
-// sets no bound. It is set per origin so a server can bound the updates a
-// connected client sends, and apply what it relays from another node or loads
-// from storage with no bound.
+// apply (ApplyUpdate and its V1 and V2 forms) may pass, by origin, so a server
+// can bound a connected client's updates and not those it relays from another
+// node or loads from storage: budget gets the apply's origin before the apply
+// takes the document's lock, so applies on several goroutines may call it at
+// once, and zero or negative sets no bound.
 //
-// An apply whose scans would pass the bound aborts partway with
-// ErrIntegrateScanBudget and keeps what it integrated, as one that overflows
-// the pending cap does; the same update sent again carries on from there. An
-// item whose scan alone passes the bound aborts every send at that item: from
-// then on each send integrates nothing, and ApplyUpdateV1Landed returns nil
-// landed with the error. The drain of the parked queue that ends an apply runs
-// on what the apply left of the bound, and past it keeps what it integrated and
-// parks the rest, without failing the apply. A later apply, from any sender,
-// tries them again when its drain has more of its bound left than the scan
-// that tripped had, or no bound.
-// On a document with WithWholeOrNothingApplies an apply that trips the bound is
-// rolled back instead, and so is a drain that trips it.
+// An apply that would pass the bound aborts partway with
+// ErrIntegrateScanBudget, and the drain of the parked queue that ends an
+// apply, past what the apply left of the bound, parks the rest without failing
+// the apply, for a later apply, from any sender, to try again when its drain
+// has more of its bound left than the scan that tripped had, or no bound; each
+// keeps what it integrated, or nothing on a document with
+// WithWholeOrNothingApplies.
 func WithIntegrateScanBudget(budget func(origin any) int) DocOption {
 	return func(d *Doc) { d.integrateScanBudget = budget }
 }
 
-// WithWholeOrNothingApplies, when on, makes each remote apply whole or nothing:
-// an apply that fails, by tripping the scan bound or for any other reason, is
-// refused, rolled back before it commits, so the document is left as it was,
-// no observer fires and ApplyUpdateV1Landed reports nothing. A drain of the
-// parked queue that trips what the apply left of the bound is rolled back on
-// its own, and the apply stands. Such a document refuses every remote update
-// that carries a move or a subdocument, and each remote apply keeps a journal
-// of what it changes.
+// WithWholeOrNothingApplies, when on, rolls back before it commits a remote
+// apply that fails, by tripping the scan bound or for any other reason, so the
+// document is left as it was, no observer fires and ApplyUpdateV1Landed
+// reports nothing, while a drain of the parked queue that trips what the apply
+// left of the bound is rolled back alone and the apply stands. Such a document
+// refuses every remote update that carries a move or a subdocument, and each
+// remote apply on it allocates at least 208 bytes to record what it changes.
 func WithWholeOrNothingApplies(on bool) DocOption {
 	return func(d *Doc) { d.wholeOrNothing = on }
 }

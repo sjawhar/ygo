@@ -8,8 +8,9 @@ import (
 
 // errWholeOrNothingContent refuses a remote move or subdocument on a document
 // with whole-or-nothing applies, since a move re-points items the document
-// already holds and a subdocument is a document of its own, which the journal
-// does not follow; so such a document never holds a pending move.
+// already holds and a subdocument is a document of its own, which the record
+// of what an apply changed does not follow; so such a document never holds a
+// pending move.
 var errWholeOrNothingContent = errors.New("a document with whole-or-nothing applies takes no remote move or subdocument")
 
 // applyJournal is what a remote apply on a document with whole-or-nothing
