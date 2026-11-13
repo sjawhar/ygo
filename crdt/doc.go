@@ -290,6 +290,65 @@ func (d *Doc) SetRefusedContent(kinds func(origin any) []ContentKind) {
 	d.refusedContent = kinds
 }
 
+// ApplyReport is what one remote apply left the document holding and what it
+// added of its own, as WithApplyReport reports it. A parked struct the drain
+// drops, under a root the list of the apply that parked it leaves out, is
+// not in it: PendingStats.RootsDropped counts those by client.
+type ApplyReport struct {
+	// Structs is the structs the document holds once the apply has
+	// committed, those parked behind a clock the document lacks included: a
+	// total, read after the commit has merged runs back together, not a sum
+	// of what earlier applies added.
+	Structs int
+	// Integrated is the structs of the update the document kept, parked ones
+	// included, as ApplyBudget.Structs counts them. A struct the drain of the
+	// parked queue integrates was counted by the apply that parked it.
+	Integrated int
+	// Bytes is the bytes those structs carry, as ApplyBudget.Bytes counts
+	// them.
+	Bytes int
+	// Split is the structs the apply made by splitting items the document
+	// held, its drain's splits included, as ApplyBudget.Split counts them;
+	// none of a drain that WithWholeOrNothingApplies takes back.
+	Split int
+	// Decoded is the values the apply read, as ApplyBudget.Decoded counts
+	// them.
+	Decoded int
+}
+
+// WithApplyReport calls report once for each remote apply (ApplyUpdate and
+// its V1 and V2 forms) that commits, with the apply's origin and an
+// ApplyReport of what the document holds and what the apply added. report
+// runs under the document's lock, after the commit has merged runs back
+// together and before the apply's observers fire, so it must not call the
+// document. A panic it raises refuses nothing, the apply having committed,
+// and reaches the apply's caller once the document is unlocked, as a panic
+// in a Transact callback does. A nil report makes no report.
+//
+// An apply that fails after it began to integrate commits what it kept, as
+// on any document without WithWholeOrNothingApplies, and reports it: its
+// counts are those of the RefusedUpdateError the apply returns. An apply
+// that leaves the document as it was, refused before any struct of it
+// integrated or rolled back by WithWholeOrNothingApplies, makes no report.
+// The option bounds and refuses nothing: every update applies as it would
+// without it.
+//
+// The cost is the count each apply keeps, as for WithApplyBudget, and at
+// the commit a step for each client the document holds structs of, to total
+// them. Every failed remote apply on the document returns a
+// RefusedUpdateError.
+func WithApplyReport(report func(origin any, report ApplyReport)) DocOption {
+	return func(d *Doc) { d.applyReport = report }
+}
+
+// SetApplyReport sets the callback of WithApplyReport on a document already
+// made, or with nil removes it. It takes the document's lock.
+func (d *Doc) SetApplyReport(report func(origin any, report ApplyReport)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.applyReport = report
+}
+
 // updateSub pairs a unique subscription ID with its callback so that
 // unsubscribe closures can find and remove the right entry even when
 // callbacks are removed out-of-order.
@@ -346,13 +405,17 @@ type Doc struct {
 	// with whole-or-nothing applies, or nil.
 	applying *applyJournal
 	// applyBudget is the budget of WithApplyBudget, allowedRoots the list of
-	// WithAllowedRoots and refusedContent the kinds of WithRefusedContent,
-	// each nil for none; counting is the tally of the remote apply in
-	// progress on a document with any of them, or nil.
+	// WithAllowedRoots, refusedContent the kinds of WithRefusedContent and
+	// applyReport the callback of WithApplyReport, each nil for none;
+	// counting is the tally of the remote apply in progress on a document
+	// with any of them, or nil, and reporting the tally of an apply whose
+	// commit is to report it, from the apply's end to the report, or nil.
 	applyBudget    func(origin any) ApplyBudget
 	allowedRoots   func(origin any) []string
 	refusedContent func(origin any) []ContentKind
+	applyReport    func(origin any, report ApplyReport)
 	counting       *applyTally
+	reporting      *applyTally
 	// parkedBy is what the document keeps of the apply that parked each
 	// parked struct, on a document with a budget or a roots list, and nil
 	// when nothing is parked; rootsDropped counts, by client, the parked
@@ -987,6 +1050,19 @@ func (d *Doc) transactInternal(ctx context.Context, fn func(*Transaction) error,
 		// registered. RunGC remains available as the explicit manual entry point.
 		if d.gc && d.undoManagerCount == 0 && !deferGC {
 			gcTxnDeleteSet(d, txn)
+		}
+
+		// The report of a remote apply that committed, after the commit's
+		// merges and collection and under the lock the apply held, so the
+		// structs it counts are the ones the document is left holding. A
+		// panic of its callback is carried like one of fn, raised after the
+		// unlock, so it skips nothing the commit still owes the document, such
+		// as the format cleanup decided above (WithApplyReport).
+		if report := d.reporting; report != nil {
+			d.reporting = nil
+			if r == nil {
+				r = reportApplyRecovered(txn, report)
+			}
 		}
 
 		// The document's park record drops this transaction's views of the queue.

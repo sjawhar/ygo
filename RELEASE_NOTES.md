@@ -222,6 +222,18 @@ the refused update leaves the document as it was, with or without
 `WithWholeOrNothingApplies`. Subdocuments and moves are refused only when the
 answer names `crdt.ContentKindDoc` or `crdt.ContentKindMove`.
 
+**A report of what each remote apply left the document holding.**
+`crdt.WithApplyReport(func(origin any, report crdt.ApplyReport))` is called
+once for each remote apply that commits, with the structs the document now
+holds, parked ones included (`Structs`), and what the apply added of its own:
+`Integrated`, `Bytes`, `Split` and `Decoded`, counted as `ApplyBudget` counts
+them. An owner that bounds a room's size reads the total without walking the
+document, and the parked structs `Doc.PendingStats` lists are in it. An apply
+that fails partway reports what the document kept of it, with the counts of
+the `RefusedUpdateError` it returns; one that leaves the document as it was,
+as every refusal does with `WithWholeOrNothingApplies`, reports nothing. The
+option bounds nothing and refuses nothing.
+
 **Who is affected:** servers that apply updates from peers, where one update
 places many items among the ones a document holds.
 
