@@ -381,13 +381,15 @@ func TestAParkedItemTheBoundStoppedIsPlacedWhenTriedAgain(t *testing.T) {
 // struct the drain meets.
 type panicOnLen struct{ Content }
 
-func (panicOnLen) Len() int { panic("a parked struct that panics") }
+func (panicOnLen) Len() uint64 { panic("a parked struct that panics") }
 
-// The drain recovers only the bound's panic and raises any other again, so the
-// apply that filled the gap returns ErrInvalidUpdate naming the panic, bounded
-// or not, and the queue keeps what the drain did not integrate. Under a bound
-// of 199 the gap's item leaves the drain nothing of it.
-func TestADrainRaisesAPanicThatIsNotTheBounds(t *testing.T) {
+// The drain recovers the bound's panic and drops a parked struct whose
+// integration panics for any other reason, so the apply that filled the gap
+// returns ErrInvalidUpdate naming that panic, bounded or not, and the queue
+// keeps what the drain did not integrate: the struct after the dropped one,
+// which waits on its clock. Under a bound of 199 the gap's item leaves the
+// drain nothing of it.
+func TestADrainDropsAStructThatPanicsNotForTheBound(t *testing.T) {
 	const l, n = 200, 2
 	state := EncodeStateAsUpdateV1(chainedList(t, l), nil)
 	gap, parked := originAtTheStartFrom(0, 1), originAtTheStartFrom(1, n)
@@ -405,8 +407,8 @@ func TestADrainRaisesAPanicThatIsNotTheBounds(t *testing.T) {
 					!strings.Contains(err.Error(), "a parked struct that panics") {
 					t.Fatalf("the apply that filled the gap returned %v, want ErrInvalidUpdate naming the panic", err)
 				}
-				if got := len(doc.store.pending.items); got != n {
-					t.Fatalf("%d items parked, want %d", got, n)
+				if got := len(doc.store.pending.items); got != n-1 {
+					t.Fatalf("%d items parked, want %d", got, n-1)
 				}
 			})
 		}

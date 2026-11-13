@@ -204,7 +204,7 @@ func requireStoreWhole(t *testing.T, doc *Doc, roots ...*abstractType) {
 			if item.ID.Clock != next {
 				t.Fatalf("client %d's store slice has clock %d at index %d, want %d", client, item.ID.Clock, i, next)
 			}
-			next += uint64(item.Content.Len())
+			next += item.Content.Len()
 		}
 	}
 	for _, root := range roots {

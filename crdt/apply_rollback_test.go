@@ -425,13 +425,13 @@ func TestAWholeOrNothingDrainGivesBackAParkedItemItSplit(t *testing.T) {
 	}
 }
 
-// The drain of a document with whole-or-nothing applies raises again a panic
-// that is not the bound's, so the apply that filled the gap returns
-// ErrInvalidUpdate naming it, and is rolled back whole, bounded or not: the
-// document is as it was, and so is what it holds parked, though the apply
-// parked an item and delete ranges of its own before the drain. No observer
-// fires.
-func TestAWholeOrNothingDrainRaisesAPanicThatIsNotTheBounds(t *testing.T) {
+// A parked struct whose integration panics for a reason other than the bound
+// fails the drain of a document with whole-or-nothing applies, so the apply
+// that filled the gap returns ErrInvalidUpdate naming the panic, and is rolled
+// back whole, bounded or not: the document is as it was, and so is what it
+// holds parked, the struct that panicked included, though the apply parked an
+// item and delete ranges of its own before the drain. No observer fires.
+func TestAWholeOrNothingDrainFailsOnAPanicThatIsNotTheBounds(t *testing.T) {
 	const l, n = 200, 2
 	state := EncodeStateAsUpdateV1(chainedList(t, l), nil)
 	parked := originAtTheStartFrom(1, n)
@@ -468,21 +468,6 @@ func TestAWholeOrNothingDrainRaisesAPanicThatIsNotTheBounds(t *testing.T) {
 			})
 		}
 	}
-}
-
-// parkedDeletes is an update of no structs whose delete set names n one-clock
-// ranges of client, every other clock from 0, which a document that never
-// heard from client parks, every range, as pending deletes.
-func parkedDeletes(client ClientID, n int) []byte {
-	enc := encoding.NewEncoder()
-	for _, v := range []uint64{0, 1, uint64(client), uint64(n)} { // no clients; deletes of one
-		enc.WriteVarUint(v)
-	}
-	for i := range n {
-		enc.WriteVarUint(uint64(2 * i))
-		enc.WriteVarUint(1)
-	}
-	return append([]byte(nil), enc.Bytes()...)
 }
 
 // A keystroke costs a document with whole-or-nothing applies about what it
@@ -523,5 +508,39 @@ func TestAWholeOrNothingApplyCostsNothingForWhatIsParked(t *testing.T) {
 					n, parked.name, on, off, 64<<10)
 			}
 		})
+	}
+}
+
+// A park that merges an update's structs into the queue changes parked
+// structs in place, as Yjs merges its pending update: here it grows a parked
+// GC struct by the one sent over it. When the apply then fails on a document
+// with whole-or-nothing applies, the queue is as the apply found it, and the
+// struct that fills the gap drains it as before.
+func TestAWholeOrNothingRollbackGivesBackTheQueueAParkMergedInto(t *testing.T) {
+	doc := New(WithClientID(100), WithWholeOrNothingApplies(true))
+	if err := applyHexes(t, doc, false, "01010201000100"); err != nil { // GC 2@1+1, behind 2@0
+		t.Fatal(err)
+	}
+	before, stats := parkedState(doc), fmt.Sprintf("%+v", doc.PendingStats())
+	fired := observers(doc)
+	// GC 2@1+2, which the park merges into the parked struct, then a delete set
+	// cut off after the first client it names.
+	if err := applyHexes(t, doc, false, "01010201000201050101"); !errors.Is(err, ErrInvalidUpdate) {
+		t.Fatalf("the cut update returned %v, want ErrInvalidUpdate", err)
+	}
+	if !bytes.Equal(parkedState(doc), before) || *fired != 0 {
+		t.Fatalf("the refused update changed what is parked or handed its observers %d callbacks", *fired)
+	}
+	if got := fmt.Sprintf("%+v", doc.PendingStats()); got != stats {
+		t.Fatalf("the pending queue is %s, want %s", got, stats)
+	}
+	if items := doc.store.pending.heldItems(); len(items) != 1 || items[0].ID.Clock != 1 || items[0].Content.Len() != 1 {
+		t.Fatalf("the queue holds %d structs, want GC 2@1+1 as it was parked", len(items))
+	}
+	if err := applyHexes(t, doc, false, "01010200000100"); err != nil { // GC 2@0+1
+		t.Fatal(err)
+	}
+	if got := svText(doc.StateVector()); got != "2:2," || doc.store.pending != nil {
+		t.Fatalf("the gap left state vector %s and %v parked, want 2:2, and nothing", got, doc.store.pending)
 	}
 }
