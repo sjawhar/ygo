@@ -148,7 +148,7 @@ func BenchmarkPendingParkSteady(b *testing.B) {
 func BenchmarkPendingParkOutOfOrder(b *testing.B) {
 	single := func(clock uint64) []byte {
 		it := &Item{ID: ID{Client: 2, Clock: clock}, Origin: &ID{Client: 9, Clock: 0}, Content: NewContentDeleted(1)}
-		return encodeStructStoreV1(map[ClientID][]*Item{2: {it}}, newDeleteSet(), nil, newStructStore())
+		return encodeStructStoreV1(map[ClientID][]*Item{2: {it}}, newDeleteSet(), nil)
 	}
 	for _, n := range []int{1_000, 10_000} {
 		b.Run(fmt.Sprintf("parked=%d", n), func(b *testing.B) {
@@ -187,7 +187,7 @@ func BenchmarkPendingParkBatch(b *testing.B) {
 		return &Item{ID: ID{Client: 2, Clock: clock}, Origin: &ID{Client: 9, Clock: 0}, Content: NewContentDeleted(1)}
 	}
 	enc := func(items []*Item) []byte {
-		return encodeStructStoreV1(map[ClientID][]*Item{2: items}, newDeleteSet(), nil, newStructStore())
+		return encodeStructStoreV1(map[ClientID][]*Item{2: items}, newDeleteSet(), nil)
 	}
 	for _, sk := range [][2]int{{1_000, 32}, {10_000, 9}, {10_000, 52}, {10_000, 53}, {10_000, 1_000}, {100_000, 2}, {100_000, 5}, {100_000, 6}, {100_000, 32}} {
 		s, k := sk[0], sk[1]
@@ -235,7 +235,7 @@ func BenchmarkPendingParkGCBatch(b *testing.B) {
 		return &Item{ID: ID{Client: 2, Clock: clock}, Origin: &ID{Client: 9, Clock: 0}, Content: NewContentDeleted(1)}
 	}
 	enc := func(items []*Item) []byte {
-		return encodeStructStoreV1(map[ClientID][]*Item{2: items}, newDeleteSet(), nil, newStructStore())
+		return encodeStructStoreV1(map[ClientID][]*Item{2: items}, newDeleteSet(), nil)
 	}
 	for _, s := range []int{10_000, 25_000} {
 		k := s - 1

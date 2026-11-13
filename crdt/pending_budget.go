@@ -862,7 +862,9 @@ func (s *pendingScanner) content(tag byte) uint64 {
 				s.err = typeRefError(ref)
 			}
 		} else {
-			ref, s.err = s.v2.readTypeRef()
+			if ref, s.err = s.v2.readTypeRef(); ref > maxTypeRef && s.err == nil {
+				s.err = typeRefError(ref)
+			}
 		}
 		if typeRefHasName(ref) {
 			s.key()
