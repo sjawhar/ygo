@@ -110,6 +110,7 @@ func (item *Item) integrate(txn *Transaction, offset uint64) {
 		// Yjs stores an item whose right origin is a GC struct as a GC struct.
 		if right != nil && right.isGCOrphan() {
 			item.markGCOrphan()
+			noteIntegrated(txn, item)
 			txn.doc.store.Append(item)
 			txn.doc.store.resolvePendingMoves(txn, item.ID.Client)
 			return
@@ -202,6 +203,10 @@ func (item *Item) integrate(txn *Transaction, offset uint64) {
 			o = o.Right
 		}
 	}
+
+	// A remote apply's budget and allowed roots are checked here, before the
+	// item is linked (noteIntegrated).
+	noteIntegrated(txn, item)
 
 	// Insert item between left and left.Right.
 	item.Left = left
@@ -466,6 +471,9 @@ func (item *Item) lastID() ID {
 // (nextDeleteItem), so a remotely built tree of any depth deletes without
 // growing the goroutine stack.
 func (item *Item) delete(txn *Transaction) {
+	// A remote apply may delete only under a root its allowed roots name; the
+	// cascade below stays under the same root (noteDeleted).
+	noteDeleted(txn, item)
 	for current := item; current != nil; {
 		if current.Deleted {
 			current = nextDeleteItem(current, item)
@@ -576,6 +584,7 @@ func splitItem(txn *Transaction, item *Item, offset uint64) *Item {
 		right.Right.Left = right
 	}
 	item.Right = right
+	countSplit(txn)
 	txn.doc.store.insertItem(right)
 	// A key's entry is its rightmost unit, so Set's origin stays the run's end.
 	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {

@@ -234,18 +234,20 @@ func integrateClientRuns(txn *Transaction, pending []*Item, step int, done []boo
 }
 
 // tryIntegrateOrDrop marks a panicking item done while a drain continues. The
-// scan bound's panic is not the item's fault: it goes on to drainParked, and
-// the item stays parked.
+// scan bound's and the apply budget's panics are not the item's fault: they
+// go on to drainParked, and the item stays parked. A parked struct the
+// allowed roots refuse is dropped, as one that panics is.
 func tryIntegrateOrDrop(txn *Transaction, item *Item, dropped *error) (ok bool, waitsOn ClientID, err error) {
 	if dropped == nil {
 		return tryIntegrate(txn, item)
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			if _, bound := r.(integrateScanBudgetExceeded); bound {
+			switch r.(type) {
+			case integrateScanBudgetExceeded, applyBudgetExceeded:
 				panic(r)
 			}
-			*dropped = integrationPanicErr(r)
+			*dropped = recoveredApplyErr(r)
 			ok, waitsOn, err = true, 0, nil
 		}
 	}()

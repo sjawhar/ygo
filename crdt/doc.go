@@ -158,6 +158,84 @@ func WithWholeOrNothingApplies(on bool) DocOption {
 	return func(d *Doc) { d.wholeOrNothing = on }
 }
 
+// ApplyBudget is what one remote apply may decode and add. A field of zero or
+// below is no limit in that measure, as WithIntegrateScanBudget reads its
+// bound, so the zero value bounds nothing. The smallest limit is 1, and a
+// budget cannot refuse every value, struct or byte: a caller that wants an
+// origin's updates refused whole refuses them before the apply.
+type ApplyBudget struct {
+	// Decoded is the values the apply may read: each struct, each delete
+	// range, each lib0 Any value at any depth, each entry of an Any map and
+	// each JSON value and member. It is counted as the update is read,
+	// before the apply allocates for a length the update declares, so it
+	// bounds the memory one update can take while it is decoded.
+	Decoded int
+	// Structs is the structs of the update the apply may add to the
+	// document. The structs a delete makes by splitting items the document
+	// holds are not among them, so Structs never refuses a delete.
+	Structs int
+	// Bytes is the bytes of content those structs may carry: text, binary,
+	// decoded values, a format's key and value, and an XML element's or
+	// hook's name.
+	Bytes int
+}
+
+// WithApplyBudget bounds each remote apply (ApplyUpdate and its V1 and V2
+// forms) by the ApplyBudget that budget returns for the apply's origin. budget
+// runs once per apply, under the document's lock, so it must not call the
+// document; a nil budget bounds nothing, as a document without the option.
+//
+// An apply that would pass its budget stops at the value or the struct that
+// passes it, before that struct enters the document, and returns
+// ErrApplyBudget in a RefusedUpdateError. As for the scan bound
+// (WithIntegrateScanBudget), the document keeps what the apply integrated
+// before it stopped, which ApplyUpdateV1Landed reports, and keeps nothing on
+// a document that also has WithWholeOrNothingApplies. A struct the drain of
+// the parked queue integrates was sent by an earlier update and does not
+// count against the apply that fills its gap. Local transactions are never
+// bounded. A budget that limits nothing changes nothing an apply does, and
+// every failed remote apply on the document returns a RefusedUpdateError.
+func WithApplyBudget(budget func(origin any) ApplyBudget) DocOption {
+	return func(d *Doc) { d.applyBudget = budget }
+}
+
+// SetApplyBudget sets the budget of WithApplyBudget on a document already
+// made, or with nil removes it, for an owner that loads trusted state first.
+// It takes the document's lock.
+func (d *Doc) SetApplyBudget(budget func(origin any) ApplyBudget) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.applyBudget = budget
+}
+
+// WithAllowedRoots names the root types a remote apply may write under: roots
+// runs once per apply with the apply's origin, under the document's lock, so
+// it must not call the document. A nil roots, or an answer of no names,
+// allows every root, as a document without the option.
+//
+// An apply that would create a root the answer does not name, or add to or
+// delete under one, at any depth of nested types, or add under no root of
+// the document, stops before that struct enters the document or that item is
+// deleted, and returns ErrRootNotAllowed in a RefusedUpdateError whose Root
+// is the root's name. The document keeps what the apply integrated before it
+// stopped, and keeps nothing on a document that also has
+// WithWholeOrNothingApplies. An update that names a root the document holds
+// and writes nothing under it, as a peer handing back the whole state does,
+// is applied. A parked struct that the drain integrates under a root the
+// answer does not name is dropped, and the apply returns ErrRootNotAllowed.
+// Every failed remote apply on the document returns a RefusedUpdateError.
+func WithAllowedRoots(roots func(origin any) []string) DocOption {
+	return func(d *Doc) { d.allowedRoots = roots }
+}
+
+// SetAllowedRoots sets the list of WithAllowedRoots on a document already
+// made, or with nil removes it. It takes the document's lock.
+func (d *Doc) SetAllowedRoots(roots func(origin any) []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.allowedRoots = roots
+}
+
 // updateSub pairs a unique subscription ID with its callback so that
 // unsubscribe closures can find and remove the right entry even when
 // callbacks are removed out-of-order.
@@ -213,6 +291,12 @@ type Doc struct {
 	// applying is the journal of the remote apply in progress on a document
 	// with whole-or-nothing applies, or nil.
 	applying *applyJournal
+	// applyBudget is the budget of WithApplyBudget and allowedRoots the list
+	// of WithAllowedRoots, each nil for none; counting is the tally of the
+	// remote apply in progress on a document with either, or nil.
+	applyBudget  func(origin any) ApplyBudget
+	allowedRoots func(origin any) []string
+	counting     *applyTally
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -370,6 +454,28 @@ func (d *Doc) scanBudget(origin any) int {
 		return 0
 	}
 	return d.integrateScanBudget(origin)
+}
+
+// callApplyBudget calls the WithApplyBudget callback, tagging a panic it
+// raises with the option's name; the caller holds d.mu.
+func (d *Doc) callApplyBudget(origin any) ApplyBudget {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{"WithApplyBudget", r})
+		}
+	}()
+	return d.applyBudget(origin)
+}
+
+// callAllowedRoots calls the WithAllowedRoots callback, tagging a panic it
+// raises with the option's name; the caller holds d.mu.
+func (d *Doc) callAllowedRoots(origin any) []string {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{"WithAllowedRoots", r})
+		}
+	}()
+	return d.allowedRoots(origin)
 }
 
 // uuidV4 returns a random RFC-4122 v4 UUID string. Used as the default document

@@ -43,6 +43,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allocates at least 288 bytes to record what it changes, and one whose drain
   tries parked items also a copy of the state vector and of that record so
   far. Off, the default, nothing changes.
+- **`crdt`: `WithApplyBudget` bounds what one remote apply may decode and add,
+  and `WithAllowedRoots` the root types it may write under.** Each takes a
+  callback asked once per remote apply with the apply's origin;
+  `Doc.SetApplyBudget` and `Doc.SetAllowedRoots` set them on a document
+  already made. An `ApplyBudget` bounds `Decoded`, the values the apply reads,
+  counted before it allocates for a declared length; `Structs`, the structs of
+  the update it adds; and `Bytes`, the bytes of content they carry. A field
+  of zero or below is no limit, as for `WithIntegrateScanBudget`, so the zero
+  value bounds nothing and the smallest limit is 1; `Structs` never refuses
+  an update that only deletes. An apply that would pass its budget, or create,
+  write under or delete under a root the list does not name, stops before that
+  struct enters the document and returns `ErrApplyBudget` or
+  `ErrRootNotAllowed`, both wrapping `ErrInvalidUpdate`, in a
+  `RefusedUpdateError` that reports what the apply decoded and added. As for
+  the scan bound, the document keeps what the apply integrated before it
+  stopped, which `ApplyUpdateV1Landed` reports, and keeps nothing with
+  `WithWholeOrNothingApplies`. A struct the drain of the parked queue
+  integrates is not counted against the apply that fills its gap. An option
+  set to limit nothing changes nothing an apply does.
 
 ### Changed
 

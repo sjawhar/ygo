@@ -186,6 +186,23 @@ remote update that carries a move or a subdocument, with
 `crdt.ErrInvalidUpdate`. Each remote apply on it allocates at least 288 bytes
 to record what it changes.
 
+**A budget for each remote apply, and the roots it may write under.**
+`crdt.WithApplyBudget(func(origin any) crdt.ApplyBudget)` bounds, per apply,
+the values it reads (`Decoded`), the structs of the update it adds (`Structs`)
+and the bytes of content they carry (`Bytes`). A field of zero or below is no
+limit, as `WithIntegrateScanBudget` reads its bound, so the zero value bounds
+nothing and the smallest limit is 1. `Decoded` is counted as the update is
+read, so a frame that declares millions of values is refused before they are
+in memory. `crdt.WithAllowedRoots(func(origin any) []string)` names the root
+types an apply may write under, at any depth. An apply that would pass its
+budget or leave its roots stops before that struct enters the document and
+returns `crdt.ErrApplyBudget` or `crdt.ErrRootNotAllowed` in a
+`crdt.RefusedUpdateError` that reports what it decoded and added. The document
+keeps what the apply integrated before it stopped, as for the scan bound, and
+keeps nothing on a document with `WithWholeOrNothingApplies`, which is the one
+option that rolls an apply back. A budget that limits nothing, or a list that
+names every root an update writes, changes nothing an apply does.
+
 **Who is affected:** servers that apply updates from peers, where one update
 places many items among the ones a document holds.
 

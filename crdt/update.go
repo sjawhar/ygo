@@ -50,11 +50,29 @@ var ErrIntegrateScanBudget = fmt.Errorf("%w: its conflict scans pass the documen
 
 // integrateScanBudgetExceeded is the panic Item.integrate raises when a
 // bounded apply's scans reach the bound. left is what the bound left the scan
-// that tripped when it began: the item needs more than that. dropped is the
-// error of a parked item the tripped drain dropped before it (drainPending).
-type integrateScanBudgetExceeded struct {
+// that tripped when it began: the item needs more than that.
+type integrateScanBudgetExceeded struct{ left uint32 }
+
+// drainStopped is the panic drainPending raises again, for drainParked, when
+// the scan bound, the apply budget or the allowed roots stop the drain rather
+// than fail it. scan is whether the scan bound stopped it, and left is then
+// what the bound left the scan that tripped; dropped is the error of a parked
+// struct the drain dropped before it stopped.
+type drainStopped struct {
+	scan    bool
 	left    uint32
 	dropped error
+}
+
+// drainStop is the drainStopped r stands for, when r stops a drain.
+func drainStop(r any) (drainStopped, bool) {
+	switch r := r.(type) {
+	case integrateScanBudgetExceeded:
+		return drainStopped{scan: true, left: r.left}, true
+	case applyBudgetExceeded, rootNotAllowed:
+		return drainStopped{}, true
+	}
+	return drainStopped{}, false
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -657,6 +675,7 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 			retErr = drainAfterApply(txn, retErr)
 		}
 		endRemoteApply(txn, retErr != nil)
+		retErr = endApplyTally(txn, retErr)
 	}()
 
 	dec := encoding.NewDecoder(update)
@@ -664,6 +683,7 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	// Snapshot state vector before applying anything (used for skip/offset logic).
 	sv := txn.doc.store.StateVector()
 	beginRemoteApply(txn, sv)
+	beginApplyTally(txn)
 
 	numClients, err := dec.ReadVarUint()
 	if err != nil {
@@ -712,10 +732,11 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 		return err
 	}
 
-	ds, dsErr := budget.deleteSet, error(nil)
+	ds, dsRanges, dsErr := budget.deleteSet, budget.deleteSetRanges, error(nil)
 	if !budget.deleteSetRead {
-		ds, dsErr = decodeDeleteSet(dec)
+		ds, dsRanges, dsErr = decodeDeleteSetRanges(dec)
 	}
+	countDecodedRanges(txn, dsRanges)
 	if err := applyDecodedDeleteSet(txn, ds, dsErr); err != nil {
 		return err
 	}
@@ -733,9 +754,12 @@ func drainAfterApply(txn *Transaction, err error) (retErr error) {
 	if err != nil && txn.doc.applying != nil {
 		return err
 	}
+	if t := txn.doc.tally(); t != nil {
+		t.draining = true
+	}
 	defer func() {
 		if r := recover(); r != nil && retErr == nil {
-			retErr = integrationPanicErr(r)
+			retErr = recoveredApplyErr(r)
 		}
 	}()
 	if drainErr := drainParked(txn, drainPending); retErr == nil {
@@ -782,6 +806,8 @@ func decodeStructs(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 
 		kept := false // Yjs's rest takes a client's structs from one that waits
 		for j := uint64(0); j < numStructs; j++ {
+			// Each struct is a value the apply reads, counted before it is read.
+			txn.doc.tally().decode(1)
 			item, err := decodeItem(dec, txn.doc, client, clock)
 			if err != nil {
 				return nil, nil, 0, err
@@ -867,6 +893,7 @@ func integrateGroup(txn *Transaction, group []*Item, existingEnd uint64, pending
 				item.ID.Clock += offset
 				item.Content = item.Content.Splice(offset)
 			}
+			noteIntegrated(txn, item)
 			txn.doc.store.Append(item)
 			// A deferred move whose target is in this GC struct stops waiting.
 			txn.doc.store.resolvePendingMoves(txn, item.ID.Client)
@@ -908,7 +935,7 @@ func integrateGroup(txn *Transaction, group []*Item, existingEnd uint64, pending
 		if rightIsGC(txn, item) {
 			item.Left = nil
 			item.markGCOrphan()
-			appendTrimmed(store, item, existingEnd)
+			appendTrimmed(txn, item, existingEnd)
 			// A deferred move whose target is in this GC struct stops waiting.
 			store.resolvePendingMoves(txn, item.ID.Client)
 			existingEnd = itemEnd
@@ -998,11 +1025,29 @@ func resolveDeferred(txn *Transaction, pending []*Item) ([]*Item, error) {
 // store.pending as long as progress is being made, integrating items and
 // re-parking those still blocked. A parked item whose integration panics is
 // dropped, since retrying it would panic on every later drain, and the drain
-// goes on; the panic is returned as an error. The scan bound's panic is not
-// the item's fault: the pass parks what it did not integrate again and raises
-// the panic, with what it dropped, for drainParked.
+// goes on; the panic is returned as an error. The scan bound, the apply budget
+// and the allowed roots stop the drain instead: what the pass did not
+// integrate parks again, and the stop goes on to drainParked with what the
+// drain dropped (drainStopped).
 // Also retries pendingDs after each successful integration pass.
-func drainPending(txn *Transaction) error {
+func drainPending(txn *Transaction) (dropped error) {
+	var items []*Item // the pass's items, until they park again
+	var done []bool
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if items != nil {
+			parkUndrained(txn, items, done)
+		}
+		if stop, ok := drainStop(r); ok {
+			stop.dropped = dropped
+			r = stop
+		}
+		panic(r)
+	}()
+
 	// pendingDs may be drainable even if pending items aren't — integrated
 	// items from this update might be targets of previously-parked deletes.
 	if len(txn.doc.store.pendingDs.clients) > 0 {
@@ -1021,28 +1066,16 @@ func drainPending(txn *Transaction) error {
 	// update (integratePending keeps its order), but executed inline so
 	// everything integrated during this call surfaces in a single OnUpdate
 	// notification.
-	var dropped error
 	for txn.drainable() {
-		items := txn.doc.store.pending.heldItems()
+		items = txn.doc.store.pending.heldItems()
 		txn.doc.store.pending = nil
 
-		done := make([]bool, len(items))
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					parkUndrained(txn, items, done)
-					if trip, ok := r.(integrateScanBudgetExceeded); ok {
-						trip.dropped = dropped
-						r = trip
-					}
-					panic(r)
-				}
-			}()
-			// A refused parked item is dropped without failing the update, since the
-			// drain cannot tell which update carried it.
-			_ = integratePending(txn, items, done, &dropped)
-		}()
+		done = make([]bool, len(items))
+		// A refused parked item is dropped without failing the update, since the
+		// drain cannot tell which update carried it.
+		_ = integratePending(txn, items, done, &dropped)
 		progressed := parkUndrained(txn, items, done)
+		items = nil
 		// Retry pendingDs — freshly-integrated items may now be targets
 		// of previously-parked delete entries.
 		if progressed && len(txn.doc.store.pendingDs.clients) > 0 {
@@ -1114,13 +1147,13 @@ func (txn *Transaction) drainable() bool {
 }
 
 // drainParked runs drain, the drain of the parked queue that ends an apply,
-// returns its error, and raises again every panic but the bound's; on a
-// document with whole-or-nothing applies, a drain that fails or panics is
-// rolled back first. When the drain's scans reach what the apply left of the
-// bound, the drain keeps what it integrated, or on such a document is rolled
-// back to where it began, and parks the rest again without failing the apply,
-// whose sender did not send the parked items; a later apply, from any sender,
-// tries them again (drainable).
+// returns its error, and raises again every panic but a stop (drainStopped);
+// on a document with whole-or-nothing applies, a drain that fails or panics
+// is rolled back first. When the scan bound, the apply budget or the allowed
+// roots stop the drain, it keeps what it integrated, or on such a document is
+// rolled back to where it began, and parks the rest again without failing the
+// apply, whose sender did not send the parked items; a later apply, from any
+// sender, tries them again (drainable).
 func drainParked(txn *Transaction, drain func(*Transaction) error) (err error) {
 	s := txn.doc.store
 	j := txn.doc.applying
@@ -1142,19 +1175,26 @@ func drainParked(txn *Transaction, drain func(*Transaction) error) (err error) {
 		if r == nil {
 			return
 		}
-		trip, ok := r.(integrateScanBudgetExceeded)
+		stop, ok := r.(drainStopped)
 		if !ok {
 			panic(r)
 		}
-		err = trip.dropped
+		err = stop.dropped
 		if journaled {
-			// Rolled back whole, the drain dropped nothing and needs more than
-			// it began with.
-			trip.left, err = from, nil
+			// Rolled back whole, the drain dropped nothing, and a drain the scan
+			// bound stopped needs more than it began with.
+			err = nil
+			if stop.scan {
+				stop.left = from
+			}
 		}
-		// The drain tripped the bound, so an item may wait on nothing but a
-		// drain with more of the bound left: nothing tells the parked items'
-		// sender to send them again. missing keeps what they do wait on.
+		if s.pending == nil {
+			// A retry of the parked deletes stopped the drain, before any pass.
+			return
+		}
+		// The drain stopped, so an item may wait on nothing but a later drain:
+		// nothing tells the parked items' sender to send them again. missing
+		// keeps what they do wait on.
 		missing := make(StateVector)
 		for _, item := range s.pending.heldItems() {
 			if client, parkedAt, future := itemFutureDep(item, s); future {
@@ -1164,18 +1204,39 @@ func drainParked(txn *Transaction, drain func(*Transaction) error) (err error) {
 			}
 		}
 		s.pending.missing, s.pending.ready = missing, false
-		s.pending.tripped, s.pending.scanLeft = true, trip.left
-		if len(s.pendingDs.clients) > 0 {
-			retryPendingDs(txn)
+		s.pending.tripped, s.pending.scanLeft = true, stop.left
+		if stop.scan && len(s.pendingDs.clients) > 0 {
+			retryPendingDsUntilStopped(txn)
 		}
 	}()
 	return drain(txn)
 }
 
+// retryPendingDsUntilStopped is retryPendingDs for after a drain stopped: a
+// retry the apply budget or the allowed roots stop leaves its deletes parked
+// and the apply standing.
+func retryPendingDsUntilStopped(txn *Transaction) {
+	defer func() {
+		if r := recover(); r != nil {
+			if _, stop := drainStop(r); !stop {
+				panic(r)
+			}
+		}
+	}()
+	retryPendingDs(txn)
+}
+
 // recoveredApplyErr is the error an apply returns for a panic it recovered.
 func recoveredApplyErr(r any) error {
-	if _, ok := r.(integrateScanBudgetExceeded); ok {
+	switch r := r.(type) {
+	case integrateScanBudgetExceeded:
 		return ErrIntegrateScanBudget
+	case applyBudgetExceeded:
+		return ErrApplyBudget
+	case rootNotAllowed:
+		return ErrRootNotAllowed
+	case budgetCallbackPanic:
+		return fmt.Errorf("%w: panic in the %s callback: %v", ErrInvalidUpdate, r.option, r.v)
 	}
 	return integrationPanicErr(r)
 }
@@ -1251,6 +1312,9 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 			// Named root type.
 			name, err := dec.ReadVarString()
 			if err != nil {
+				return nil, err
+			}
+			if err := refuseRoot(doc, name); err != nil {
 				return nil, err
 			}
 			parent = doc.getOrCreateType(name)
@@ -1359,11 +1423,16 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if n > uint64(dec.Remaining()) {
 			return nil, ErrInvalidUpdate
 		}
+		// The declared count is charged before a list is made for it; what each
+		// value holds is counted off the value its text decoded to.
+		tally := doc.tally()
+		tally.decode(int(n))
 		if n == 0 || !isAnyTag(dec.RemainingBytes()[0]) {
 			vals, err := readJSONVals(dec, n)
 			if err != nil {
 				return nil, err
 			}
+			tally.nestedAll(vals)
 			return NewContentJSON(vals...), nil
 		}
 		// ygo ≤1.51.0 wrote lib0 Any per value, always starting with a tag
@@ -1377,11 +1446,13 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 			for range len(rem) - sub.Remaining() {
 				_, _ = dec.ReadUint8()
 			}
+			tally.nestedAll(vals)
 			return NewContentJSON(vals...), nil
 		}
 		if vals, err = readLegacyAnyVals(dec, n); err != nil {
 			return nil, jsonErr
 		}
+		tally.nestedAll(vals)
 		return NewContentJSON(vals...), nil
 
 	case wireBinary:
@@ -1410,6 +1481,7 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		doc.tally().value(v)
 		return NewContentEmbed(v), nil
 
 	case wireFormat:
@@ -1425,6 +1497,7 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		doc.tally().value(val)
 		return NewContentFormat(key, val), nil
 
 	case wireType:
@@ -1446,6 +1519,8 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if n > uint64(dec.Remaining()) {
 			return nil, ErrInvalidUpdate
 		}
+		// Every value is counted off the frame before the list is made.
+		countAnyRun(doc.tally(), dec, n)
 		vals := make([]any, n)
 		for i := range vals {
 			if vals[i], err = dec.ReadAny(); err != nil {
@@ -1463,6 +1538,7 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		countAnyRun(doc.tally(), dec, 1)
 		optsAny, err := dec.ReadAny()
 		if err != nil {
 			return nil, err
@@ -1553,7 +1629,14 @@ func decodeTypeContent(dec *encoding.Decoder, doc *Doc, typeClass byte) (*abstra
 
 // decodeDeleteSet returns the ranges it read in full, sorted and merged per
 // client, also on an error, since Yjs has applied those by then.
-func decodeDeleteSet(dec *encoding.Decoder) (ds DeleteSet, err error) {
+func decodeDeleteSet(dec *encoding.Decoder) (DeleteSet, error) {
+	ds, _, err := decodeDeleteSetRanges(dec)
+	return ds, err
+}
+
+// decodeDeleteSetRanges is decodeDeleteSet with ranges, how many ranges it
+// read off the frame before the sort and merge, which an apply counts.
+func decodeDeleteSetRanges(dec *encoding.Decoder) (ds DeleteSet, ranges int, err error) {
 	defer func() {
 		for c := range ds.clients {
 			ds.sortAndCompact(c)
@@ -1561,7 +1644,7 @@ func decodeDeleteSet(dec *encoding.Decoder) (ds DeleteSet, err error) {
 	}()
 	n, err := dec.ReadVarUint()
 	if err != nil {
-		return newOrderedDeleteSet(), err
+		return newOrderedDeleteSet(), 0, err
 	}
 	// A first pass on a copy of the cursor counts each client's ranges, so the
 	// decode sizes every list once; an entry with a range takes at least four
@@ -1570,14 +1653,14 @@ func decodeDeleteSet(dec *encoding.Decoder) (ds DeleteSet, err error) {
 	scanErr := readDeleteSet(&scan, n, tally.count)
 	if len(tally.clients) == 0 {
 		*dec = scan // the pass read what the decode would, and added nothing
-		return newOrderedDeleteSet(), scanErr
+		return newOrderedDeleteSet(), 0, scanErr
 	}
 	tally.merge()
 	ds = tally.deleteSet()
 	err = readDeleteSet(dec, n, func(client ClientID, r DeleteRange, _ bool) {
 		ds.appendDecoded(client, r, &tally)
 	})
-	return ds, err
+	return ds, tally.total(), err
 }
 
 // readDeleteSet reads the n client entries of a V1 delete set, calling add for
@@ -1799,13 +1882,15 @@ func jsonNumbers(v any) any {
 
 // appendTrimmed stores an item without integrating it, dropping the prefix the
 // store already has for its client. existingEnd must be at least the item's
-// clock.
-func appendTrimmed(store *StructStore, item *Item, existingEnd uint64) {
+// clock. The item is checked and counted as one that integrates
+// (noteIntegrated).
+func appendTrimmed(txn *Transaction, item *Item, existingEnd uint64) {
 	if offset := existingEnd - item.ID.Clock; offset > 0 {
 		item.ID.Clock += offset
 		item.Content = item.Content.Splice(offset)
 	}
-	store.Append(item)
+	noteIntegrated(txn, item)
+	txn.doc.store.Append(item)
 }
 
 // errGCContinuation refuses an item whose new clocks follow its client's GC
@@ -1959,7 +2044,7 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 	// contiguous per-client list. The guards above leave clock <= existingEnd
 	// here, so the offset is never negative.
 	if item.Parent == nil && item.Deleted {
-		appendTrimmed(store, item, existingEnd)
+		appendTrimmed(txn, item, existingEnd)
 		store.resolvePendingMoves(txn, item.ID.Client)
 		return true, 0, nil
 	}
@@ -2023,7 +2108,7 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 			// which diverges by integration order (#156). Store it as the GC
 			// struct Yjs integrates it as.
 			item.markGCOrphan()
-			appendTrimmed(store, item, existingEnd)
+			appendTrimmed(txn, item, existingEnd)
 			store.resolvePendingMoves(txn, item.ID.Client)
 			return true, 0, nil
 		}
@@ -2077,7 +2162,7 @@ func tryIntegrate(txn *Transaction, item *Item) (ok bool, waitsOn ClientID, err 
 	if (item.Left != nil && item.Left.isGCOrphan()) || typeCollected(item.Parent) || rightIsGC(txn, item) {
 		item.Left = nil
 		item.markGCOrphan()
-		appendTrimmed(store, item, existingEnd)
+		appendTrimmed(txn, item, existingEnd)
 		store.resolvePendingMoves(txn, item.ID.Client)
 		return true, 0, nil
 	}

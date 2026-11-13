@@ -71,6 +71,16 @@ func (t *rangeTally) merge() {
 	t.clients = merged
 }
 
+// total is how many ranges the pass counted over every client: the ranges the
+// frame carried, before the decode sorts and merges them.
+func (t *rangeTally) total() int {
+	n := 0
+	for _, c := range t.clients {
+		n += c.ranges
+	}
+	return n
+}
+
 // deleteSet returns an ordered set with room for the tally's clients.
 func (t *rangeTally) deleteSet() DeleteSet {
 	return DeleteSet{clients: make(map[ClientID][]DeleteRange, len(t.clients)), order: make([]ClientID, 0, len(t.clients))}
@@ -196,7 +206,9 @@ func (ds *DeleteSet) orderedClients() []ClientID {
 
 // retryPendingDs reapplies the parked deletions that can now apply, in the
 // order Yjs re-reads its pending delete set. Under a journal the take writes
-// into a copy of the pending deletes (ownPendingDs).
+// into a copy of the pending deletes (ownPendingDs). A retry the apply budget
+// or the allowed roots stop parks every range it took again, the ones it
+// applied included, since a delete applies only once, ready for a later retry.
 func retryPendingDs(txn *Transaction) {
 	store := txn.doc.store
 	if len(store.pendingDsMoved) > 0 {
@@ -207,6 +219,20 @@ func retryPendingDs(txn *Transaction) {
 		return
 	}
 	slices.SortFunc(ready.order, func(a, b ClientID) int { return cmp.Compare(b, a) })
+	defer func() {
+		if r := recover(); r != nil {
+			if _, stop := drainStop(r); stop {
+				parkDeletes(txn, ready)
+				if store.pendingDsMoved == nil {
+					store.pendingDsMoved = make(map[ClientID]struct{}, len(ready.clients))
+				}
+				for client := range ready.clients {
+					store.pendingDsMoved[client] = struct{}{}
+				}
+			}
+			panic(r)
+		}
+	}()
 	store.parkDeletes(ready.applyToPartial(txn))
 }
 
@@ -352,11 +378,11 @@ func checkParkedDeletes(doc *Doc, b *pendingBudget) error {
 	if n, err := parkingRangesBound(b.deleteSetScanner(), b.initial); err != nil || n <= b.deleteRoom {
 		return nil
 	}
-	ds, err := deleteSetOf(b)
+	ds, ranges, err := deleteSetRangesOf(b)
 	if err != nil {
 		return nil
 	}
-	b.deleteSet, b.deleteSetRead = ds, true
+	b.deleteSet, b.deleteSetRead, b.deleteSetRanges = ds, true, ranges
 	clocks, err := structClocksOf(b)
 	if err != nil {
 		return wrapUpdateErr(err)
@@ -402,14 +428,20 @@ func (b *pendingBudget) readsDeleteSet() bool {
 // deleteSetOf reads the delete set of b's V1 or V2 update, where the walk of
 // its structs found it.
 func deleteSetOf(b *pendingBudget) (DeleteSet, error) {
+	ds, _, err := deleteSetRangesOf(b)
+	return ds, err
+}
+
+// deleteSetRangesOf is deleteSetOf with the ranges it read off the frame.
+func deleteSetRangesOf(b *pendingBudget) (DeleteSet, int, error) {
 	if err := b.walkGroups(); err != nil {
-		return DeleteSet{}, err
+		return DeleteSet{}, 0, err
 	}
 	s := b.deleteSetScanner()
 	if b.v2 {
-		return decodeDeleteSetV2(s.v2)
+		return decodeDeleteSetV2Ranges(s.v2)
 	}
-	return decodeDeleteSet(s.rest)
+	return decodeDeleteSetRanges(s.rest)
 }
 
 // parkingRangesBound counts, without allocating, the ranges of the delete set s
