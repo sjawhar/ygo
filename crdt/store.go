@@ -189,6 +189,21 @@ func (s *StructStore) resolvePendingMoves(txn *Transaction, client ClientID) {
 	}
 }
 
+// Count returns how many structs the store holds, every client's together. It
+// walks the clients rather than keeping a running total, so it costs one step
+// per client and allocates nothing. A total would have to be kept in step by
+// every write to clients - Append, insertItem's split halves, the commit's
+// squashRuns and tryMergeWithLeft, and RunGC's merge of adjacent tombstones -
+// and a total that drifts from the store is worse than one that costs a walk
+// of the clients to read.
+func (s *StructStore) Count() int {
+	n := 0
+	for _, items := range s.clients {
+		n += len(items)
+	}
+	return n
+}
+
 // StateVector computes the current state vector: for each client, the clock of
 // the last item + its length (i.e. the next expected clock from that client).
 func (s *StructStore) StateVector() StateVector {

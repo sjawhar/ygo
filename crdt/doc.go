@@ -935,6 +935,28 @@ func (d *Doc) StateVector() StateVector {
 	return d.store.StateVector()
 }
 
+// StructCount returns how many structs the document holds: the items of every
+// client, deleted items and the placeholders of garbage-collected ones
+// included. A struct holds a run of content, not one element, and an insert or
+// a delete inside a run splits it, so the count follows how the content was
+// edited and how it arrived, not only what it is. It is this replica's count:
+// text typed one character per transaction is a struct per character on the
+// writer and on a replica that applied each transaction's update, and one
+// struct on a replica that loads the writer's state in one update.
+//
+// Structs parked until a missing dependency arrives are not counted until they
+// integrate (PendingStats reports them), and a subdocument's structs are
+// counted by its own Doc.
+//
+// StructCount walks the document's clients, not its structs, and allocates
+// nothing. It takes the document's read lock, and so must not be called
+// inside a Transact callback (see Transact and GetText; issue #138).
+func (d *Doc) StructCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.store.Count()
+}
+
 // EncodeStateAsUpdate encodes the full document state as a V1 binary update.
 func (d *Doc) EncodeStateAsUpdate() []byte {
 	return EncodeStateAsUpdateV1(d, nil)
