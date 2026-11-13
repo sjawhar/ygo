@@ -37,7 +37,7 @@ func TestUnit_Any_IntegerOutsideInt32_IsWrittenAsLib0Writes(t *testing.T) {
 		{"2^53-1", int64(1<<53 - 1), "7b433fffffffffffff"},
 		{"uint64 2^63", uint64(1 << 63), "7c5f000000"},
 		{"uint64 max", uint64(math.MaxUint64), "7c5f800000"},
-		{"int 2^40", int(1 << 40), "7c53800000"},
+		{"int -2^31", int(math.MinInt32), "7ccf000000"}, // a 32-bit int holds it too
 		{"uint32 2^31", uint32(1 << 31), "7c4f000000"},
 	}
 	for _, tc := range cases {
