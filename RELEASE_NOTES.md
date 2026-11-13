@@ -276,6 +276,28 @@ is the cut itself, for a caller with its own transport, and
 `sync.EncodeSyncStep2Split` is the answer as sync messages;
 `sync.EncodeSyncStep2` is unchanged.
 
+**Who is affected: nobody, unless you choose to be.** Nothing that exists
+changes.
+
+**`Doc.StructCount` reports how many structs a document holds.** What a
+document costs follows its structs as well as its content. The same 10,000
+characters typed in one transaction are one struct, a 10,011-byte state that
+a new document loads with 36 allocations and 13 KB. Typed one character per
+transaction, each at the front, they are 10,000 structs, a 59,878-byte state
+that a new document loads with 40,088 allocations and 2.5 MB. The store is
+unexported, and until now no method reported this count.
+
+The count takes in every client's items, deleted items and garbage-collected
+placeholders. It leaves out structs parked until a missing dependency arrives,
+which `PendingStats` reports, and a subdocument's structs, which its own `Doc`
+counts. It is this replica's count: text typed one character per transaction
+is a struct per character on the writer and on a server that applied each
+keystroke's update as it arrived, and one struct on a replica that loads the
+writer's state in one update.
+
+`StructCount` takes the document's read lock, so call it outside `Transact`.
+It walks the document's clients rather than its structs and allocates nothing.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single
