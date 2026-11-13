@@ -33,9 +33,9 @@ var ErrRootNotAllowed = fmt.Errorf("%w: it writes under a root the document does
 //
 // Decoded is the values the apply read, the run that passed the budget
 // included. Structs and Bytes are the structs of the update the apply added
-// to the document and the bytes they carry; the struct that would have
-// passed the budget is not among them. Split is the structs the apply made by
-// splitting items the document held. On a document with
+// to the document, parked ones included, and the bytes they carry; the struct
+// that would have passed the budget is not among them. Split is the structs
+// the apply made by splitting items the document held. On a document with
 // WithWholeOrNothingApplies the document keeps none of it, and otherwise it
 // keeps what Structs, Bytes and Split count. Root is the root a refused
 // update named or reached that the list does not allow, and empty for any
@@ -208,17 +208,32 @@ func (t *applyTally) nestedAll(vals []any) {
 // it does: it refuses the apply when item would hang under a root the list
 // does not allow (checkItemRoot), and when the update's own structs or bytes
 // would pass the budget with it, and otherwise counts it. A struct the drain
-// of the parked queue adds is checked against the list but not counted: an
-// earlier update parked it.
+// of the parked queue adds is checked against the list but not counted: the
+// update that parked it was charged for it (noteParked).
 func noteIntegrated(txn *Transaction, item *Item) {
 	t := txn.doc.tally()
 	if t == nil {
 		return
 	}
 	t.checkItemRoot(txn.doc, item.Parent)
-	if t.draining {
-		return
+	if !t.draining {
+		t.count(item)
 	}
+}
+
+// noteParked counts item, a struct of the update about to park behind a
+// clock the document lacks, against the update's structs and bytes, and
+// refuses the apply before it parks when it would pass the budget: the
+// document holds a parked struct and integrates it once the gap is filled.
+func noteParked(txn *Transaction, item *Item) {
+	if t := txn.doc.tally(); t != nil && !t.draining {
+		t.count(item)
+	}
+}
+
+// count refuses the apply when item would take the update's structs or bytes
+// past the budget, and otherwise counts it.
+func (t *applyTally) count(item *Item) {
 	bytes := contentBytes(item.Content)
 	if b := t.budget; over(b.Structs, t.structs+1) || over(b.Bytes, t.bytes+bytes) {
 		panic(applyBudgetExceeded{})

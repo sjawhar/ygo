@@ -1843,3 +1843,72 @@ func TestUnit_ApplyBudget_ADrainsSplitsCountAgainstTheApplyThatFillsTheGap(t *te
 		t.Fatalf("the document reads %q with %d parked, want %q and none", got, doc.PendingStats().Items, want)
 	}
 }
+
+// A struct of the update that parks behind a clock the document lacks counts
+// against Structs and Bytes when it parks, so a sender cannot pass the budget
+// by writing behind a clock it never sends: the document would hold the
+// struct, carry it in its stored state and integrate it once the gap is
+// filled. Under Structs: 1 an update that parks two structs is refused at the
+// second and keeps the first parked; under Bytes: 1 one that parks "BC" is
+// refused and parks nothing. The apply that fills the gap is not charged for
+// a parked struct again.
+func TestUnit_ApplyBudget_CountsTheStructsAnUpdateParks(t *testing.T) {
+	parked := gapStringUpdate(1, "BC", &ID{Client: 2, Clock: 0}) // waits on 2@0
+	budget := func(structs, bytes int) func(any) ApplyBudget {
+		return func(any) ApplyBudget { return ApplyBudget{Structs: structs, Bytes: bytes} }
+	}
+
+	// Two structs of client 2 past a clock 0 the document never receives:
+	// "B" beside it and "C" before it.
+	writer := New(WithClientID(2))
+	text := writer.GetText("t")
+	writer.Transact(func(txn *Transaction) { text.Insert(txn, 0, "A", nil) })
+	held := writer.StateVector()
+	writer.Transact(func(txn *Transaction) { text.Insert(txn, 1, "B", nil) })
+	writer.Transact(func(txn *Transaction) { text.Insert(txn, 0, "C", nil) })
+	twoParked := EncodeStateAsUpdateV1(writer, held)
+
+	for _, c := range []struct {
+		name   string
+		budget func(any) ApplyBudget
+		update []byte
+		kept   int // structs parked, and bytes, when the apply stops
+	}{
+		{"Structs: 1", budget(1, 0), twoParked, 1},
+		{"Bytes: 1", budget(0, 1), parked, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			doc := New(WithClientID(7))
+			doc.SetApplyBudget(c.budget)
+			err := ApplyUpdateV1(doc, c.update, nil)
+			var refused *RefusedUpdateError
+			if !errors.Is(err, ErrApplyBudget) || !errors.As(err, &refused) {
+				t.Fatalf("the parking update returned %v, want ErrApplyBudget in a RefusedUpdateError", err)
+			}
+			if got := doc.PendingStats().Items; got != c.kept {
+				t.Fatalf("%d structs parked, want %d", got, c.kept)
+			}
+			if refused.Structs != c.kept || refused.Bytes != c.kept {
+				t.Fatalf("the refusal reports %d structs and %d bytes, want %d of each", refused.Structs, refused.Bytes, c.kept)
+			}
+		})
+	}
+
+	// A budget that holds the struct parks it, and the update that fills the
+	// gap is charged for its own struct alone, though its drain lands both.
+	doc := New(WithClientID(7))
+	doc.SetApplyBudget(budget(1, 2))
+	if err := ApplyUpdateV1(doc, parked, nil); err != nil {
+		t.Fatalf("the parking update was refused under a budget that holds it: %v", err)
+	}
+	if got := doc.PendingStats().Items; got != 1 {
+		t.Fatalf("%d structs parked, want the one the update carried", got)
+	}
+	doc.SetApplyBudget(budget(1, 1))
+	if err := ApplyUpdateV1(doc, gapStringUpdate(0, "A", nil), nil); err != nil {
+		t.Fatalf("the update that fills the gap was refused: %v", err)
+	}
+	if got := doc.GetText("t").ToString(); got != "ABC" || doc.PendingStats().Items != 0 {
+		t.Fatalf("the document reads %q with %d parked, want \"ABC\" and none", got, doc.PendingStats().Items)
+	}
+}

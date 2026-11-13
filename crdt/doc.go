@@ -171,7 +171,8 @@ type ApplyBudget struct {
 	// bounds the memory one update can take while it is decoded.
 	Decoded int
 	// Structs is the structs of the update the apply may add to the
-	// document. The structs a delete makes by splitting items the document
+	// document, a struct that parks behind a clock the document lacks
+	// included. The structs a delete makes by splitting items the document
 	// holds are not among them, so Structs never refuses a delete.
 	Structs int
 	// Bytes is the bytes of content those structs may carry: text, binary,
@@ -197,9 +198,10 @@ type ApplyBudget struct {
 // ErrApplyBudget in a RefusedUpdateError. As for the scan bound
 // (WithIntegrateScanBudget), the document keeps what the apply integrated
 // before it stopped, which ApplyUpdateV1Landed reports, and keeps nothing on
-// a document that also has WithWholeOrNothingApplies. A struct the drain of
-// the parked queue integrates was sent by an earlier update and does not
-// count against the apply that fills its gap. Local transactions are never
+// a document that also has WithWholeOrNothingApplies. A struct of the update
+// that parks behind a clock the document lacks counts when it parks, and a
+// struct the drain of the parked queue integrates does not count again
+// against the apply that fills its gap. Local transactions are never
 // bounded. A budget that limits nothing changes nothing an apply does, and
 // every failed remote apply on the document returns a RefusedUpdateError.
 func WithApplyBudget(budget func(origin any) ApplyBudget) DocOption {

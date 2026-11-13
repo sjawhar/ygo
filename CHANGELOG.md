@@ -61,9 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RefusedUpdateError` that reports what the apply decoded and added. As for
   the scan bound, the document keeps what the apply integrated before it
   stopped, which `ApplyUpdateV1Landed` reports, and keeps nothing with
-  `WithWholeOrNothingApplies`. A struct the drain of the parked queue
-  integrates is not counted against the apply that fills its gap. An option
-  set to limit nothing changes nothing an apply does.
+  `WithWholeOrNothingApplies`. A struct of the update that parks behind a
+  clock the document lacks counts when it parks, and the drain that later
+  integrates it does not count it against the apply that fills its gap. An
+  option set to limit nothing changes nothing an apply does.
 
 ### Changed
 

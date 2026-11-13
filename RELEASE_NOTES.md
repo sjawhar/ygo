@@ -198,9 +198,11 @@ they are in memory. `crdt.WithAllowedRoots(func(origin any) []string)` names
 the root types an apply may write under, at any depth. An apply that would
 pass its budget or leave its roots stops before that struct enters the
 document and returns `crdt.ErrApplyBudget` or `crdt.ErrRootNotAllowed` in a
-`crdt.RefusedUpdateError` that reports what it decoded and added. The document
-keeps what the apply integrated before it stopped, as for the scan bound, and
-keeps nothing on a document with `WithWholeOrNothingApplies`, which is the one
+`crdt.RefusedUpdateError` that reports what it decoded and added. A struct
+that waits on a missing clock counts when it parks, so a sender cannot pass
+the budget by writing behind a clock it never sends. The document keeps what
+the apply integrated before it stopped, as for the scan bound, and keeps
+nothing on a document with `WithWholeOrNothingApplies`, which is the one
 option that rolls an apply back. A budget that limits nothing, or a list that
 names every root an update writes, changes nothing an apply does.
 
