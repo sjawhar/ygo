@@ -218,7 +218,11 @@ func TestUnit_Any_AllVariants(t *testing.T) {
 			e.WriteAny(tc.val)
 			got, err := encoding.NewDecoder(e.Bytes()).ReadAny()
 			require.NoError(t, err)
-			assert.Equal(t, tc.val, got)
+			want := tc.val
+			if f, ok := tc.val.(float32); ok {
+				want = float64(f) // tag 124 reads back as the float64 it holds
+			}
+			assert.Equal(t, want, got)
 		})
 	}
 }
@@ -281,7 +285,8 @@ func TestGolden_Any_Lib0FloatBytes(t *testing.T) {
 		wire := []byte{124, 0x3f, 0xc0, 0x00, 0x00}
 		got, err := encoding.NewDecoder(wire).ReadAny()
 		require.NoError(t, err)
-		assert.InDelta(t, float32(1.5), got, 0)
+		assert.IsType(t, float64(0), got, "lib0 reads tag 124 as a Number")
+		assert.InDelta(t, 1.5, got, 0)
 
 		e := encoding.NewEncoder()
 		e.WriteAny(float32(1.5))
@@ -727,11 +732,11 @@ func TestUnit_Any_VeryLargeUint64_FallsBackToFloat64(t *testing.T) {
 	got := e.Bytes()
 	require.Len(t, got, 5, "tag(1) + float32(4) = 5 bytes")
 	assert.Equal(t, byte(124), got[0], "uint64 > MaxInt64 at 2^64 must use tag 124 (float32)")
-	// Round-trip returns a float with precision loss (expected — same as JS).
+	// Round-trip returns a float64 with precision loss (expected — same as JS).
 	dec := encoding.NewDecoder(got)
 	decoded, err := dec.ReadAny()
 	require.NoError(t, err)
-	assert.IsType(t, float32(0), decoded)
+	assert.IsType(t, float64(0), decoded)
 }
 
 // IEEE-754 specials: NaN can't equal itself so isFloat32Lossless returns false
@@ -763,9 +768,9 @@ func TestUnit_Any_FloatSpecials(t *testing.T) {
 		dec := encoding.NewDecoder(got)
 		decoded, err := dec.ReadAny()
 		require.NoError(t, err)
-		f, ok := decoded.(float32)
+		f, ok := decoded.(float64)
 		require.True(t, ok)
-		assert.True(t, math.IsInf(float64(f), 1))
+		assert.True(t, math.IsInf(f, 1))
 	})
 	t.Run("NegInf_narrows_to_float32", func(t *testing.T) {
 		e := encoding.NewEncoder()

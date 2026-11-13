@@ -181,9 +181,11 @@ func (e *Encoder) writeNegVarUint(v uint64) {
 //
 //	nil            -> 126 (null)
 //	bool           -> 120 (true) / 121 (false)
-//	int / int64    -> 125 + VarInt
+//	integers       -> 125 + VarInt while |v| <= 2^31-1, else as a float64
+//	                  up to ±2^53, else 122 + 8 bytes BE (writeAnyInt)
 //	float32        -> 124 + 4 bytes BE
-//	float64        -> 123 + 8 bytes BE
+//	float64        -> 124 + 4 bytes BE when a float32 holds it exactly,
+//	                  else 123 + 8 bytes BE
 //	BigInt         -> 122 + 8 bytes BE
 //	string         -> 119 + VarString
 //	[]byte         -> 116 + VarBytes

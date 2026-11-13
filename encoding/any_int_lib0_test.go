@@ -15,8 +15,8 @@ import (
 // a JavaScript Number: tag 125 while |v| <= 2^31-1, then tag 124 (float32)
 // when a float32 holds the value exactly, then tag 123 (float64). The bytes
 // below are lib0's own, from writeAny in Node, so the test pins the wire form
-// and not only the tag. A value lib0 writes as tag 124 reads back as a
-// float32, as lib0's readAny reads it back as a float.
+// and not only the tag. A value lib0 writes as tag 124 or 123 reads back as a
+// float64, as lib0's readAny reads either as a Number.
 func TestUnit_Any_IntegerOutsideInt32_IsWrittenAsLib0Writes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -53,15 +53,11 @@ func TestUnit_Any_IntegerOutsideInt32_IsWrittenAsLib0Writes(t *testing.T) {
 			require.NoError(t, err)
 			switch want[0] {
 			case 125:
-				assert.IsType(t, int64(0), got, "tag 125 reads back as an integer")
-			case 124:
-				f, ok := got.(float32)
-				require.True(t, ok, "tag 124 reads back as a float32, as lib0 reads a float; got %T", got)
-				// Delta 0: a float32 holds every value of this class exactly.
-				assert.InDelta(t, asFloat64(tc.v), float64(f), 0)
-			case 123:
+				assert.Equal(t, tc.v, got, "tag 125 reads back as an int64")
+			case 124, 123:
 				f, ok := got.(float64)
-				require.True(t, ok, "tag 123 reads back as a float64; got %T", got)
+				require.True(t, ok, "tag %d reads back as a float64; got %T", want[0], got)
+				// Delta 0: a float32 holds every tag-124 value of this class exactly.
 				assert.InDelta(t, asFloat64(tc.v), f, 0)
 			}
 		})
