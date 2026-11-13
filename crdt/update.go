@@ -1161,11 +1161,14 @@ func (txn *Transaction) drainable() bool {
 func drainParked(txn *Transaction, drain func(*Transaction) error) (err error) {
 	s := txn.doc.store
 	j := txn.doc.applying
+	t := txn.doc.tally()
 	// Only a drain that tries the parked items can change them or trip the bound.
 	journaled := j != nil && txn.drainable()
 	from := txn.scanLeft
+	var counted drainCount
 	if journaled {
 		j.beginDrain(txn)
+		counted = t.beginDrain()
 	}
 	// The parked structs this drain drops are counted only if it stands.
 	var drops int
@@ -1180,6 +1183,7 @@ func drainParked(txn *Transaction, drain func(*Transaction) error) (err error) {
 				if t := txn.doc.tally(); t != nil {
 					t.rootDrops = t.rootDrops[:drops]
 				}
+				t.takeBackDrain(counted)
 			} else {
 				j.endDrain()
 			}

@@ -82,6 +82,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tells no observer, with or without `WithWholeOrNothingApplies`. The option
   refuses no subdocument or move unless its answer names that kind, and an
   answer of no kinds changes nothing an apply does.
+- **`crdt`: `WithApplyReport` reports what each remote apply left the
+  document holding.** Its callback, also set by `Doc.SetApplyReport`, is
+  called once for each remote apply that commits, under the document's lock
+  after the commit's merges and before the apply's observers, with the
+  apply's origin and an `ApplyReport`: `DocStructs`, the document's total of
+  structs with the parked ones included, and `Integrated`, `Bytes`, `Split`
+  and `Decoded`, the apply's own counts as `ApplyBudget` measures them. An
+  apply that fails after it began to integrate reports what the document
+  kept of it, the counts its `RefusedUpdateError` carries; an apply that
+  leaves the document as it was, refused before it integrated or rolled back
+  by `WithWholeOrNothingApplies`, reports nothing. A drain that
+  `WithWholeOrNothingApplies` takes back leaves none of its splits in
+  `Split`. The option bounds and refuses nothing, and a panic of its callback
+  reaches the apply's caller once the commit has finished.
 
 ### Changed
 

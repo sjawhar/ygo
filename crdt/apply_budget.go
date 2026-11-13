@@ -23,9 +23,9 @@ var ErrApplyBudget = fmt.Errorf("%w: it decodes or adds more than the document a
 var ErrRootNotAllowed = fmt.Errorf("%w: it writes under a root the document does not allow", ErrInvalidUpdate)
 
 // RefusedUpdateError is the error a remote apply (ApplyUpdate and its V1 and
-// V2 forms) returns on a document with WithApplyBudget, WithAllowedRoots or
-// WithRefusedContent when the apply fails, for any reason, with what it did
-// before it stopped.
+// V2 forms) returns on a document with WithApplyBudget, WithAllowedRoots,
+// WithRefusedContent or WithApplyReport when the apply fails, for any
+// reason, with what it did before it stopped.
 //
 // Err is why it failed: ErrApplyBudget, ErrRootNotAllowed,
 // ErrContentNotAllowed, or any other error of a remote apply, such as
@@ -116,7 +116,8 @@ func over(limit, used int) bool {
 }
 
 // tally is the tally of the remote apply running on d, or nil when none runs,
-// when d has no budget, roots list or refused content kinds, or when d is nil.
+// when d has no budget, roots list, refused content kinds or report, or when
+// d is nil.
 func (d *Doc) tally() *applyTally {
 	if d == nil {
 		return nil
@@ -125,11 +126,11 @@ func (d *Doc) tally() *applyTally {
 }
 
 // beginApplyTally starts the tally of txn's apply when its document has a
-// budget, a roots list or refused content kinds, asking each callback once,
-// with the apply's origin.
+// budget, a roots list, refused content kinds or a report, asking each
+// callback once, with the apply's origin.
 func beginApplyTally(txn *Transaction) {
 	d := txn.doc
-	if d.applyBudget == nil && d.allowedRoots == nil && d.refusedContent == nil {
+	if d.applyBudget == nil && d.allowedRoots == nil && d.refusedContent == nil && d.applyReport == nil {
 		return
 	}
 	// The tally starts before the callbacks run, so an apply whose callback
@@ -158,7 +159,9 @@ func beginApplyTally(txn *Transaction) {
 // endApplyTally ends txn's tally and returns err, the apply's error, as a
 // RefusedUpdateError carrying the counts when the apply failed. It counts the
 // parked structs the drain dropped, unless a whole-or-nothing document took
-// the apply back.
+// the apply back. An apply whose transaction commits what it did, one neither
+// refused before it integrated nor rolled back, keeps the tally for its
+// report, which the commit makes (WithApplyReport).
 func endApplyTally(txn *Transaction, err error) error {
 	d := txn.doc
 	t := d.counting
@@ -174,10 +177,34 @@ func endApplyTally(txn *Transaction, err error) error {
 			d.rootsDropped[client]++
 		}
 	}
+	if d.applyReport != nil && !txn.refused && !txn.rolledBack {
+		d.reporting = t
+	}
 	if err == nil {
 		return nil
 	}
 	return &RefusedUpdateError{Err: err, Decoded: t.decoded, Structs: t.structs, Bytes: t.bytes, Split: t.split, Root: t.root}
+}
+
+// drainCount is the count as a drain of the pending queue began, which a
+// drain taken back returns to (takeBackDrain).
+type drainCount struct{ split int }
+
+// beginDrain is the count as the drain of the parked queue begins.
+func (t *applyTally) beginDrain() drainCount {
+	if t == nil {
+		return drainCount{}
+	}
+	return drainCount{t.split}
+}
+
+// takeBackDrain returns the counts to at, where the drain began, once
+// WithWholeOrNothingApplies has taken the drain back: the document keeps
+// none of its splits.
+func (t *applyTally) takeBackDrain(at drainCount) {
+	if t != nil {
+		t.split = at.split
+	}
 }
 
 // decode counts n values the apply read and refuses the apply once they pass
