@@ -27,17 +27,42 @@ func (failingJSONMarshaler) MarshalJSON() ([]byte, error) {
 
 // assertToJSONMatchesEncodingJSON checks ToJSON against json.Marshal of the
 // same container's ToSlice or Entries, the output ToJSON had before it stopped
-// recursing. The comparison is byte for byte rather than JSONEq: key order and
-// number formatting are part of what is checked.
+// recursing, with one difference: each float32 is marshalled as the float64 it
+// equals, since ToJSON prints the digits a float32's value holds where
+// encoding/json prints the shortest digits that identify the float32. The
+// comparison is byte for byte rather than JSONEq: key order and number
+// formatting are part of what is checked.
 func assertToJSONMatchesEncodingJSON(t *testing.T, got []byte, gotErr error, value any) {
 	t.Helper()
-	want, wantErr := json.Marshal(value)
+	want, wantErr := json.Marshal(float32sAsFloat64s(value))
 	if wantErr != nil {
 		require.EqualError(t, gotErr, wantErr.Error())
 		return
 	}
 	require.NoError(t, gotErr)
 	assert.Equal(t, string(want), string(got))
+}
+
+// float32sAsFloat64s deep-copies the []any and map[string]any in v with each
+// float32 replaced by the float64 it equals.
+func float32sAsFloat64s(v any) any {
+	switch v := v.(type) {
+	case float32:
+		return float64(v)
+	case []any:
+		out := make([]any, len(v))
+		for i, e := range v {
+			out[i] = float32sAsFloat64s(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, e := range v {
+			out[k] = float32sAsFloat64s(e)
+		}
+		return out
+	}
+	return v
 }
 
 func TestUnit_ToJSON_ValuesMatchEncodingJSON(t *testing.T) {
@@ -94,7 +119,7 @@ func TestUnit_ToJSON_ValuesMatchEncodingJSON(t *testing.T) {
 	}
 }
 
-func TestUnit_ToJSON_FloatsMatchEncodingJSON(t *testing.T) {
+func TestUnit_ToJSON_FloatsMatchEncodingJSONFloat64(t *testing.T) {
 	values := []any{
 		0.0, 1e-6, 9.999999999999999e-7, 1e20, 1e21, 999999999999999900000.0,
 		0.1, -2.5, math.MaxFloat64, math.SmallestNonzeroFloat64,

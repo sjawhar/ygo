@@ -419,9 +419,10 @@ func (a *YArray) toSliceLocked() []any {
 
 // ToJSON returns the array serialised as a JSON array: the bytes
 // json.Marshal(a.ToSlice()) would produce, without recursing once per nested
-// shared type. Values are copied out under the document's read lock and
-// formatted after it is released, so a MarshalJSON method may read or write
-// the document.
+// shared type, except that a float32 is written as the float64 it equals, with
+// the digits its value holds, as Yjs's toJSON writes the same Number. Values
+// are copied out under the document's read lock and formatted after it is
+// released, so a MarshalJSON method may read or write the document.
 // Must not be called from inside a Transact callback.
 func (a *YArray) ToJSON() ([]byte, error) {
 	return marshalSharedJSON(a.doc, a)

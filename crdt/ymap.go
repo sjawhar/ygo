@@ -385,9 +385,11 @@ func (m *YMap) ForEach(fn func(key string, value any)) {
 
 // ToJSON returns the map serialised as a JSON object with sorted keys: the
 // bytes json.Marshal(m.Entries()) would produce, without recursing once per
-// nested shared type. Values are copied out under the document's read lock and
-// formatted after it is released, so a MarshalJSON method may read or write
-// the document.
+// nested shared type, except that a float32 is written as the float64 it
+// equals, with the digits its value holds, as Yjs's toJSON writes the same
+// Number. Values are copied out under the document's read lock and formatted
+// after it is released, so a MarshalJSON method may read or write the
+// document.
 // Must not be called from inside a Transact callback.
 func (m *YMap) ToJSON() ([]byte, error) {
 	return marshalSharedJSON(m.doc, m)

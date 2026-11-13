@@ -14,6 +14,33 @@ same value written by a JavaScript peer. Code that type-switches on a decoded
 value should accept `float32` as well as `float64` and `int64`. Integers past
 ±2^53 keep tag 122 (BigInt).
 
+**Who is affected: code that prints ygo documents as JSON, servers that receive
+text as V2 and forward it as V1, and code that reads XML attributes as
+strings.** This applies wherever a value is a `float32`, including each value
+above that now reads back as one.
+
+A `float32` now prints as the `float64` that it equals. That conversion is
+exact, and the digits are the ones that JavaScript's `JSON.stringify` prints for
+the same Number. Before, ygo printed a `float32` as `encoding/json` does, with
+the shortest digits that identify the float32. Those digits are a different
+number. A replica printed 2^40 as `1099511600000`, -2^31 as `-2147483600`, and
+the millisecond timestamp 1718999973888 as `1719000000000`, 26,112 ms off.
+
+This was already true for a value from a JavaScript peer, and for a Go
+`float64` that `WriteAny` writes as tag 124. Without this fix, the encoding
+change above would make it true for Go integers too. The fix applies to:
+
+- `YMap.ToJSON` and `YArray.ToJSON`, at any depth of a value's maps and arrays.
+  The `mobile` package's `GetMapJSON` and `GetArrayJSON` call them, and get the
+  fix once `mobile` requires this release.
+- The JSON text that V1 writes for a text attribute or an embed. A document
+  that received such a value as V2 wrote a different number to V1, and every
+  V1 reader got that number.
+- `YXmlElement.GetAttribute`, `GetAttributes` and `ToXML`.
+
+A `float32` that a writer sets itself prints the same way. So `float32(0.1)`
+prints as `0.10000000149011612`, not `0.1`, on the writer and on every replica.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single

@@ -782,7 +782,8 @@ func deleteChildRange(t *abstractType, txn *Transaction, index, length int) {
 // trailing ".0", booleans as "true"/"false". It is NOT exact JavaScript
 // String() semantics (exponent thresholds like 1e-7/1e21, negative zero, and
 // non-scalar values differ) — use GetAttributeValue for the exact typed
-// value; the wire always carries the typed value regardless.
+// value; the wire always carries the typed value regardless. A float32 renders
+// as the float64 it equals, so that it shows the digits its value holds.
 func xmlAttrToString(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -790,6 +791,7 @@ func xmlAttrToString(v any) string {
 	case nil:
 		return ""
 	default:
+		x, _ = widenFloat32s(x)
 		return fmt.Sprintf("%v", x)
 	}
 }

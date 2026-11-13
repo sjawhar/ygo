@@ -20,6 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value written as tag 124 reads back from `ReadAny` as a `float32` rather
   than a `float64` (or, for -2^31, an `int64`), which is what ygo already
   read back for the same value from a JavaScript peer.
+- **`crdt`: a `float32` prints as the number it holds.** `YMap.ToJSON` and
+  `YArray.ToJSON` printed a `float32` as `encoding/json` does, with the
+  shortest digits that identify the float32. Those digits are a different
+  number. A value read back from Any tag 124 is a `float32`, so a replica
+  printed a different number than the writer and Yjs print. For example, it
+  printed 2^40 as `1099511600000`, -2^31 as `-2147483600`, and the millisecond
+  timestamp 1718999973888 as `1719000000000`, 26,112 ms off.
+
+  This was already true for a value from a JavaScript peer, and for a Go
+  `float64` that `WriteAny` writes as tag 124. Without this fix, the encoding
+  change above would make it true for Go integers too. A `float32` now prints
+  as the `float64` that it equals. That conversion is exact, and the digits are
+  the ones that JavaScript's `JSON.stringify` prints for the same Number. The
+  fix applies at any depth of a value's maps and arrays, and to these readers
+  too:
+
+  - The JSON text that V1 writes for a text attribute or an embed. A document
+    that received such a value as V2 wrote a different number to V1, and every
+    V1 reader got that number.
+  - `YXmlElement.GetAttribute`, `GetAttributes` and `ToXML`.
+  - The `mobile` package's `GetMapJSON` and `GetArrayJSON`, which call
+    `ToJSON`, once `mobile` requires this release.
+
+  A `float32` that a writer sets itself prints the same way. So `float32(0.1)`
+  prints as `0.10000000149011612`, not `0.1`, on the writer and on every
+  replica.
 
 ## [1.55.0] — 2026-10-31
 

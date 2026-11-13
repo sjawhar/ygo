@@ -1309,7 +1309,10 @@ func wrapUpdateErr(err error) error {
 
 // fmtValToJSON serialises a ContentFormat/ContentEmbed/ContentJSON value as
 // JSON text, matching Yjs's JSON.stringify. HTML escaping is off because
-// JSON.stringify never escapes <, > or &.
+// JSON.stringify never escapes <, > or &. A float32 is written as the float64
+// it equals (widenFloat32s), as JSON.stringify writes the Number a lib0 reader
+// decodes from Any tag 124; encoding/json's float32 digits would name another
+// number.
 //
 // A non-finite number is written as null, as JSON.stringify does; any other
 // unencodable value (one that bypassed checkTextValue) panics, as WriteAny does.
@@ -1317,6 +1320,7 @@ func fmtValToJSON(v any) string {
 	if v == nil {
 		return "null"
 	}
+	v, _ = widenFloat32s(v)
 	s, err := encodeJSONText(v)
 	if err != nil {
 		if s, err = encodeJSONText(nullNonFinite(v)); err != nil {
@@ -1336,15 +1340,12 @@ func encodeJSONText(v any) (string, error) {
 	return string(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
 }
 
-// nullNonFinite returns v with every NaN/±Inf replaced by nil.
+// nullNonFinite returns v with every NaN/±Inf replaced by nil. v holds no
+// float32: fmtValToJSON has widened each one.
 func nullNonFinite(v any) any {
 	switch t := v.(type) {
 	case float64:
 		if math.IsNaN(t) || math.IsInf(t, 0) {
-			return nil
-		}
-	case float32:
-		if f := float64(t); math.IsNaN(f) || math.IsInf(f, 0) {
 			return nil
 		}
 	case []any:

@@ -3,6 +3,7 @@ package crdt
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -489,6 +490,7 @@ func (w *jsonWriter) writeValue(value any) {
 		w.out = out
 		return
 	}
+	value, _ = widenFloat32s(value)
 	w.deferredAt = append(w.deferredAt, len(w.out))
 	w.deferredVals = append(w.deferredVals, value)
 }
@@ -587,8 +589,9 @@ func (w *jsonWriter) release() {
 
 // appendJSONScalar appends value as encoding/json encodes it, for the types
 // whose encoding runs no user code: nil, bool, valid UTF-8 strings, and the
-// integer and finite float types. ok is false for every other value, which
-// the caller hands to encoding/json.
+// integer and finite float types. A float32 is the exception: it is written as
+// the float64 it equals (appendJSONFloat). ok is false for every other value,
+// which the caller hands to encoding/json.
 func appendJSONScalar(out []byte, value any) ([]byte, bool) {
 	switch value := value.(type) {
 	case nil:
@@ -618,28 +621,31 @@ func appendJSONScalar(out []byte, value any) ([]byte, bool) {
 	case uint64:
 		return strconv.AppendUint(out, value, 10), true
 	case float64:
-		return appendJSONFloat(out, value, 64)
+		return appendJSONFloat(out, value)
 	case float32:
-		return appendJSONFloat(out, float64(value), 32)
+		return appendJSONFloat(out, float64(value))
 	}
 	return out, false
 }
 
-// appendJSONFloat is encoding/json's float encoding: ES6 number formatting,
+// appendJSONFloat is encoding/json's float64 encoding: ES6 number formatting,
 // exponent form below 1e-6 and from 1e21. NaN and ±Inf report !ok so that
 // encoding/json returns its own error for them.
-func appendJSONFloat(out []byte, f float64, bits int) ([]byte, bool) {
+//
+// A float32 comes here as the float64 it equals, which every float32 is, so
+// it prints with the digits its value holds, as JSON.stringify prints the
+// Number a lib0 reader decodes from Any tag 124. encoding/json would print
+// the shortest digits that identify the float32 instead, and those name a
+// different number: float32(1<<40) as 1099511600000, not 1099511627776.
+func appendJSONFloat(out []byte, f float64) ([]byte, bool) {
 	if math.IsInf(f, 0) || math.IsNaN(f) {
 		return out, false
 	}
 	format := byte('f')
-	if abs := math.Abs(f); abs != 0 {
-		// A float32 compares as float32 so the cutoffs match encoding/json's.
-		if bits == 64 && (abs < 1e-6 || abs >= 1e21) || bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
-			format = 'e'
-		}
+	if abs := math.Abs(f); abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
 	}
-	out = strconv.AppendFloat(out, f, format, -1, bits)
+	out = strconv.AppendFloat(out, f, format, -1, 64)
 	if format == 'e' {
 		// e-09 becomes e-9, as in encoding/json.
 		n := len(out)
@@ -649,6 +655,45 @@ func appendJSONFloat(out []byte, f float64, bits int) ([]byte, bool) {
 		}
 	}
 	return out, true
+}
+
+// widenFloat32s returns v with each float32 in it, at any depth of []any and
+// map[string]any, replaced by the float64 it equals, so that encoding/json
+// prints it as appendJSONFloat does. It copies only the containers on a path
+// to a float32 and never changes v, which may be a document's own value; ok
+// reports whether it replaced any, and v comes back as it is when it did not.
+func widenFloat32s(v any) (any, bool) {
+	switch x := v.(type) {
+	case float32:
+		return float64(x), true
+	case []any:
+		var out []any
+		for i, e := range x {
+			if w, ok := widenFloat32s(e); ok {
+				if out == nil {
+					out = slices.Clone(x)
+				}
+				out[i] = w
+			}
+		}
+		if out != nil {
+			return out, true
+		}
+	case map[string]any:
+		var out map[string]any
+		for k, e := range x {
+			if w, ok := widenFloat32s(e); ok {
+				if out == nil {
+					out = maps.Clone(x)
+				}
+				out[k] = w
+			}
+		}
+		if out != nil {
+			return out, true
+		}
+	}
+	return v, false
 }
 
 // appendJSONString appends s with encoding/json's HTML-safe string encoding.
