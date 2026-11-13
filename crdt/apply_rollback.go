@@ -385,6 +385,10 @@ func (j *applyJournal) rollBackTo(txn *Transaction, point *applyPoint) {
 					continue
 				}
 				x.Deleted = false
+				// The delete detached the subdocument the item carries.
+				if cd, ok := x.Content.(*ContentDoc); ok && cd.Doc != nil {
+					cd.Doc.reattachSubdoc(x, d)
+				}
 				if x.Parent != nil {
 					if x.Content.IsCountable() {
 						x.Parent.length += nativeContentLen(x.Content)

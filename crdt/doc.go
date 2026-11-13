@@ -345,6 +345,16 @@ func (d *Doc) detachSubdoc(item *Item) {
 	}
 }
 
+// reattachSubdoc gives d back the item and parent detachSubdoc dropped, for
+// item, alive again after the rollback of the apply that deleted it.
+func (d *Doc) reattachSubdoc(item *Item, parent *Doc) {
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
+	if d.item == nil && d.detached {
+		d.item, d.parent, d.detached = item, parent, false
+	}
+}
+
 // maxPendingItemsLimit returns the effective cap on the pending queue depth.
 func (d *Doc) maxPendingItemsLimit() int {
 	if d.maxPendingItems <= 0 {

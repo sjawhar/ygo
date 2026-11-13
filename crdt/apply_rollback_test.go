@@ -544,3 +544,70 @@ func TestAWholeOrNothingRollbackGivesBackTheQueueAParkMergedInto(t *testing.T) {
 		t.Fatalf("the gap left state vector %s and %v parked, want 2:2, and nothing", got, doc.store.pending)
 	}
 }
+
+// loadNotifies reports whether child.Load() tells its parent, which a
+// subdocument still attached to the document does and a detached one cannot.
+func loadNotifies(parent, child *Doc) bool {
+	loaded := 0
+	stop := parent.OnSubdocs(func(ev SubdocsEvent) {
+		for _, sub := range ev.Loaded {
+			if sub == child {
+				loaded++
+			}
+		}
+	})
+	defer stop()
+	child.Load()
+	return loaded == 1
+}
+
+// A refused update on a document with whole-or-nothing applies that had
+// deleted an item carrying a subdocument leaves the subdocument as it was:
+// still under its key, and attached, so its Load tells the document. The
+// update carries only a delete and a struct, so the document takes it, and
+// fails in the drain it starts, on a parked struct that panics.
+func TestAWholeOrNothingRollbackKeepsADeletedSubdocumentAttached(t *testing.T) {
+	doc := New(WithClientID(7), WithWholeOrNothingApplies(true))
+	child := New(WithGUID("child"), WithShouldLoad(false))
+	holder := doc.GetMap("t")
+	doc.Transact(func(txn *Transaction) { holder.Set(txn, "doc", child) })
+
+	// A peer deletes the key; its update carries the delete and nothing else.
+	peer := New(WithClientID(2))
+	if err := ApplyUpdateV1(peer, EncodeStateAsUpdateV1(doc, nil), nil); err != nil {
+		t.Fatal(err)
+	}
+	sv, peerHolder := peer.StateVector(), peer.GetMap("t")
+	peer.Transact(func(txn *Transaction) { peerHolder.Delete(txn, "doc") })
+	deleteKey := EncodeStateAsUpdateV1(peer, sv)
+
+	// A writer's second character parks behind its first.
+	writer := New(WithClientID(50))
+	text := writer.GetText("w")
+	writer.Transact(func(txn *Transaction) { text.Insert(txn, 0, "a", nil) })
+	first := EncodeStateAsUpdateV1(writer, nil)
+	at := writer.StateVector()
+	writer.Transact(func(txn *Transaction) { text.Insert(txn, 1, "b", nil) })
+	if err := ApplyUpdateV1(doc, EncodeStateAsUpdateV1(writer, at), nil); err != nil {
+		t.Fatal(err)
+	}
+	gap, err := MergeUpdatesV1(first, deleteKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parked := doc.store.pending.items[0]
+	content := parked.Content
+	parked.Content = panicOnLen{content}
+	err = ApplyUpdateV1(doc, gap, nil)
+	parked.Content = content
+	if !errors.Is(err, ErrInvalidUpdate) || !strings.Contains(err.Error(), "a parked struct that panics") {
+		t.Fatalf("the update returned %v, want ErrInvalidUpdate naming the panic", err)
+	}
+	if entry, held := holder.Get("doc"); !held || entry != child {
+		t.Fatalf("the refused update left %v under the key the subdocument held", entry)
+	}
+	if !loadNotifies(doc, child) {
+		t.Fatal("the subdocument's Load told the document nothing: the refused update left it detached")
+	}
+}
