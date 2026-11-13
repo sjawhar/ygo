@@ -332,6 +332,85 @@ func EncodeStateVectorFromUpdate(update []byte) ([]byte, error) {
 	return encodeStateVectorFromUpdate(update, false)
 }
 
+// ParseUpdateMeta reads the structs of a V1 update without integrating them
+// and returns, for each client, the clock its first struct starts at (from)
+// and the clock past its last struct (to), as Yjs parseUpdateMeta does. A
+// client with no struct in the update is in neither map. A malformed update
+// returns an error that wraps ErrInvalidUpdate.
+//
+// With these a caller can size an update before it applies it:
+// to[client] - from[client] is the span of clocks the update covers for that
+// client, and the document's StateVector says how much of that span is new.
+//
+// Every struct counts, a Skip included, so to is the end of the last struct.
+// EncodeStateVectorFromUpdate differs: as Yjs's state vector reader does, it
+// ends a client at its first Skip or gap and leaves out a client whose
+// structs do not start at clock 0. The delete set is not read.
+//
+// Yjs's encoders write each client's structs in one group. Where an update
+// sends a client in more than one group, from is the lowest start and to the
+// highest end over those groups. Yjs keeps the start of the client's last
+// run of groups and the end of its last group instead, which can put to
+// below from.
+func ParseUpdateMeta(update []byte) (from, to StateVector, err error) {
+	return parseUpdateMeta(update, false)
+}
+
+// ParseUpdateMetaV2 is ParseUpdateMeta for a V2 update.
+func ParseUpdateMetaV2(update []byte) (from, to StateVector, err error) {
+	return parseUpdateMeta(update, true)
+}
+
+// parseUpdateMeta reads the structs of a V1 or V2 update in wire order, as
+// encodeStateVectorFromUpdate does, and keeps the lowest clock a client's
+// structs start at and the highest they reach. A malformed update is an error,
+// never a panic: the scanner stops at the byte it cannot read and the reason
+// it gives is named as an invalid update (scanReason).
+func parseUpdateMeta(update []byte, v2 bool) (StateVector, StateVector, error) {
+	from, to := make(StateVector), make(StateVector)
+	s := newPendingScanner(update, v2)
+	groups := s.uint()
+	if groups > maxV2Items {
+		return nil, nil, ErrInvalidUpdate
+	}
+	var total uint64
+	for i := uint64(0); i < groups && s.err == nil; i++ {
+		n := s.uint()
+		// The same bounds as the decoders, so a run-length V2 column cannot
+		// declare more structs than an apply would read.
+		if n > maxV2Items-total {
+			return nil, nil, ErrInvalidUpdate
+		}
+		total += n
+		c := s.client()
+		at := s.uint()
+		if s.err == nil && c > maxClient {
+			return nil, nil, ErrInvalidUpdate
+		}
+		for j := uint64(0); j < n && s.err == nil; j++ {
+			length, _, _, _ := s.item()
+			if s.err != nil {
+				break
+			}
+			end, err := structEnd(at, length)
+			if err != nil {
+				return nil, nil, err
+			}
+			if start, held := from[c]; !held || at < start {
+				from[c] = at
+			}
+			if reached, held := to[c]; !held || end > reached {
+				to[c] = end
+			}
+			at = end
+		}
+	}
+	if s.err != nil {
+		return nil, nil, wrapUpdateErr(scanReason(s.err))
+	}
+	return from, to, nil
+}
+
 // encodeStateVectorFromUpdate reads the structs of a V1 or V2 update in wire
 // order, as Yjs encodeStateVectorFromUpdate does, so a client's consecutive
 // groups count as one run, a Skip of any length ends the run, and the delete

@@ -51,6 +51,9 @@ the same document.
   in Yjs.
 - `EncodeStateVectorFromUpdate` and its V2 form return the state vector Yjs
   returns, and a subdocument guid that is not UTF-8 is an error, not a panic.
+- `crdt.ParseUpdateMeta` and `ParseUpdateMetaV2` are new. They return the
+  first and the last clock of each client's structs in an update without
+  applying it, as Yjs `parseUpdateMeta` does.
 - An update's structs integrate in Yjs's order, and the integration stops at
   the first refused struct, as Yjs stops.
 - Every struct of an update decodes before one integrates, so a struct that

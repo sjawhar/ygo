@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`crdt`: `ParseUpdateMeta(update)` and `ParseUpdateMetaV2(update)`** read
+  an update's structs without applying it and return, for each client, the
+  clock its first struct starts at (`from`) and the clock past its last
+  (`to`), as Yjs `parseUpdateMeta` does, so a caller can size an update
+  before it applies it. Unlike `EncodeStateVectorFromUpdate`, they count
+  every struct, a Skip included, and a client whose structs start above
+  clock 0. A malformed update returns an error that wraps `ErrInvalidUpdate`.
+  Where an update sends one client in more than one group, which Yjs's
+  encoders do not write, `from` is the lowest start and `to` the highest end
+  over those groups.
 - **`crdt`: `Doc.SetMaxPendingItems(n)`** sets the pending cap after
   construction, so stored state over a cap can load first.
 
