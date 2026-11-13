@@ -59,6 +59,9 @@ type Transaction struct {
 	// undefined for every txn method); for one used cross-goroutine after
 	// commit the check is best-effort.
 	done bool
+	// rolledBack marks a remote apply that WithWholeOrNothingApplies rolled
+	// back, which commits as a transaction that changed nothing.
+	rolledBack bool
 	// ctx is the context associated with this transaction. Set to
 	// context.Background() by Transact and to the caller's ctx by
 	// TransactContext. Exposed via the Ctx() method so fn can poll for

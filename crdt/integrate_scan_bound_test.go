@@ -15,15 +15,15 @@ import (
 const fromAClient = "client"
 
 // boundTo is a document holding state, loaded with no bound, whose remote
-// applies with origin fromAClient may scan at most bound items.
-func boundTo(t *testing.T, state []byte, bound int) *Doc {
+// applies with origin fromAClient may scan at most bound items, made with opts.
+func boundTo(t *testing.T, state []byte, bound int, opts ...DocOption) *Doc {
 	t.Helper()
-	doc := New(WithIntegrateScanBudget(func(origin any) int {
+	doc := New(append(opts, WithIntegrateScanBudget(func(origin any) int {
 		if origin == fromAClient {
 			return bound
 		}
 		return 0
-	}))
+	}))...)
 	if err := ApplyUpdateV1(doc, state, nil); err != nil {
 		t.Fatal(err)
 	}

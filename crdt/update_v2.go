@@ -610,14 +610,16 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		if r := recover(); r != nil {
 			retErr = recoveredApplyErr(r)
 		}
+		endRemoteApply(txn, retErr != nil)
 	}()
 
+	sv := txn.doc.store.StateVector()
+	beginRemoteApply(txn, sv)
 	dec, err := newV2Decoder(update)
 	if err != nil {
 		return err
 	}
 
-	sv := txn.doc.store.StateVector()
 	initialV2 := *dec
 	budget := newPendingBudget(txn.doc, sv, update, true)
 	budget.v2Start = &initialV2
@@ -830,7 +832,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 	unresolvableDs := ds.applyToPartial(txn)
 	if len(unresolvableDs.clients) > 0 {
-		txn.doc.store.pendingDs.Merge(unresolvableDs)
+		parkDeletes(txn, unresolvableDs)
 	}
 
 	drainParked(txn, drainPendingV2)
@@ -1117,6 +1119,9 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 		return NewContentAny(vals...), nil
 
 	case wireDoc:
+		if doc.wholeOrNothing {
+			return nil, errWholeOrNothingContent
+		}
 		guid, err := dec.readString()
 		if err != nil {
 			return nil, err
@@ -1128,6 +1133,9 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 		return NewContentDoc(newSubdocFromOpts(guid, optsAny)), nil
 
 	case wireMove:
+		if doc.wholeOrNothing {
+			return nil, errWholeOrNothingContent
+		}
 		clientU, err := dec.restDec.ReadVarUint()
 		if err != nil {
 			return nil, err

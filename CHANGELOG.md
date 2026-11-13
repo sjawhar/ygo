@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the scan that tripped had, or no bound. Any other panic in the drain still
   fails the apply with `ErrInvalidUpdate`. Remote moves and subdocuments apply
   as before, and a document without the option is unchanged.
+- **`crdt`: `WithWholeOrNothingApplies(true)` makes each remote apply whole
+  or nothing.** On such a document an apply that fails, by tripping the bound
+  or for any other reason, is refused: it is rolled back before it commits, so
+  the document is left byte for byte as it was, no observer fires, and
+  `ApplyUpdateV1Landed` reports nothing. A drain of the parked queue that trips
+  the bound is rolled back on its own, the queue is parked again as the drain
+  found it, and the apply that filled the gap succeeds; a later apply, from any
+  sender, tries the queue again when its drain has more of its bound left than
+  that drain began with, or no bound. Such a document refuses every remote
+  update that carries a move or a subdocument. Each remote apply on it
+  allocates a journal of 208 bytes, and one whose drain tries parked items
+  also a copy of the state vector and of what the apply changed so far. Off,
+  the default, nothing changes.
 
 ## [1.55.1] — 2026-11-13
 

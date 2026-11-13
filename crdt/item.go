@@ -321,6 +321,9 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 	// the contextless cleanup walk. Plain-text types never set this flag,
 	// so their deletes skip the walk entirely (#86 final fix).
 	if _, ok := item.Content.(*ContentFormat); ok && item.Parent != nil {
+		if j := txn.doc.applying; j != nil {
+			j.keepFormatting(item.Parent)
+		}
 		item.Parent.hasFormatting = true
 		item.Parent.fmtGen++
 		item.Parent.cleanFormatting = true
@@ -384,6 +387,9 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 			if existing, ok := item.Parent.itemMap[key]; ok && existing != item && !existing.Deleted {
 				existing.delete(txn)
 			}
+			if j := txn.doc.applying; j != nil {
+				j.tookMapKey(item.Parent, key)
+			}
 			item.Parent.itemMap[key] = item
 		}
 	}
@@ -440,6 +446,9 @@ func (item *Item) delete(txn *Transaction) {
 
 		current.Deleted = true
 		if _, ok := current.Content.(*ContentFormat); ok && current.Parent != nil {
+			if j := txn.doc.applying; j != nil {
+				j.keepFormatting(current.Parent)
+			}
 			current.Parent.fmtGen++
 		}
 		if current.Parent != nil && current.Content.IsCountable() {

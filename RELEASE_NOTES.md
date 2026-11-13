@@ -1,7 +1,7 @@
 ## v1.56.0
 
 **Who is affected:** servers that apply updates from clients they do not
-control. Nothing changes unless you set the new option.
+control. Nothing changes unless you set one of the new options.
 
 **A bound on the conflict scans of one remote apply, set per origin.** YATA
 places an item by scanning right from its left origin. An item that names an
@@ -25,6 +25,19 @@ bound, it keeps what it integrated and parks the rest, and the apply that
 filled the gap still succeeds. A later apply, from any sender, tries the rest
 again when its drain has more of its bound left than the scan that tripped
 had. Remote moves and subdocuments work under a bound.
+
+**Whole-or-nothing applies, as a document option.**
+`crdt.WithWholeOrNothingApplies(true)` refuses a remote apply that fails, by
+tripping the bound or for any other reason: it is rolled back before it
+commits, so where an apply without the option is not fully applied, this one
+keeps nothing. The document is left byte for byte as it was, no observer
+fires, and `ApplyUpdateV1Landed` returns nothing, so a server can tell the
+sender that none of its update was kept. A drain of the parked queue that
+trips the bound is rolled back on its own, the apply that filled the gap still
+succeeds, and a later apply tries the queue again when its drain has more of
+its bound left than that drain began with. Such a document refuses every
+remote update that carries a move or a subdocument, with
+`crdt.ErrInvalidUpdate`. Each remote apply on it allocates a 208-byte journal.
 
 **Upgrading.** No change is needed.
 

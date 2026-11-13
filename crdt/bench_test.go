@@ -429,6 +429,13 @@ func BenchmarkApplyUpdateV1_ConflictScanBounded(b *testing.B) {
 	benchConflictScan(b, 2_000, 200, WithIntegrateScanBudget(func(any) int { return 1 << 30 }))
 }
 
+// BenchmarkApplyUpdateV1_ConflictScanWholeOrNothing is
+// BenchmarkApplyUpdateV1_ConflictScanBounded on a document with
+// whole-or-nothing applies.
+func BenchmarkApplyUpdateV1_ConflictScanWholeOrNothing(b *testing.B) {
+	benchConflictScan(b, 2_000, 200, WithIntegrateScanBudget(func(any) int { return 1 << 30 }), WithWholeOrNothingApplies(true))
+}
+
 // BenchmarkApplyUpdateV1_SplitRunMergedBack applies 2,000 items that each split
 // one 4,000-character run, whose halves all merge back at commit.
 func BenchmarkApplyUpdateV1_SplitRunMergedBack(b *testing.B) { benchSplitRunMergedBack(b, 2_000) }

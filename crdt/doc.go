@@ -135,8 +135,22 @@ func WithMaxPendingItems(n int) DocOption {
 // parks the rest, without failing the apply. A later apply, from any sender,
 // tries them again when its drain has more of its bound left than the scan
 // that tripped had, or no bound.
+// On a document with WithWholeOrNothingApplies an apply that trips the bound is
+// rolled back instead, and so is a drain that trips it.
 func WithIntegrateScanBudget(budget func(origin any) int) DocOption {
 	return func(d *Doc) { d.integrateScanBudget = budget }
+}
+
+// WithWholeOrNothingApplies, when on, makes each remote apply whole or nothing:
+// an apply that fails, by tripping the scan bound or for any other reason, is
+// refused, rolled back before it commits, so the document is left as it was,
+// no observer fires and ApplyUpdateV1Landed reports nothing. A drain of the
+// parked queue that trips what the apply left of the bound is rolled back on
+// its own, and the apply stands. Such a document refuses every remote update
+// that carries a move or a subdocument, and each remote apply keeps a journal
+// of what it changes.
+func WithWholeOrNothingApplies(on bool) DocOption {
+	return func(d *Doc) { d.wholeOrNothing = on }
 }
 
 // updateSub pairs a unique subscription ID with its callback so that
@@ -175,6 +189,7 @@ type Doc struct {
 	guid            string // guid identifies this document (for subdocument embedding). Defaults to a random uuidv4 (see New) unless set with WithGUID.
 	shouldLoad      bool
 	autoLoad        bool
+	wholeOrNothing  bool // see WithWholeOrNothingApplies
 	collectionID    string
 	item            *Item // set on integrate when this Doc is embedded as a subdocument (#63)
 	subdocs         map[string]*Doc
@@ -182,6 +197,9 @@ type Doc struct {
 	maxPendingItems int // 0 = use defaultMaxPendingItems; see WithMaxPendingItems and #46
 	// integrateScanBudget is the bound of WithIntegrateScanBudget, or nil.
 	integrateScanBudget func(origin any) int
+	// applying is the journal of the remote apply in progress on a document
+	// with whole-or-nothing applies, or nil.
+	applying *applyJournal
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -361,6 +379,9 @@ func (d *Doc) getOrCreateType(name string) *abstractType {
 	r.owner = r
 	r.name = name
 	d.share[name] = r
+	if d.applying != nil {
+		d.applying.named = append(d.applying.named, name)
+	}
 	return &r.abstractType
 }
 
@@ -508,6 +529,10 @@ func (d *Doc) GetText(name string) *YText {
 //
 // Returns nil only if there is nothing to fire (no observers of any kind).
 func buildPhase2(d *Doc, txn *Transaction) func() {
+	// A rolled-back apply left the document as it was, so there is nothing to fire.
+	if txn.rolledBack {
+		return nil
+	}
 	// Encode the incremental update and snapshot observer slices while still
 	// holding the lock so we get a consistent view.
 	var updateBytes []byte
