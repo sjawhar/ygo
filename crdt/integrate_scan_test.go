@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"runtime"
 	"strings"
 	"testing"
@@ -211,6 +212,134 @@ func requireStoreWhole(t *testing.T, doc *Doc, roots ...*abstractType) {
 			if found := doc.store.Find(item.ID); found != item {
 				t.Fatalf("the store does not hold the listed item %v at its clock", item.ID)
 			}
+		}
+	}
+}
+
+// chainedList is a document whose text is l one-character items from clients 5
+// and 6 in turn, each typed at the end after the other's, so no two neighbours
+// merge and each item's left origin is its left neighbour.
+func chainedList(t testing.TB, l int) *Doc {
+	t.Helper()
+	a, b := New(WithClientID(5)), New(WithClientID(6))
+	at, bt := a.GetText("t"), b.GetText("t")
+	for i := range l {
+		from, to, text := a, b, at
+		if i%2 == 1 {
+			from, to, text = b, a, bt
+		}
+		sv := to.StateVector()
+		from.Transact(func(txn *Transaction) { text.Insert(txn, text.Len(), "c", nil) })
+		if err := ApplyUpdateV1(to, EncodeStateAsUpdateV1(from, sv), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return a
+}
+
+// originAtTheStart is an update of n one-character items from client 9, each
+// naming the first item of chainedList's text as its left origin and no right
+// origin. YATA places such an item by scanning right from its origin past every
+// item whose own origin lies in what the scan has passed (Item.integrate), and
+// in chainedList that is every item to the end, so each of these items scans
+// the whole list.
+func originAtTheStart(n int) []byte {
+	enc := encoding.NewEncoder()
+	enc.WriteVarUint(1) // clients
+	enc.WriteVarUint(uint64(n))
+	enc.WriteVarUint(9) // client
+	enc.WriteVarUint(0) // first clock
+	for range n {
+		enc.WriteUint8(wireString | flagHasOrigin)
+		enc.WriteVarUint(5)
+		enc.WriteVarUint(0)
+		enc.WriteVarString("x")
+	}
+	enc.WriteVarUint(0) // delete set: no clients
+	return append([]byte(nil), enc.Bytes()...)
+}
+
+// An update whose n items each scan a list of l items allocates for the list
+// once, not n times: its scans share one map of marks. With two fresh sets per
+// scan, l = 2,000 and n = 200 allocated about 30 MB.
+func TestAnUpdateWhoseItemsEachScanTheListAllocatesForTheListOnce(t *testing.T) {
+	const l, n = 2_000, 200
+	doc := chainedList(t, l)
+	allocated, took, err := applyMeasured(doc, originAtTheStart(n))
+	t.Logf("l=%d n=%d: err=%v, allocated %d bytes in %s", l, n, err, allocated, took)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocated > 4<<20 {
+		t.Fatalf("the apply allocated %d bytes, want under %d", allocated, 4<<20)
+	}
+	if got, want := doc.GetText("t").ToString(), strings.Repeat("c", l)+strings.Repeat("x", n); got != want {
+		t.Fatalf("the text is %d characters, want the list, then every inserted character", len(got))
+	}
+}
+
+// concurrentKeystrokes is the first state of a two-character text and one
+// update for each of peers*n keystrokes into it, each typed at a random place
+// by a random one of peers peers; after one keystroke in three, a random peer
+// catches up with the typist.
+func concurrentKeystrokes(t *testing.T, seed uint64, peers, n int) (state []byte, keystrokes [][]byte) {
+	t.Helper()
+	rng := rand.New(rand.NewPCG(seed, 1))
+	base := New(WithClientID(1))
+	baseText := base.GetText("t")
+	base.Transact(func(txn *Transaction) { baseText.Insert(txn, 0, "ab", nil) })
+	state = EncodeStateAsUpdateV1(base, nil)
+	docs := make([]*Doc, peers)
+	for p := range docs {
+		docs[p] = New(WithClientID(ClientID(10 + p)))
+		if err := ApplyUpdateV1(docs[p], state, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keystrokes = make([][]byte, 0, peers*n)
+	for k := range peers * n {
+		typist := docs[rng.IntN(peers)]
+		text := typist.GetText("t")
+		sv := typist.StateVector()
+		// Every keystroke is a distinct character, so the text shows the order.
+		char, pos := string(rune(0x4e00+k)), rng.IntN(text.Len()+1)
+		typist.Transact(func(txn *Transaction) { text.Insert(txn, pos, char, nil) })
+		keystrokes = append(keystrokes, EncodeStateAsUpdateV1(typist, sv))
+		if rng.IntN(3) == 0 {
+			peer := docs[rng.IntN(peers)]
+			if err := ApplyUpdateV1(peer, EncodeStateAsUpdateV1(typist, peer.StateVector()), nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return state, keystrokes
+}
+
+// loadText applies updates in order to a new document and returns its text.
+func loadText(t *testing.T, updates ...[]byte) string {
+	t.Helper()
+	doc := New()
+	for _, update := range updates {
+		if err := ApplyUpdateV1(doc, update, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return doc.GetText("t").ToString()
+}
+
+// One update's conflict scans share the map of marks, and none of them reads
+// another's: concurrent keystrokes merged into one update read as when each
+// is applied alone.
+func TestKeystrokesInOneUpdateReadAsWhenEachIsAppliedAlone(t *testing.T) {
+	for seed := range uint64(20) {
+		state, keystrokes := concurrentKeystrokes(t, seed, 8, 30)
+		merged, err := MergeUpdatesV1(keystrokes...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		alone := loadText(t, append([][]byte{state}, keystrokes...)...)
+		if together := loadText(t, state, merged); together != alone {
+			t.Fatalf("seed %d: the keystrokes as one update read\n%s\nwant, each applied alone,\n%s", seed, together, alone)
 		}
 	}
 }

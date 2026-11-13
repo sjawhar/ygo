@@ -61,6 +61,10 @@ type Transaction struct {
 	// TransactContext. Exposed via the Ctx() method so fn can poll for
 	// cancellation.
 	ctx context.Context
+	// scanMarks holds the marks this transaction's conflict scans leave on
+	// the items they pass (Item.integrate), and scanSerial numbers the scans.
+	scanMarks  map[*Item]scanMark
+	scanSerial uint32
 	// formatCleanup marks a remote transaction whose format cleanup runs
 	// once its observers have fired; afterTypeObservers, when set, decides
 	// it after the type observers (typeObserved: there are some), where
@@ -570,4 +574,16 @@ func tryMergeWithLeft(item *Item, merging *mergeRuns) bool {
 	// Remove item from its client's store slice.
 	merging.remove(item)
 	return true
+}
+
+// scanMark is a conflict scan's mark on an item it passed: which scan of the
+// transaction, and at which step of it (Item.integrate).
+type scanMark struct{ scan, step uint32 }
+
+// scanMarkMap returns the transaction's scan marks, made on first use.
+func (txn *Transaction) scanMarkMap() map[*Item]scanMark {
+	if txn.scanMarks == nil {
+		txn.scanMarks = make(map[*Item]scanMark)
+	}
+	return txn.scanMarks
 }

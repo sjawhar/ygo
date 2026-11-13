@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   40,000-character run allocated 420.5 MiB and now allocates 12.0 MiB. The
   merge conditions are unchanged, so the merged items and the encoded state
   are as before.
+- **`crdt`: a transaction's conflict scans share one map.** YATA places an
+  item by scanning right from its left origin, and each scan built two new
+  sets of the items it passed. An item that names an early left origin and no
+  right origin scans to the end of the list, so an update of many such items
+  allocated the list's size once per item. The scans now mark the items they
+  pass in one map the transaction keeps and never clears. One update of 2,000
+  such items into a 40,000-item list allocated 4,511 MiB and now allocates
+  2.7 MiB, in 59% less time. A transaction whose scans pass only a few items
+  makes two more allocations than before, for the map. Placement is unchanged.
 
 ## [1.55.0] — 2026-10-31
 
