@@ -234,6 +234,14 @@ the `RefusedUpdateError` it returns; one that leaves the document as it was,
 as every refusal does with `WithWholeOrNothingApplies`, reports nothing. The
 option bounds nothing and refuses nothing.
 
+`ApplyReport.StateBytes` is the bytes each remote apply added to the
+document's encoded state, signed, counted as the apply makes each change
+rather than by encoding. An owner that encodes a document once, while
+nothing is parked, and adds each report's `StateBytes` holds a total at or
+above the state's length in either form the encode writes, so it can bound a
+document's state without an encode per apply. An apply that fails partway
+counts what the document kept of it.
+
 **Who is affected:** servers that apply updates from peers, where one update
 places many items among the ones a document holds.
 

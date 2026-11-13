@@ -898,6 +898,7 @@ func integrateGroup(txn *Transaction, group []*Item, existingEnd uint64, pending
 				item.Content = item.Content.Splice(offset)
 			}
 			noteIntegrated(txn, item)
+			noteStateAppend(txn, item)
 			txn.doc.store.Append(item)
 			// A deferred move whose target is in this GC struct stops waiting.
 			txn.doc.store.resolvePendingMoves(txn, item.ID.Client)
@@ -1163,12 +1164,15 @@ func drainParked(txn *Transaction, drain func(*Transaction) error) (err error) {
 	j := txn.doc.applying
 	t := txn.doc.tally()
 	// Only a drain that tries the parked items can change them or trip the bound.
-	journaled := j != nil && txn.drainable()
+	drainable := txn.drainable()
+	journaled := j != nil && drainable
 	from := txn.scanLeft
 	var counted drainCount
+	if drainable {
+		counted = t.beginDrain(s)
+	}
 	if journaled {
 		j.beginDrain(txn)
-		counted = t.beginDrain()
 	}
 	// The parked structs this drain drops are counted only if it stands.
 	var drops int
@@ -1183,11 +1187,12 @@ func drainParked(txn *Transaction, drain func(*Transaction) error) (err error) {
 				if t := txn.doc.tally(); t != nil {
 					t.rootDrops = t.rootDrops[:drops]
 				}
-				t.takeBackDrain(counted)
+				t.takeBackDrain(counted, s)
 			} else {
 				j.endDrain()
 			}
 		}
+		t.endDrain()
 		if r == nil {
 			return
 		}
@@ -1905,13 +1910,14 @@ func jsonNumbers(v any) any {
 // appendTrimmed stores an item without integrating it, dropping the prefix the
 // store already has for its client. existingEnd must be at least the item's
 // clock. The item is checked and counted as one that integrates
-// (noteIntegrated).
+// (noteIntegrated, noteStateAppend).
 func appendTrimmed(txn *Transaction, item *Item, existingEnd uint64) {
 	if offset := existingEnd - item.ID.Clock; offset > 0 {
 		item.ID.Clock += offset
 		item.Content = item.Content.Splice(offset)
 	}
 	noteIntegrated(txn, item)
+	noteStateAppend(txn, item)
 	txn.doc.store.Append(item)
 }
 

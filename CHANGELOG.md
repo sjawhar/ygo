@@ -96,6 +96,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WithWholeOrNothingApplies` takes back leaves none of its splits in
   `Split`. The option bounds and refuses nothing, and a panic of its callback
   reaches the apply's caller once the commit has finished.
+- **`crdt`: `ApplyReport.StateBytes`, the bytes each remote apply added to the
+  document's encoded state**, as `EncodeStateAsUpdateV1(doc, nil)` measures
+  it, so an owner that encodes a document once and adds each report's
+  `StateBytes` holds the state's length, or more, without encoding again. It
+  is a signed delta, counted where the apply makes each change rather than by
+  encoding: a struct integrated or parked with the skip and section header it
+  adds, a split, a park's merge into the queue, a drain's landings, the delete
+  set's growth, and what the commit's merges and collection take out. An
+  apply that fails partway counts what the document kept, and a drain that
+  `WithWholeOrNothingApplies` takes back counts nothing of it. The sum is at
+  or above the state in both forms the encode writes; where the document
+  keeps no count of a part the state writes, the report takes the most that
+  part can add.
 
 ### Changed
 
