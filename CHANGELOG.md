@@ -50,8 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cut (content occupying one clock) and the last, which carries the structs
   the sender itself holds parked. A text item longer than `maxBytes` is cut at
   a character boundary, never inside one.
+- **`crdt.SplitStateAsUpdateV1(doc, sv, maxBytes)`** returns what
+  `SplitUpdateV1` returns for `EncodeStateAsUpdateV1(doc, sv)`, byte for
+  byte, without encoding the state or decoding it back: it reads the
+  document's own structs and writes each one once. For a document whose
+  values came in updates, what it allocates grows with the updates it
+  returns and the document's clients, not with its structs. A document
+  holding parked structs or deletions is still cut from its encoded state.
 - **`sync.EncodeSyncStep2Split(doc, step1msg, maxBytes)`** answers a step-1
-  message with that series as sync messages, each at most `maxBytes` long:
+  message with the series `SplitStateAsUpdateV1` cuts the document's state
+  into, as sync messages, each at most `maxBytes` long:
   Update messages (type 2) and then one SyncStep2 (type 1), last. A receiver
   that applies them in order holds exactly what `EncodeSyncStep2`'s one
   message would have left it holding.
@@ -96,6 +104,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   64 KiB goes out in one frame of its own size, so no single state size
   covers every room. The connect handshake still carries no state, and the
   slow-peer resync (`SlowPeerResync`) still sends one full-state SyncStep2.
+  What cutting the answer costs the server, against the single SyncStep2
+  (`BenchmarkJoinAnswer_FragmentedRoom`, `BenchmarkJoinAnswer_MixedRoom`):
+  for a room of 20,000 characters typed into the middle, up to 11% more CPU
+  time per answer, and 103 allocations of 1.6 MiB in all against 33 of
+  1.9 MiB; for a room of 16,000 small structs - map entries, XML elements
+  and attributes, formatted text - 43% more CPU time, and 5,165 allocations
+  of 1.9 MiB against 5,048 of 1.7 MiB.
 
 ### Fixed
 
