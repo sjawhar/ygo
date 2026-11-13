@@ -383,10 +383,10 @@ type panicOnLen struct{ Content }
 
 func (panicOnLen) Len() int { panic("a parked struct that panics") }
 
-// The drain recovers only the bound's panic. It raises any other again, so
-// the apply that filled the gap returns ErrInvalidUpdate naming the panic,
-// bounded or not, and the queue keeps what the drain did not integrate. Under a
-// bound of 199 the gap's item leaves the drain nothing of it.
+// The drain recovers only the bound's panic and raises any other again, so the
+// apply that filled the gap returns ErrInvalidUpdate naming the panic, bounded
+// or not, and the queue keeps what the drain did not integrate. Under a bound
+// of 199 the gap's item leaves the drain nothing of it.
 func TestADrainRaisesAPanicThatIsNotTheBounds(t *testing.T) {
 	const l, n = 200, 2
 	state := EncodeStateAsUpdateV1(chainedList(t, l), nil)

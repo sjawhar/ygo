@@ -118,23 +118,18 @@ func WithMaxPendingItems(n int) DocOption {
 }
 
 // WithIntegrateScanBudget bounds the items the conflict scans of one remote
-// apply (ApplyUpdate and its V1 and V2 forms) may pass, by the apply's origin:
-// budget is called with the origin before the apply takes the document's lock,
-// so applies on several goroutines may call it at once, and zero or negative
-// sets no bound. It is set per origin so a server can bound the updates a
-// connected client sends, and apply what it relays from another node or loads
-// from storage with no bound.
+// apply (ApplyUpdate and its V1 and V2 forms) may pass, by origin, so a server
+// can bound a connected client's updates and not those it relays from another
+// node or loads from storage: budget gets the apply's origin before the apply
+// takes the document's lock, so applies on several goroutines may call it at
+// once, and zero or negative sets no bound.
 //
-// An apply whose scans would pass the bound aborts partway with
-// ErrIntegrateScanBudget and keeps what it integrated, as one that overflows
-// the pending cap does; the same update sent again carries on from there. An
-// item whose scan alone passes the bound aborts every send at that item: from
-// then on each send integrates nothing, and ApplyUpdateV1Landed returns nil
-// landed with the error. The drain of the parked queue that ends an apply runs
-// on what the apply left of the bound, and past it keeps what it integrated and
-// parks the rest, without failing the apply. A later apply, from any sender,
-// tries them again when its drain has more of its bound left than the scan
-// that tripped had, or no bound.
+// An apply that would pass the bound aborts partway with
+// ErrIntegrateScanBudget, and the drain of the parked queue that ends an
+// apply, past what the apply left of the bound, parks the rest without failing
+// the apply, for a later apply, from any sender, to try again when its drain
+// has more of its bound left than the scan that tripped had, or no bound; each
+// keeps what it integrated.
 func WithIntegrateScanBudget(budget func(origin any) int) DocOption {
 	return func(d *Doc) { d.integrateScanBudget = budget }
 }
