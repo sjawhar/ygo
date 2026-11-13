@@ -1375,6 +1375,11 @@ func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) 
 		parentSub = &sub
 	}
 
+	// A kind the apply refuses is refused here, before its content is read
+	// (refuseContentKind).
+	if err := refuseContentKind(doc, tag); err != nil {
+		return nil, err
+	}
 	content, err := decodeContent(dec, doc, tag)
 	if err != nil {
 		return nil, err

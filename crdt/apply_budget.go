@@ -23,13 +23,14 @@ var ErrApplyBudget = fmt.Errorf("%w: it decodes or adds more than the document a
 var ErrRootNotAllowed = fmt.Errorf("%w: it writes under a root the document does not allow", ErrInvalidUpdate)
 
 // RefusedUpdateError is the error a remote apply (ApplyUpdate and its V1 and
-// V2 forms) returns on a document with WithApplyBudget or WithAllowedRoots
-// when the apply fails, for any reason, with what it did before it stopped.
+// V2 forms) returns on a document with WithApplyBudget, WithAllowedRoots or
+// WithRefusedContent when the apply fails, for any reason, with what it did
+// before it stopped.
 //
-// Err is why it failed: ErrApplyBudget, ErrRootNotAllowed, or any other error
-// of a remote apply, such as ErrIntegrateScanBudget or one wrapping
-// ErrInvalidUpdate. Unwrap returns it, so errors.Is matches it, and Error is
-// its message.
+// Err is why it failed: ErrApplyBudget, ErrRootNotAllowed,
+// ErrContentNotAllowed, or any other error of a remote apply, such as
+// ErrIntegrateScanBudget or one wrapping ErrInvalidUpdate. Unwrap returns it,
+// so errors.Is matches it, and Error is its message.
 //
 // Decoded is the values the apply read, the run that passed the budget
 // included. Structs and Bytes are the structs of the update the apply added
@@ -78,9 +79,9 @@ type budgetCallbackPanic struct {
 	v      any
 }
 
-// applyTally is what one remote apply has decoded and added, and the budget
-// and roots it may do so within, both asked for as the apply began
-// (beginApplyTally).
+// applyTally is what one remote apply has decoded and added, and the budget,
+// roots and refused content kinds it may do so within, each asked for as the
+// apply began (beginApplyTally).
 type applyTally struct {
 	// budget is what the apply may decode and add; a field of zero or below
 	// is no limit (WithApplyBudget).
@@ -92,6 +93,9 @@ type applyTally struct {
 	roots        []string
 	allowedTypes map[*abstractType]bool
 	rootOf       map[*abstractType]*abstractType
+	// refused is the kinds of content the update may not carry, nil or empty
+	// for every kind (WithRefusedContent).
+	refused []ContentKind
 	// draining is set while the drain of the parked queue runs: its structs
 	// are not the update's, so they are not counted against Structs or Bytes.
 	draining bool
@@ -112,7 +116,7 @@ func over(limit, used int) bool {
 }
 
 // tally is the tally of the remote apply running on d, or nil when none runs,
-// when d has neither a budget nor a roots list, or when d is nil.
+// when d has no budget, roots list or refused content kinds, or when d is nil.
 func (d *Doc) tally() *applyTally {
 	if d == nil {
 		return nil
@@ -121,10 +125,11 @@ func (d *Doc) tally() *applyTally {
 }
 
 // beginApplyTally starts the tally of txn's apply when its document has a
-// budget or a roots list, asking both callbacks once, with the apply's origin.
+// budget, a roots list or refused content kinds, asking each callback once,
+// with the apply's origin.
 func beginApplyTally(txn *Transaction) {
 	d := txn.doc
-	if d.applyBudget == nil && d.allowedRoots == nil {
+	if d.applyBudget == nil && d.allowedRoots == nil && d.refusedContent == nil {
 		return
 	}
 	// The tally starts before the callbacks run, so an apply whose callback
@@ -144,6 +149,9 @@ func beginApplyTally(txn *Transaction) {
 				}
 			}
 		}
+	}
+	if d.refusedContent != nil {
+		t.refused = d.callRefusedContent(txn.Origin)
 	}
 }
 
@@ -250,12 +258,13 @@ type parkedFrom struct {
 
 // noteParkedRoot checks item, a struct of the update about to park, against
 // the apply's roots: one whose parent is known is refused when it hangs under
-// a root the list does not allow. The document keeps the apply's origin for
-// the struct, and its list when the parent is not known yet, for the drain
-// that integrates it (checkParkedRoot, dropOutsideRoots).
+// a root the list does not allow. A document with a budget or a roots list
+// keeps the apply's origin for the struct, and its list when the parent is
+// not known yet, for the drain that integrates it (checkParkedRoot,
+// dropOutsideRoots).
 func noteParkedRoot(txn *Transaction, item *Item) {
 	t := txn.doc.tally()
-	if t == nil || isGCStruct(item) {
+	if t == nil || isGCStruct(item) || txn.doc.applyBudget == nil && txn.doc.allowedRoots == nil {
 		return
 	}
 	from := parkedFrom{origin: txn.Origin}

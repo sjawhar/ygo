@@ -868,6 +868,11 @@ func decodeItemV2(dec *v2Decoder, doc *Doc, client ClientID, clock uint64, info 
 		}
 	}
 
+	// A kind the apply refuses is refused before its content is read
+	// (refuseContentKind).
+	if err := refuseContentKind(doc, info&0x1F); err != nil {
+		return nil, 0, err
+	}
 	content, err := decodeContentV2(dec, doc, info&0x1F)
 	if err != nil {
 		return nil, 0, err

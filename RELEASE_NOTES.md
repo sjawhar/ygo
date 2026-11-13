@@ -210,6 +210,18 @@ nothing on a document with `WithWholeOrNothingApplies`, which is the one
 option that rolls an apply back. A budget that limits nothing, or a list that
 names every root an update writes, changes nothing an apply does.
 
+**Kinds of content a document refuses.**
+`crdt.WithRefusedContent(func(origin any) []crdt.ContentKind)` names, per
+apply, the kinds of content a remote update may not carry, for an owner whose
+readers cannot show every kind: one embed is a few bytes, inside any budget,
+and once it is in the document every reader is shown a node its schema does
+not have. An update that carries a struct of a named kind is refused with
+`crdt.ErrContentNotAllowed` in a `crdt.RefusedUpdateError`. The kind is read
+as the update is decoded, before any of its structs enters the document, so
+the refused update leaves the document as it was, with or without
+`WithWholeOrNothingApplies`. Subdocuments and moves are refused only when the
+answer names `crdt.ContentKindDoc` or `crdt.ContentKindMove`.
+
 **Who is affected:** servers that apply updates from peers, where one update
 places many items among the ones a document holds.
 

@@ -69,6 +69,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apply that filled its gap does not fail for it unless it sent it, and
   `PendingStats.RootsDropped` counts the drop by the struct's client. An
   option set to limit nothing changes nothing an apply does.
+- **`crdt`: `WithRefusedContent` names the kinds of content a remote apply may
+  not bring in.** It takes a callback asked once per remote apply with the
+  apply's origin, answering `ContentKind` values, which are the wire format's
+  content tags (`ContentKindEmbed`, `ContentKindBinary`, `ContentKindDoc`,
+  `ContentKindMove` and the rest); `Doc.SetRefusedContent` sets it on a
+  document already made. An update that carries a struct of a named kind,
+  anywhere in it, is refused with `ErrContentNotAllowed`, which wraps
+  `ErrInvalidUpdate`, in a `RefusedUpdateError`. Each struct's kind is read as
+  the update is decoded, before its content, and every struct decodes before
+  one integrates, so the refused update leaves the document as it was and
+  tells no observer, with or without `WithWholeOrNothingApplies`. The option
+  refuses no subdocument or move unless its answer names that kind, and an
+  answer of no kinds changes nothing an apply does.
 
 ### Changed
 

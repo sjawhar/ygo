@@ -252,6 +252,44 @@ func (d *Doc) SetAllowedRoots(roots func(origin any) []string) {
 	d.allowedRoots = roots
 }
 
+// WithRefusedContent names the kinds of content a remote apply may not
+// bring into the document: kinds runs once per apply with the apply's origin,
+// under the document's lock, so it must not call the document. A nil kinds,
+// or an answer of no kinds, takes every kind, as a document without the
+// option.
+//
+// It is for an owner whose readers cannot show every kind of content: one
+// embed is one struct of a few bytes, inside any budget, and once a document
+// holds it every reader is shown content its schema has no node for.
+//
+// A struct of a kind the answer names refuses the whole update, wherever in
+// the update it sits, with ErrContentNotAllowed in a RefusedUpdateError.
+// The check reads each struct's content tag as the apply decodes the update,
+// and every struct of an update is decoded before one integrates, so a
+// refused update leaves the document as it was and tells no observer, with
+// or without WithWholeOrNothingApplies. A struct that parks was checked by
+// the apply that decoded it, so the drain that later integrates it does not
+// check it again. Naming ContentKindDoc or ContentKindMove refuses remote
+// subdocuments or moves; the option refuses neither by itself. An update
+// that carries none of the named kinds applies as it would without the
+// option, and every failed remote apply on the document returns a
+// RefusedUpdateError.
+//
+// The cost is the call of kinds per apply and, for each struct the update
+// carries, a scan of its answer, besides the per-apply count that every
+// RefusedUpdateError reports.
+func WithRefusedContent(kinds func(origin any) []ContentKind) DocOption {
+	return func(d *Doc) { d.refusedContent = kinds }
+}
+
+// SetRefusedContent sets the kinds of WithRefusedContent on a document
+// already made, or with nil removes them. It takes the document's lock.
+func (d *Doc) SetRefusedContent(kinds func(origin any) []ContentKind) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.refusedContent = kinds
+}
+
 // updateSub pairs a unique subscription ID with its callback so that
 // unsubscribe closures can find and remove the right entry even when
 // callbacks are removed out-of-order.
@@ -307,12 +345,14 @@ type Doc struct {
 	// applying is the journal of the remote apply in progress on a document
 	// with whole-or-nothing applies, or nil.
 	applying *applyJournal
-	// applyBudget is the budget of WithApplyBudget and allowedRoots the list
-	// of WithAllowedRoots, each nil for none; counting is the tally of the
-	// remote apply in progress on a document with either, or nil.
-	applyBudget  func(origin any) ApplyBudget
-	allowedRoots func(origin any) []string
-	counting     *applyTally
+	// applyBudget is the budget of WithApplyBudget, allowedRoots the list of
+	// WithAllowedRoots and refusedContent the kinds of WithRefusedContent,
+	// each nil for none; counting is the tally of the remote apply in
+	// progress on a document with any of them, or nil.
+	applyBudget    func(origin any) ApplyBudget
+	allowedRoots   func(origin any) []string
+	refusedContent func(origin any) []ContentKind
+	counting       *applyTally
 	// parkedBy is what the document keeps of the apply that parked each
 	// parked struct, on a document with a budget or a roots list, and nil
 	// when nothing is parked; rootsDropped counts, by client, the parked
@@ -498,6 +538,17 @@ func (d *Doc) callAllowedRoots(origin any) []string {
 		}
 	}()
 	return d.allowedRoots(origin)
+}
+
+// callRefusedContent calls the WithRefusedContent callback, tagging a panic
+// it raises with the option's name; the caller holds d.mu.
+func (d *Doc) callRefusedContent(origin any) []ContentKind {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(budgetCallbackPanic{"WithRefusedContent", r})
+		}
+	}()
+	return d.refusedContent(origin)
 }
 
 // uuidV4 returns a random RFC-4122 v4 UUID string. Used as the default document
