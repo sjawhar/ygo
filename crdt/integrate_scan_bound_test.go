@@ -169,19 +169,21 @@ func TestAnUpdateWhoseItemScansPastTheBoundNeverCompletes(t *testing.T) {
 
 // When the drain of the parked queue passes what the apply left of the bound,
 // it keeps what it integrated and parks the rest, and the apply that filled the
-// gap succeeds: its sender did not send the parked items. What stays parked
-// waits for its sender: an apply that brings nothing of client 9 leaves it,
-// and each send of it carries on until it completes.
+// gap succeeds: its sender did not send the parked items. Nothing tells that
+// sender to send them again, so a later apply, from any sender, tries them
+// again on what it leaves of its own bound: here, edits from other clients
+// that scan nothing each leave the drain the whole bound and integrate some,
+// until none is parked.
 func TestADrainPastTheBoundKeepsWhatItIntegratedAndParksTheRest(t *testing.T) {
 	const l, n, bound = 200, 20, 1_000
 	state := EncodeStateAsUpdateV1(chainedList(t, l), nil)
 	gap, parked := originAtTheStartFrom(0, 1), originAtTheStartFrom(1, n)
-	other := New(WithClientID(11))
-	om := other.GetMap("m")
-	other.Transact(func(txn *Transaction) { om.Set(txn, "k", 1) })
-	elsewhere := EncodeStateAsUpdateV1(other, nil)
+	elsewhere := make([][]byte, n)
+	for i := range elsewhere {
+		elsewhere[i] = editFrom(ClientID(11 + i))
+	}
 	want := boundTo(t, state, 0)
-	for _, update := range [][]byte{parked, gap, elsewhere} {
+	for _, update := range append([][]byte{parked, gap}, elsewhere...) {
 		if err := ApplyUpdateV1(want, update, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -208,26 +210,99 @@ func TestADrainPastTheBoundKeepsWhatItIntegratedAndParksTheRest(t *testing.T) {
 			}
 			requireText(t, boundTo(t, EncodeStateAsUpdateV1(doc, nil), 0), l, n+1)
 
-			if err := form.apply(doc, elsewhere, fromAClient); err != nil {
-				t.Fatal(err)
-			}
-			if got := len(doc.store.pending.items); got != n-4 {
-				t.Fatalf("an apply that brought nothing of client 9 left %d items parked, want %d", got, n-4)
-			}
-
-			for send := 1; ; send++ {
-				err := form.apply(doc, parked, fromAClient)
-				if err == nil {
-					break
+			parkedNow := n - 4
+			for i, update := range elsewhere {
+				if err := form.apply(doc, update, fromAClient); err != nil {
+					t.Fatalf("edit %d from another client returned %v", i, err)
 				}
-				if !errors.Is(err, ErrIntegrateScanBudget) || send == n {
-					t.Fatalf("send %d of the parked items returned %v", send, err)
+				if doc.store.pending == nil {
+					continue
 				}
+				if got := len(doc.store.pending.items); got >= parkedNow {
+					t.Fatalf("edit %d from another client left %d items parked, want fewer than %d", i, got, parkedNow)
+				}
+				parkedNow = len(doc.store.pending.items)
 			}
 			if doc.store.pending != nil {
-				t.Fatalf("%d items parked after the update completed", len(doc.store.pending.items))
+				t.Fatalf("%d items parked after %d edits from other clients", len(doc.store.pending.items), n)
 			}
+			requireText(t, doc, l, n+1)
+			requireStoreWhole(t, doc, &doc.GetText("t").abstractType)
 			requireSameState(t, doc, want)
+		})
+	}
+}
+
+// editFrom is an update from client that sets a key of its own in a map, and
+// so scans nothing.
+func editFrom(client ClientID) []byte {
+	doc := New(WithClientID(client))
+	m := doc.GetMap("m")
+	doc.Transact(func(txn *Transaction) { m.Set(txn, fmt.Sprint(client), 1) })
+	return EncodeStateAsUpdateV1(doc, nil)
+}
+
+// characterAfter is an update of one character from client 9 at clock, with
+// origin as its left origin and no right origin.
+func characterAfter(clock uint64, origin ID) []byte {
+	enc := encoding.NewEncoder()
+	for _, v := range []uint64{1, 1, 9, clock} { // one client, one struct, client 9, clock
+		enc.WriteVarUint(v)
+	}
+	enc.WriteUint8(wireString | flagHasOrigin)
+	enc.WriteVarUint(uint64(origin.Client))
+	enc.WriteVarUint(origin.Clock)
+	enc.WriteVarString("x")
+	enc.WriteVarUint(0) // delete set: no clients
+	return append([]byte(nil), enc.Bytes()...)
+}
+
+// A parked item whose scan alone passes the bound is tried again only by a
+// drain with more of the bound left than the scan that tripped had, or with no
+// bound. One later apply that leaves its drain the whole bound finds that the
+// item does not fit, the applies after it spend nothing on it, and an apply
+// with no bound integrates it.
+func TestAParkedItemPastTheBoundCostsTheAppliesAfterItNothing(t *testing.T) {
+	const l, bound = 200, 100
+	state := EncodeStateAsUpdateV1(chainedList(t, l), nil)
+	// The gap, client 9's clock 0, follows chainedList's character 150 and
+	// scans the 49 after it, which leaves the drain 51. Clock 1 scans 199.
+	gap, stuck := characterAfter(0, ID{Client: 5, Clock: 75}), originAtTheStartFrom(1, 1)
+	for _, form := range applyForms {
+		t.Run(form.name, func(t *testing.T) {
+			doc := boundTo(t, state, bound)
+			spent := -1
+			doc.OnAfterTransaction(func(txn *Transaction) { spent = bound - int(txn.scanLeft) })
+			for _, update := range [][]byte{stuck, gap} {
+				if err := form.apply(doc, update, fromAClient); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if parked := doc.PendingStats().Items; spent != bound || parked != 1 {
+				t.Fatalf("the apply that filled the gap spent %d of the bound and left %d items parked, want %d and 1", spent, parked, bound)
+			}
+			for i := range 5 {
+				if err := form.apply(doc, editFrom(ClientID(11+i)), fromAClient); err != nil {
+					t.Fatal(err)
+				}
+				want := 0
+				if i == 0 {
+					want = bound // the first has the whole bound, more than the 51 the drain had
+				}
+				if parked := doc.PendingStats().Items; spent != want || parked != 1 {
+					t.Fatalf("edit %d from another client spent %d of the bound and left %d items parked, want %d and 1", i, spent, parked, want)
+				}
+			}
+			if err := form.apply(doc, editFrom(16), nil); err != nil {
+				t.Fatal(err)
+			}
+			if parked := doc.PendingStats().Items; parked != 0 {
+				t.Fatalf("%d items parked after an apply with no bound", parked)
+			}
+			if got := strings.Count(doc.GetText("t").ToString(), "x"); got != 2 {
+				t.Fatalf("the text holds %d of client 9's characters, want 2", got)
+			}
+			requireStoreWhole(t, doc, &doc.GetText("t").abstractType)
 		})
 	}
 }

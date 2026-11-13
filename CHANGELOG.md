@@ -19,12 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the bound aborts partway with `ErrIntegrateScanBudget`, which wraps
   `ErrInvalidUpdate`: the document keeps what it integrated, as for an update
   that overflows the pending cap, `ApplyUpdateV1Landed` reports that part, and
-  the same update sent again carries on from there. The drain of the parked
+  the same update sent again carries on from there, until it reaches an item
+  whose scan alone passes the bound: from then on each send integrates nothing
+  and `ApplyUpdateV1Landed` returns no landed part. The drain of the parked
   queue runs on what the apply left of the bound; past it, the drain keeps what
-  it integrated, parks the rest until its sender sends it again, and the apply
-  succeeds. Any other panic in the drain still fails the apply with
-  `ErrInvalidUpdate`. Remote moves and subdocuments apply as before, and a
-  document without the option is unchanged.
+  it integrated, parks the rest, and the apply succeeds. A later apply, from any
+  sender, tries the rest again when its drain has more of its bound left than
+  the scan that tripped had, or no bound. Any other panic in the drain still
+  fails the apply with `ErrInvalidUpdate`. Remote moves and subdocuments apply
+  as before, and a document without the option is unchanged.
 
 ## [1.55.1] — 2026-11-13
 

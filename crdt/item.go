@@ -135,6 +135,7 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 		scan, step, groupFrom := txn.scanSerial, uint32(0), uint32(1)
 
 		// Scan right until we hit our right origin (item.Right) or the end.
+		scanFrom := txn.scanLeft
 		for o != nil && o != item.Right {
 			// A bounded apply aborts before its scans pass one item more than
 			// the bound, and before this item is linked.
@@ -142,7 +143,7 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 				if txn.scanLeft == 0 {
 					// A parked item tried again resolves its neighbours again.
 					item.Left, item.Right = nil, nil
-					panic(integrateScanBudgetExceeded{})
+					panic(integrateScanBudgetExceeded{left: scanFrom})
 				}
 				txn.scanLeft--
 			}

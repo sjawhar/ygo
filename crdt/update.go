@@ -44,8 +44,9 @@ var ErrInvalidUpdate = errors.New("crdt: invalid update")
 var ErrIntegrateScanBudget = fmt.Errorf("%w: its conflict scans pass the document's bound", ErrInvalidUpdate)
 
 // integrateScanBudgetExceeded is the panic Item.integrate raises when a
-// bounded apply's scans reach the bound.
-type integrateScanBudgetExceeded struct{}
+// bounded apply's scans reach the bound. left is what the bound left the scan
+// that tripped when it began: the item needs more than that.
+type integrateScanBudgetExceeded struct{ left uint32 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -821,7 +822,7 @@ func drainPending(txn *Transaction) {
 	// Matches yrs' apply_update retry gate and Yjs JS's readUpdateV2
 	// recursion, but executed inline so everything integrated during
 	// this call surfaces in a single OnUpdate notification.
-	for txn.doc.store.pending != nil && txn.doc.store.retryable(txn.doc.store.pending.missing) {
+	for txn.drainable() {
 		items := txn.doc.store.pending.items
 		txn.doc.store.pending = nil
 
@@ -879,33 +880,51 @@ func unresolvedPending(store *StructStore, items []*Item, done []bool) ([]*Item,
 	return remaining, missing
 }
 
+// drainable reports whether txn's drain should try the parked queue: a clock
+// the queue waits on has advanced, or the bound tripped in the drain that last
+// tried it and txn's drain has more of the bound left than the scan that
+// tripped had, or no bound. A drain with no more left would trip at the same
+// item again, so an item whose scan alone passes the bound costs the applies
+// after it nothing until one with a larger bound, or none, tries it.
+func (txn *Transaction) drainable() bool {
+	p := txn.doc.store.pending
+	if p == nil {
+		return false
+	}
+	if p.tripped && (!txn.scanBounded || txn.scanLeft > p.scanLeft) {
+		return true
+	}
+	return txn.doc.store.retryable(p.missing)
+}
+
 // drainParked runs drain, the drain of the parked queue that ends an apply.
 // When the drain's scans reach what the apply left of the bound, the drain
 // keeps what it integrated and parks the rest again without failing the
-// apply, whose sender did not send the parked items; every other panic is
-// raised again.
+// apply, whose sender did not send the parked items; a later apply, from any
+// sender, tries them again (drainable). Every other panic is raised again.
 func drainParked(txn *Transaction, drain func(*Transaction)) {
 	defer func() {
 		r := recover()
 		if r == nil {
 			return
 		}
-		if _, ok := r.(integrateScanBudgetExceeded); !ok {
+		trip, ok := r.(integrateScanBudgetExceeded)
+		if !ok {
 			panic(r)
 		}
-		// Each parked item waits on what it depends on, and one that depends
-		// on nothing on its own client's next clock, so its sender's next send
-		// of it tries it again and later applies do not pay for it.
+		// The drain tripped the bound, so an item may wait on nothing but a
+		// drain with more of the bound left: nothing tells the parked items'
+		// sender to send them again. missing keeps what they do wait on.
 		s := txn.doc.store
 		missing := make(StateVector)
 		for _, item := range s.pending.items {
 			if client, parkedAt, future := itemFutureDep(item, s); future {
 				mergePendingMissing(missing, client, parkedAt)
-			} else {
+			} else if item.ID.Clock > s.NextClock(item.ID.Client) {
 				mergePendingMissing(missing, item.ID.Client, s.NextClock(item.ID.Client))
 			}
 		}
-		s.pending.missing = missing
+		s.pending.missing, s.pending.tripped, s.pending.scanLeft = missing, true, trip.left
 		if len(s.pendingDs.clients) > 0 {
 			retryPendingDs(txn)
 		}

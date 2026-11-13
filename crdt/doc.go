@@ -127,10 +127,14 @@ func WithMaxPendingItems(n int) DocOption {
 //
 // An apply whose scans would pass the bound aborts partway with
 // ErrIntegrateScanBudget and keeps what it integrated, as one that overflows
-// the pending cap does; the same update sent again carries on from there. The
-// drain of the parked queue that ends an apply runs on what the apply left of
-// the bound, and past it keeps what it integrated and parks the rest until
-// their sender sends them again, without failing the apply.
+// the pending cap does; the same update sent again carries on from there. An
+// item whose scan alone passes the bound aborts every send at that item: from
+// then on each send integrates nothing, and ApplyUpdateV1Landed returns nil
+// landed with the error. The drain of the parked queue that ends an apply runs
+// on what the apply left of the bound, and past it keeps what it integrated and
+// parks the rest, without failing the apply. A later apply, from any sender,
+// tries them again when its drain has more of its bound left than the scan
+// that tripped had, or no bound.
 func WithIntegrateScanBudget(budget func(origin any) int) DocOption {
 	return func(d *Doc) { d.integrateScanBudget = budget }
 }

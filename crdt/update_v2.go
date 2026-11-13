@@ -857,7 +857,7 @@ func drainPendingV2(txn *Transaction) {
 	// Matches yrs' apply_update retry gate and Yjs JS's readUpdateV2
 	// recursion, but executed inline so everything integrated during
 	// this call surfaces in a single OnUpdate notification.
-	for txn.doc.store.pending != nil && txn.doc.store.retryable(txn.doc.store.pending.missing) {
+	for txn.drainable() {
 		items := txn.doc.store.pending.items
 		txn.doc.store.pending = nil
 
