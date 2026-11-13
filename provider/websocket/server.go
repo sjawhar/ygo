@@ -47,10 +47,11 @@ func (s *Server) safeHook(name string, fn func()) {
 	fn()
 }
 
-// writeTimeout is applied to every individual WebSocket write. A peer that
-// stops reading will be detected and disconnected within this window, preventing
-// a slow-reader from blocking the broadcast loop for all other peers.
-const writeTimeout = 10 * time.Second
+// defaultPeerWriteTimeout is the deadline on one WebSocket write when
+// Server.PeerWriteTimeout is not set. A peer that stops reading is detected
+// and disconnected within this window, so a slow reader cannot block the
+// broadcast loop for every other peer.
+const defaultPeerWriteTimeout = 10 * time.Second
 
 // closeFrameTimeout bounds the close frame sent for a cancel cause. A peer that
 // cannot take a control frame this quickly is not reading anyway.
@@ -180,6 +181,14 @@ func (s *Server) peerWriteQueueSize() int {
 		return s.PeerWriteQueueSize
 	}
 	return defaultPeerWriteQueueSize
+}
+
+// peerWriteTimeout returns the configured per-write deadline or the default.
+func (s *Server) peerWriteTimeout() time.Duration {
+	if s.PeerWriteTimeout > 0 {
+		return s.PeerWriteTimeout
+	}
+	return defaultPeerWriteTimeout
 }
 
 // SlowPeerPolicy selects how the server reacts when a peer's broadcast write
@@ -1110,6 +1119,28 @@ type Server struct {
 	// alone lets one peer pin many full-state frames; zero or negative
 	// disables it.
 	PeerWriteQueueBytes int64
+
+	// PeerWriteTimeout is the deadline on one write to a peer: each frame
+	// the peer's writer goroutine sends (writeToConn) and the close frame a
+	// disconnect queues (sendCloseFrame). The close frame sent for a
+	// cancelled request context keeps its own one-second bound. A write that
+	// passes the deadline closes the connection without a close frame, so
+	// the reader sees 1006 (abnormal closure), and the peer leaves its room.
+	// Zero (the default) or a negative value uses 10 s, the deadline this
+	// server used before the field existed.
+	//
+	// The deadline covers a whole frame, so it also sets how slow a link a
+	// peer can read on and still take the largest frame the server sends
+	// it, usually the room's state in answer to its SyncStep1. A reader
+	// that takes bytes steadily but needs longer than the deadline for that
+	// frame is dropped part-way through it. A server for slow links sets
+	// this to the time its slowest supported link needs for the largest
+	// room state it holds.
+	//
+	// Like the other config fields, set it before serving; it is read
+	// without synchronisation, on each write, and must not be mutated
+	// while the server is handling connections.
+	PeerWriteTimeout time.Duration
 
 	// SlowPeerPolicy selects the reaction when a peer's broadcast write queue
 	// overflows: SlowPeerDisconnect (default) closes the connection; SlowPeerResync

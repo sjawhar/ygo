@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the one in-flight caller discounted is that `Apply`. It returns
   `ErrRoomNotFound` when the name holds a different instance by then, and
   `ErrNotInApply` when nobody is inside the room at all.
+- **`provider/websocket`: `Server.PeerWriteTimeout` sets the deadline on one
+  write to a peer.** It was a fixed 10 seconds. The deadline covers a whole
+  frame, so a peer on a slow link that read steadily but needed longer than
+  that for one frame, such as the room's state in answer to its SyncStep1,
+  was dropped part-way through it. The field bounds each frame the peer's
+  writer sends and the close frame a disconnect queues; the close frame for a
+  cancelled request context keeps its one-second bound. A write that passes
+  the deadline closes the connection without a close frame, and the peer
+  leaves its room. Zero, the default, or a negative value keeps 10 seconds.
 
 ### Fixed
 

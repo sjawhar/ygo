@@ -20,7 +20,7 @@ import (
 // connection makes the read loop run the teardown and fire OnLastPeer.
 func TestInteg_WriterExit_TimedOutWriteTearsDownPeer(t *testing.T) {
 	// The margin covers scheduling.
-	const teardownBound = ygws.WriteTimeout + 5*time.Second
+	const teardownBound = ygws.DefaultPeerWriteTimeout + 5*time.Second
 
 	srv := ygws.NewServer()
 	lastPeer := make(chan struct{}, 1)

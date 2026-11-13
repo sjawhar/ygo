@@ -175,9 +175,9 @@ func (s *Server) effectiveMaxUpdateBytes() int {
 // holds that state, enforces MaxPendingItems when it applies the update.
 //
 // Peer write failures during fan-out do not produce an error: writes
-// are dispatched in goroutines with a per-write deadline (writeTimeout),
-// matching the existing peer-broadcast path. A slow peer cannot block
-// the broadcast to other peers.
+// are sent from goroutines with a per-write deadline
+// (Server.PeerWriteTimeout), matching the existing peer-broadcast path. A
+// slow peer cannot block the broadcast to other peers.
 func (s *Server) BroadcastUpdate(ctx context.Context, room string, update []byte) error {
 	return s.broadcastUpdate(ctx, room, update, true)
 }

@@ -24,11 +24,24 @@ changes.
   at Warn as `peer queued bytes over budget`. A frame that arrives while the
   budget or more waits closes even a peer that reads. Zero, the default,
   changes nothing.
+- **`Server.PeerWriteTimeout` sets the deadline on one write to a peer.** It
+  was a fixed 10 seconds, and still is when the field is unset. The deadline
+  covers a whole frame, so a reader on a slow link that took the room's state
+  steadily but needed longer than that for it was dropped part-way through.
+  A server for slow links sets the time its slowest link needs for the
+  largest room state:
+
+  ```go
+  srv.PeerWriteTimeout = 30 * time.Second
+  ```
+
+  A write that passes the deadline closes the connection, and the peer
+  leaves its room.
 - **A failed write closes the connection.** Each write to a peer has a
-  10-second deadline. When a write failed, the peer's writer stopped but the
-  connection stayed open, so a peer that kept sending stayed in its room and
-  `OnLastPeer` did not fire. The server now closes the connection and removes
-  the peer.
+  deadline, 10 seconds unless `PeerWriteTimeout` sets another. When a write
+  failed, the peer's writer stopped but the connection stayed open, so a
+  peer that kept sending stayed in its room and `OnLastPeer` did not fire.
+  The server now closes the connection and removes the peer.
 - **A peer that the server closes has its unread input dropped.** When the
   server closed a connection itself (a full write queue, a Hocuspocus close
   message, a cancelled request context without a close code, `Shutdown` or
