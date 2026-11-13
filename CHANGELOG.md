@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`crdt`: `Doc.SetMaxPendingItems(n)`** sets the pending cap after
   construction, so stored state over a cap can load first.
+- **`crdt.ErrPendingCap`** is the error a document returns when it refuses a
+  remote update that would leave more structs or more delete ranges parked
+  than `WithMaxPendingItems` allows, from every check that enforces the cap.
+  It wraps `ErrInvalidUpdate`, so `errors.Is(err, ErrInvalidUpdate)` still
+  holds for it. It is a separate error because the two refusals say different
+  things about the sender: bytes that do not decode come from a broken
+  sender, while an update over the cap only waits on clocks the document
+  does not hold yet, and applies once the document holds them. A caller that
+  compared a cap refusal with `==` rather than `errors.Is` no longer matches
+  it: its text is now `crdt: invalid update: it would park more than the
+  document allows`.
 
 ### Changed
 

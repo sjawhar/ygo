@@ -516,7 +516,7 @@ func (b *pendingBudget) checkCollected(known StateVector, bounds []pendingWireBo
 			pending++
 			if !merging {
 				if pending > b.remaining {
-					return ErrInvalidUpdate
+					return ErrPendingCap
 				}
 				continue
 			}
@@ -528,7 +528,7 @@ func (b *pendingBudget) checkCollected(known StateVector, bounds []pendingWireBo
 		pending = b.parked.plan(arrived).growth()
 	}
 	if pending > b.remaining {
-		return ErrInvalidUpdate
+		return ErrPendingCap
 	}
 	return nil
 }

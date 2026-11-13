@@ -160,8 +160,8 @@ func TestUnit_ApplyUpdate_ACappedDocumentRefusesWithTheDecodersReason(t *testing
 					break
 				}
 			}
-			if err := f.apply(New(WithMaxPendingItems(1)), f.update, nil); u.pastCap && (err == nil || err.Error() != ErrInvalidUpdate.Error()) {
-				t.Errorf("%s %s past a one-item cap: %v, want %q", u.name, f.name, err, ErrInvalidUpdate)
+			if err := f.apply(New(WithMaxPendingItems(1)), f.update, nil); u.pastCap && !errors.Is(err, ErrPendingCap) {
+				t.Errorf("%s %s past a one-item cap: %v, want ErrPendingCap", u.name, f.name, err)
 			}
 			if u.column && f.name == "V2" {
 				// Its first byte, past the feature flag and the empty key column's
@@ -335,8 +335,8 @@ func TestUnit_ApplyUpdate_ADocumentWithLittleRoomRefusesWithTheDecodersReason(t 
 	}
 	two := EncodeStateAsUpdateV1(parkingFork(t, one, 9, 0, 0), one.StateVector())
 	for _, f := range formats(t, two) {
-		if err := f.apply(target(room), f.update, nil); err == nil || err.Error() != ErrInvalidUpdate.Error() {
-			t.Errorf("%s whole: %v, want %q", f.name, err, ErrInvalidUpdate)
+		if err := f.apply(target(room), f.update, nil); !errors.Is(err, ErrPendingCap) {
+			t.Errorf("%s whole: %v, want ErrPendingCap", f.name, err)
 		}
 		// Every cut but the delete set's last byte leaves the second struct
 		// unread.

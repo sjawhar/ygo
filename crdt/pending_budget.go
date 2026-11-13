@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"unicode/utf8"
@@ -11,6 +12,18 @@ import (
 	"github.com/reearth/ygo/encoding"
 	"github.com/reearth/ygo/internal/anycodec"
 )
+
+// ErrPendingCap is the error a remote update gets when the document refuses
+// it because the update would leave more structs or more delete ranges parked
+// than WithMaxPendingItems allows. It wraps ErrInvalidUpdate, so
+// errors.Is(err, ErrInvalidUpdate) holds for it.
+//
+// It is separate from the other refusals because it says something else about
+// the sender. Bytes that do not decode come from a broken sender, which a
+// server may drop. An update over the cap only waits on clocks the document
+// does not hold yet, and the same update applies once the document holds
+// them, so a server can keep its sender connected.
+var ErrPendingCap = fmt.Errorf("%w: it would park more than the document allows", ErrInvalidUpdate)
 
 // pendingBudget checks whether dependencies can resolve within this update
 // before charging its unresolved structs to the persistent pending limit.
@@ -144,7 +157,7 @@ func (b *pendingBudget) check() error {
 			break // only the merge itself tells what overlapping structs add
 		}
 		if !result.progressed {
-			return ErrInvalidUpdate
+			return ErrPendingCap
 		}
 	}
 	// An absent dependency cannot be supplied by a later scan. Record compact
@@ -514,7 +527,7 @@ func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining in
 					} else {
 						result.permanent++
 						if pastRoom(result.permanent, remaining, held) {
-							return result, ErrInvalidUpdate
+							return result, ErrPendingCap
 						}
 					}
 					if !blocked && collect != nil && collect.permanent {
@@ -543,7 +556,7 @@ func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining in
 						if clients == 1 && pastRoom(result.pending, remaining, held) {
 							// No other group can fill this group's first blocked head. All
 							// following uncovered non-Skip structs remain permanently pending.
-							return result, ErrInvalidUpdate
+							return result, ErrPendingCap
 						}
 					}
 					if !blocked {

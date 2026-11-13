@@ -24,6 +24,12 @@ the same document.
 - Parked delete ranges count against the same cap, separately, and are
   retried only when they can apply. `Doc.SetMaxPendingItems` sets the cap
   after construction.
+- A refusal by the pending cap returns the new `crdt.ErrPendingCap`, which
+  wraps `ErrInvalidUpdate`. A server can tell it from bytes that do not
+  decode: the update only waits on clocks the document does not hold yet,
+  and applies once the document holds them, so its sender need not be
+  dropped. Code that compared this refusal with `==` rather than `errors.Is`
+  no longer matches it.
 - A struct sent again merges into the pending queue as Yjs merges its pending
   update, so the queue holds what Yjs's pending update holds. Each struct a
   park adds, cuts or drops costs, on average, time logarithmic in the queue.

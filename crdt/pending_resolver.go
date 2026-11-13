@@ -257,7 +257,7 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	if s.pending.heldStructs() > 0 && !s.pending.tailAppends(pending) && s.pending.mergesAny(pending) {
 		pl := s.pending.plan(refsOf(pending))
 		if s.pending.heldStructs()+pl.growth() > limit {
-			return ErrInvalidUpdate
+			return ErrPendingCap
 		}
 		pending = s.pending.apply(pl, pending, s.parked != nil && len(s.parked.items) > 0)
 	}
@@ -276,7 +276,7 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	}()
 	for _, item := range pending {
 		if s.pending.heldStructs() >= limit {
-			return ErrInvalidUpdate
+			return ErrPendingCap
 		}
 		if s.pending == nil {
 			s.pending = &pendingUpdate{missing: make(StateVector), tailClient: item.ID.Client, tailValid: true}
