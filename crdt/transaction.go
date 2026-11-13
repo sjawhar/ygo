@@ -3,6 +3,7 @@ package crdt
 import (
 	"cmp"
 	"context"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -15,6 +16,8 @@ type Transaction struct {
 	doc         *Doc
 	Origin      any  // user-supplied tag forwarded to update observers
 	Local       bool // true when the change originated on this peer; false while applying a remote update
+	scanBounded bool // this remote apply's conflict scans may pass only scanLeft more items (WithIntegrateScanBudget)
+	scanLeft    uint32
 	deleteSet   DeleteSet
 	beforeState StateVector
 	afterState  StateVector
@@ -586,4 +589,12 @@ func (txn *Transaction) scanMarkMap() map[*Item]scanMark {
 		txn.scanMarks = make(map[*Item]scanMark)
 	}
 	return txn.scanMarks
+}
+
+// boundScans lets txn's conflict scans pass at most n more items, when n is
+// positive.
+func (txn *Transaction) boundScans(n int) {
+	if n > 0 {
+		txn.scanBounded, txn.scanLeft = true, uint32(min(uint64(n), math.MaxUint32))
+	}
 }

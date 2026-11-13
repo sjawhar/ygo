@@ -1,3 +1,28 @@
+## v1.56.0
+
+**Who is affected:** servers that apply updates from clients they do not
+control. Nothing changes unless you set the new option.
+
+**A bound on the conflict scans of one remote apply, set per origin.** YATA
+places an item by scanning right from its left origin. An item that names an
+early left origin and no right origin scans to the end of the list, so an
+update of a few KB can hold the document's lock for seconds.
+`crdt.WithIntegrateScanBudget(func(origin any) int)` bounds the items one
+apply's scans pass, by the origin the apply is given: a server bounds the
+origin it applies a connected client's updates with, and returns 0 for updates
+it relays from another node or loads from storage.
+
+An apply that passes the bound aborts partway and returns
+`crdt.ErrIntegrateScanBudget`, which wraps `crdt.ErrInvalidUpdate`. The
+document keeps what the apply integrated, as it does for an update that
+overflows the pending cap, and `ApplyUpdateV1Landed` returns that part for
+relay. The same update sent again carries on from there. When the drain of the
+parked queue passes the bound, it keeps what it integrated and parks the rest,
+and the apply that filled the gap still succeeds. Remote moves and
+subdocuments work under a bound.
+
+**Upgrading.** No change is needed.
+
 ## v1.55.1
 
 **Who is affected:** servers that apply updates from peers, where one update

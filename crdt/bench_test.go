@@ -423,20 +423,27 @@ func BenchmarkConcurrentSamePositionInsert(b *testing.B) {
 // each item's conflict scan passes the whole list.
 func BenchmarkApplyUpdateV1_ConflictScan(b *testing.B) { benchConflictScan(b, 2_000, 200) }
 
+// BenchmarkApplyUpdateV1_ConflictScanBounded is
+// BenchmarkApplyUpdateV1_ConflictScan on a document whose bound never trips.
+func BenchmarkApplyUpdateV1_ConflictScanBounded(b *testing.B) {
+	benchConflictScan(b, 2_000, 200, WithIntegrateScanBudget(func(any) int { return 1 << 30 }))
+}
+
 // BenchmarkApplyUpdateV1_SplitRunMergedBack applies 2,000 items that each split
 // one 4,000-character run, whose halves all merge back at commit.
 func BenchmarkApplyUpdateV1_SplitRunMergedBack(b *testing.B) { benchSplitRunMergedBack(b, 2_000) }
 
 // benchConflictScan applies originAtTheStart(n) to a fresh copy of
-// chainedList(l) on each iteration; loading the copy is not timed.
-func benchConflictScan(b *testing.B, l, n int) {
+// chainedList(l), made with opts, on each iteration; loading the copy is not
+// timed.
+func benchConflictScan(b *testing.B, l, n int, opts ...DocOption) {
 	state := EncodeStateAsUpdateV1(chainedList(b, l), nil)
 	update := originAtTheStart(n)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		b.StopTimer()
-		doc := New()
+		doc := New(opts...)
 		if err := ApplyUpdateV1(doc, state, nil); err != nil {
 			b.Fatal(err)
 		}

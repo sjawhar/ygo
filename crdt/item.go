@@ -136,6 +136,16 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 
 		// Scan right until we hit our right origin (item.Right) or the end.
 		for o != nil && o != item.Right {
+			// A bounded apply aborts before its scans pass one item more than
+			// the bound, and before this item is linked.
+			if txn.scanBounded {
+				if txn.scanLeft == 0 {
+					// A parked item tried again resolves its neighbours again.
+					item.Left, item.Right = nil, nil
+					panic(integrateScanBudgetExceeded{})
+				}
+				txn.scanLeft--
+			}
 			// Children and keyed attributes have independent conflict orders.
 			if !parentSubEqual(item.ParentSub, o.ParentSub) {
 				o = o.Right

@@ -243,12 +243,15 @@ func chainedList(t testing.TB, l int) *Doc {
 // item whose own origin lies in what the scan has passed (Item.integrate), and
 // in chainedList that is every item to the end, so each of these items scans
 // the whole list.
-func originAtTheStart(n int) []byte {
+func originAtTheStart(n int) []byte { return originAtTheStartFrom(0, n) }
+
+// originAtTheStartFrom is originAtTheStart with client 9's clocks from clock.
+func originAtTheStartFrom(clock uint64, n int) []byte {
 	enc := encoding.NewEncoder()
 	enc.WriteVarUint(1) // clients
 	enc.WriteVarUint(uint64(n))
 	enc.WriteVarUint(9) // client
-	enc.WriteVarUint(0) // first clock
+	enc.WriteVarUint(clock)
 	for range n {
 		enc.WriteUint8(wireString | flagHasOrigin)
 		enc.WriteVarUint(5)

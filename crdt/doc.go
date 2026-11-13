@@ -117,6 +117,24 @@ func WithMaxPendingItems(n int) DocOption {
 	return func(d *Doc) { d.maxPendingItems = n }
 }
 
+// WithIntegrateScanBudget bounds the items the conflict scans of one remote
+// apply (ApplyUpdate and its V1 and V2 forms) may pass, by the apply's origin:
+// budget is called with the origin before the apply takes the document's lock,
+// so applies on several goroutines may call it at once, and zero or negative
+// sets no bound. It is set per origin so a server can bound the updates a
+// connected client sends, and apply what it relays from another node or loads
+// from storage with no bound.
+//
+// An apply whose scans would pass the bound aborts partway with
+// ErrIntegrateScanBudget and keeps what it integrated, as one that overflows
+// the pending cap does; the same update sent again carries on from there. The
+// drain of the parked queue that ends an apply runs on what the apply left of
+// the bound, and past it keeps what it integrated and parks the rest until
+// their sender sends them again, without failing the apply.
+func WithIntegrateScanBudget(budget func(origin any) int) DocOption {
+	return func(d *Doc) { d.integrateScanBudget = budget }
+}
+
 // updateSub pairs a unique subscription ID with its callback so that
 // unsubscribe closures can find and remove the right entry even when
 // callbacks are removed out-of-order.
@@ -158,6 +176,8 @@ type Doc struct {
 	subdocs         map[string]*Doc
 	onSubdocs       []subdocsSub
 	maxPendingItems int // 0 = use defaultMaxPendingItems; see WithMaxPendingItems and #46
+	// integrateScanBudget is the bound of WithIntegrateScanBudget, or nil.
+	integrateScanBudget func(origin any) int
 
 	store *StructStore
 	share map[string]sharedType // named root types
@@ -254,6 +274,15 @@ func (d *Doc) maxPendingItemsLimit() int {
 		return defaultMaxPendingItems
 	}
 	return d.maxPendingItems
+}
+
+// scanBudget is the bound WithIntegrateScanBudget sets for a remote apply with
+// origin, or 0 for none.
+func (d *Doc) scanBudget(origin any) int {
+	if d.integrateScanBudget == nil {
+		return 0
+	}
+	return d.integrateScanBudget(origin)
 }
 
 // uuidV4 returns a random RFC-4122 v4 UUID string. Used as the default document

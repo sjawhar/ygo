@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.56.0] — 2026-11-13
+
+### Added
+
+- **`crdt`: `WithIntegrateScanBudget` bounds the conflict scans of a remote
+  apply, by its origin.** YATA places an item by scanning right from its left
+  origin, and an item that names an early left origin and no right origin
+  scans to the end of the list, so an update of a few KB can hold the
+  document's lock for seconds. `WithIntegrateScanBudget(func(origin any) int)`
+  gives each remote apply a bound on the items its scans pass, by the origin it
+  is applied with; zero or negative sets none. An apply whose scans would pass
+  the bound aborts partway with `ErrIntegrateScanBudget`, which wraps
+  `ErrInvalidUpdate`: the document keeps what it integrated, as for an update
+  that overflows the pending cap, `ApplyUpdateV1Landed` reports that part, and
+  the same update sent again carries on from there. The drain of the parked
+  queue runs on what the apply left of the bound; past it, the drain keeps what
+  it integrated, parks the rest until its sender sends it again, and the apply
+  succeeds. Any other panic in the drain still fails the apply with
+  `ErrInvalidUpdate`. Remote moves and subdocuments apply as before, and a
+  document without the option is unchanged.
+
 ## [1.55.1] — 2026-11-13
 
 ### Performance
