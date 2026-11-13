@@ -328,6 +328,31 @@ writer's state in one update.
 `StructCount` takes the document's read lock, so call it outside `Transact`.
 It walks the document's clients rather than its structs and allocates nothing.
 
+**Who is affected: `provider/websocket` servers that must bound the memory
+used to answer peers that join at the same time.** A server that does not set
+`Server.OnStateAnswer` is unchanged.
+
+Each answer to a SyncStep1 costs the server memory in proportion to what the
+peer is missing: the server builds every frame of the answer before it queues
+them. The answers to peers that join at the same time are built at the same
+time. `Server.OnStateAnswer`, if set, runs just before each of those answers,
+read-only peers included. It is handed the room name, its document, the
+SyncStep1, and `Structs`, how many structs the document holds, parked ones
+included; `StructsNow` reads that figure again for a hook that waited. The
+hook admits the answer, makes it wait, or refuses it:
+
+| The hook | Result |
+|---|---|
+| returns a nil error | the answer is sent; the release returned with it runs once, after the answer's frames are queued, or after an answer that could not be encoded was dropped |
+| returns or wraps a `*PeerClose{Code, Reason}`, Code 1000 or 3000-4999 | no answer; the peer is closed with Code and Reason |
+| returns any other error, or panics | no answer; the peer is closed with 4205 "Reset Connection" |
+
+A release that panics is recovered and logged. The hook runs on the peer's
+read loop, so the peer's next frame, its teardown and `Server.Shutdown` wait
+for it, and a hook that waits must bound its wait. It must not write to the
+document: a write that does not go through `Server.Apply` is broadcast to no
+peer.
+
 ## v1.55.0
 
 **Who is affected: servers that bridge many awareness clients over a single

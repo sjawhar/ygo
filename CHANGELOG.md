@@ -75,6 +75,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Update messages (type 2) and then one SyncStep2 (type 1), last. A receiver
   that applies them in order holds exactly what `EncodeSyncStep2`'s one
   message would have left it holding.
+- **`provider/websocket`: `Server.OnStateAnswer`** (`StateAnswerHook`,
+  `StateAnswerInfo`) runs just before the server answers a peer's SyncStep1
+  with the room's state, so a server can bound how many of those answers run
+  at once: each builds frames carrying all of what the peer is missing. It is
+  handed the room name, its document, the SyncStep1, and how many structs the
+  document holds, parked ones included
+  (`StateAnswerInfo.Structs`; `StructsNow` reads the figure again). A nil
+  error admits the answer, and the release returned with it runs once the
+  server is done with the answer. A non-nil error sends no answer and closes
+  the peer, with the code and reason of a `*PeerClose` it is or wraps and
+  with 4205 "Reset Connection" otherwise. A hook or release that panics is
+  recovered and logged. Nil keeps the behaviour without a hook.
 
 ### Changed
 
