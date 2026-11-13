@@ -86,14 +86,14 @@ const syncMessageHeaderBytes = 6
 // maxBytes bounds each message, not the update inside it. A message carrying
 // a single struct longer than maxBytes, which a V1 update cannot cut, and the
 // last message when doc holds parked structs, pass it; see
-// crdt.SplitUpdateV1.
+// crdt.SplitStateAsUpdateV1.
 func EncodeSyncStep2Split(doc *crdt.Doc, step1msg []byte, maxBytes int) ([][]byte, error) {
 	sv, err := readStateVector(step1msg)
 	if err != nil {
 		return nil, err
 	}
 
-	updates, err := crdt.SplitUpdateV1(crdt.EncodeStateAsUpdateV1(doc, sv), sv, maxBytes-syncMessageHeaderBytes)
+	updates, err := crdt.SplitStateAsUpdateV1(doc, sv, maxBytes-syncMessageHeaderBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -104,10 +104,10 @@ func EncodeSyncStep2Split(doc *crdt.Doc, step1msg []byte, maxBytes int) ([][]byt
 		if i == len(updates)-1 {
 			msgType = MsgSyncStep2
 		}
-		enc := encoding.NewEncoder()
-		enc.WriteVarUint(msgType)
-		enc.WriteVarBytes(update)
-		msgs[i] = enc.Bytes()
+		msgs[i] = encoding.EncodeBytes(func(enc *encoding.Encoder) {
+			enc.WriteVarUint(msgType)
+			enc.WriteVarBytes(update)
+		})
 	}
 	return msgs, nil
 }
