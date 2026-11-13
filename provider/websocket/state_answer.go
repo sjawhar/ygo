@@ -19,12 +19,12 @@ type StateAnswerInfo struct {
 	Doc *crdt.Doc
 	// Structs is how many structs the answer may have to encode: every
 	// struct Doc holds, the ones waiting in its pending queue included,
-	// since the answer carries those too (crdt.SplitUpdateV1). It is read
-	// the instant before the hook is called and is a snapshot: the room
-	// goes on taking updates while a hook that waits holds the answer, so
-	// a hook that waits must read StructsNow before it decides how much to
+	// since the answer carries those too (crdt.SplitStateAsUpdateV1). It is
+	// read the instant before the hook is called and is a snapshot: the room
+	// goes on taking updates while a hook that waits holds the answer, so a
+	// hook that waits must read StructsNow before it decides how much to
 	// reserve. The figure is a count of structs, not of bytes; what one
-	// struct costs to decode depends on the content it carries.
+	// struct costs to encode depends on the content it carries.
 	Structs int
 	// Step1 is the sync message the peer sent, whose state vector decides
 	// how much of Doc the answer carries. The hook must not modify or
@@ -42,8 +42,8 @@ func (i StateAnswerInfo) StructsNow() int {
 
 // answerStructs is how many structs an answer carrying the whole of doc
 // would encode: what the store holds and what waits in the pending queue,
-// which the answer carries as well (crdt.SplitUpdateV1, withParked). A nil
-// doc is no structs.
+// which the answer carries as well (crdt.SplitStateAsUpdateV1, withParked). A
+// nil doc is no structs.
 func answerStructs(doc *crdt.Doc) int {
 	if doc == nil {
 		return 0
@@ -56,24 +56,26 @@ func answerStructs(doc *crdt.Doc) int {
 // state and whose release runs once that answer has been handed to the
 // peer's writer.
 //
-// What it guards is the memory of one answer. Answering decodes the whole of
-// what the peer is missing into a merge store, in order to cut it into frames
-// each small enough for a browser to apply in one task
-// (sync.EncodeSyncStep2Split, crdt.SplitUpdateV1), so the server holds the
-// room's state decoded, once per answer, however small the SyncStep1 that
-// asked for it was. A room with many peers joining at once answers each of
-// them, and nothing else in the server bounds how many of those decodes run
-// together: an owner that must not be driven out of memory by a join storm
-// weighs each answer here, and lets it through, makes it wait, or refuses it.
+// What it guards is the memory of one answer. Answering cuts what the peer is
+// missing into frames each small enough for a browser to apply in one task
+// (sync.EncodeSyncStep2Split, crdt.SplitStateAsUpdateV1) and holds every
+// frame of it at once, so the server holds the room's state once more per
+// answer, however small the SyncStep1 that asked for it was, parked structs
+// and deletions included. A room with many peers joining at once answers each
+// of them, and nothing else in the server bounds how many of those answers
+// run together: an owner that must not be driven out of memory by a join
+// storm weighs each answer here, and lets it through, makes it wait, or
+// refuses it.
 //
 // The hook runs on the peer's read loop, so the peer's next frame waits for
 // it, and the answer is read and sent as soon as it returns. A non-nil
 // release runs once the answer's frames are in the peer's write queue, which
-// is where the merge store is released and Server.PeerWriteQueueBytes takes
-// over the accounting; it runs exactly once, also when the answer could not
-// be encoded and nothing was sent. A nil release is no release to run, and a
-// release that panics is recovered and logged, as the hook itself is, so it
-// does not take the peer's read loop down with it.
+// is where what the answer built besides them is released and
+// Server.PeerWriteQueueBytes takes over the accounting; it runs exactly once,
+// also when the answer could not be encoded and nothing was sent. A nil
+// release is no release to run, and a release that panics is recovered and
+// logged, as the hook itself is, so it does not take the peer's read loop
+// down with it.
 //
 // A hook that returns a non-nil error refuses the answer: nothing is sent and
 // the peer is closed, with the code and reason of a *PeerClose when the error

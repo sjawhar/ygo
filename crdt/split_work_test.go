@@ -44,11 +44,11 @@ func chainedClientsUpdate(t *testing.T, clients int) []byte {
 // clock, because the count is the same on every machine. A struct is checked
 // once for the placement that takes it, and once more for each visit that
 // leaves it where it is: the first visit of its client, and one per
-// dependency it waits through, of which blocker names four: six a struct at
-// worst, and two for this shape (8,001 checks for 4,001 structs). Eight
-// leaves room above that ceiling. The walk this replaces checked a client
-// per pass and took a pass per link: 8,006,001 checks for the same update,
-// 250 times the bound, splitting it in 958ms where it now takes 26ms.
+// dependency it waits through, of which blocker names three at most: five a
+// struct at worst, and two for this shape (8,001 checks for 4,001 structs).
+// Eight leaves room above that ceiling. The walk this replaces checked a
+// client per pass and took a pass per link: 8,006,001 checks for the same
+// update, 250 times the bound, splitting it in 958ms where it now takes 26ms.
 func TestUnit_SplitUpdateV1_WalksAChainOfClientsInWorkPerStruct(t *testing.T) {
 	const (
 		clients  = 4_000
@@ -60,10 +60,47 @@ func TestUnit_SplitUpdateV1_WalksAChainOfClientsInWorkPerStruct(t *testing.T) {
 	structs := clients + 1
 	require.Len(t, perClient, structs, "one struct per client, and the seed")
 
-	s := newUpdateSplitter(perClient, ds, nil, maxBytes)
+	queues := make([]splitQueue, 0, len(perClient))
+	for c, items := range perClient {
+		queues = appendUnsent(queues, c, items, nil)
+	}
+	s := newUpdateSplitter(queues, ds, nil, maxBytes, false)
 	s.run()
 
 	assert.LessOrEqual(t, s.checks, 8*structs, "readiness checks for %d structs", structs)
+	got := applySeries(t, s.out, maxBytes)
+	assert.Equal(t, "seed"+strings.Repeat("x", clients), got.GetText("t").ToString())
+}
+
+// A room's own structs are walked as the decoded ones are: the split that
+// reads them where they are, which answers a SyncStep1 in every room holding
+// nothing parked, places the same chain in the same work per struct, and
+// sends what the split of the encoded state sends.
+func TestUnit_SplitStateAsUpdateV1_WalksAChainOfClientsInWorkPerStruct(t *testing.T) {
+	const (
+		clients  = 4_000
+		maxBytes = 64 << 10
+	)
+	doc := New(WithClientID(1))
+	require.NoError(t, ApplyUpdateV1(doc, chainedClientsUpdate(t, clients), nil))
+	stats := doc.PendingStats()
+	require.Zero(t, stats.Items, "the room parks no struct, so it is cut from its own")
+	require.Zero(t, stats.DeleteRanges, "the room parks no deletion, so it is cut from its own")
+	structs := clients + 1
+	require.Len(t, doc.store.clients, structs, "one struct per client, and the seed")
+
+	queues := make([]splitQueue, 0, len(doc.store.clients))
+	for c, items := range doc.store.clients {
+		queues = appendUnsent(queues, c, items, nil)
+	}
+	s := newUpdateSplitter(queues, buildDeleteSet(doc.store), nil, maxBytes, true)
+	s.run()
+	require.NoError(t, s.err)
+
+	assert.LessOrEqual(t, s.checks, 8*structs, "readiness checks for %d structs", structs)
+	want, err := SplitUpdateV1(EncodeStateAsUpdateV1(doc, nil), nil, maxBytes)
+	require.NoError(t, err)
+	requireSameSeries(t, want, s.out, "the room's own structs against its encoded state")
 	got := applySeries(t, s.out, maxBytes)
 	assert.Equal(t, "seed"+strings.Repeat("x", clients), got.GetText("t").ToString())
 }

@@ -1000,14 +1000,13 @@ type Server struct {
 
 	// OnStateAnswer, if non-nil, runs immediately before the room answers a
 	// peer's SyncStep1 with the room's whole state, and its release runs
-	// once that answer has been handed to the peer's writer. Answering
-	// decodes the room's state into a merge store before it cuts it into
-	// frames, so the answer costs the server memory in proportion to what
-	// the room holds and not to the frame it arrived in; this is where an
-	// owner weighs that cost, admits the answer, or refuses it and closes
-	// the peer. A refusal sends no answer. Nil keeps the behaviour without
-	// a hook exactly: the room answers every SyncStep1. See
-	// StateAnswerHook.
+	// once that answer has been handed to the peer's writer. The answer
+	// holds every frame of the room's state at once, so it costs the server
+	// memory in proportion to what the room holds and not to the frame it
+	// arrived in; this is where an owner weighs that cost, admits the
+	// answer, or refuses it and closes the peer. A refusal sends no answer.
+	// Nil keeps the behaviour without a hook exactly: the room answers every
+	// SyncStep1. See StateAnswerHook.
 	OnStateAnswer StateAnswerHook
 
 	// OnTokenAuth, if non-nil, validates the token from a Hocuspocus in-band

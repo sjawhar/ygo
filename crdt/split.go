@@ -2,9 +2,10 @@ package crdt
 
 import (
 	"cmp"
-	"maps"
 	"math"
 	"slices"
+	"sort"
+	"unicode/utf8"
 
 	"github.com/reearth/ygo/encoding"
 )
@@ -12,10 +13,12 @@ import (
 // This file cuts one V1 update into the series of smaller V1 updates a
 // receiver applies in its place, for a transport that must not hand a
 // receiver one large update at once (a browser applies one update in one
-// task). It works at the struct level, on decodeStructsV1 and
-// encodeStructStoreV1 as MergeUpdatesV1 and DiffUpdateV1 do, because the cut
-// has to read what each struct names: a split by byte length would leave a
-// receiver holding structs that wait on structs still to come.
+// task). It works at the struct level, because the cut has to read what each
+// struct names: a split by byte length would leave a receiver holding structs
+// that wait on structs still to come. SplitUpdateV1 reads the structs of an
+// encoded update with decodeStructsV1, as MergeUpdatesV1 and DiffUpdateV1 do;
+// SplitStateAsUpdateV1 reads a document's own, so that splitting a state costs
+// what encoding it does.
 
 // splitHeaderBytes is what an update spends outside its structs and
 // deletions: the struct group count and the delete set's client count. Each is
@@ -50,22 +53,294 @@ func SplitUpdateV1(update []byte, sv StateVector, maxBytes int) ([][]byte, error
 	if err != nil {
 		return nil, err
 	}
-	s := newUpdateSplitter(perClient, ds, sv, maxBytes)
+	queues := make([]splitQueue, 0, len(perClient))
+	for c, items := range perClient {
+		queues = appendUnsent(queues, c, items, sv)
+	}
+	s := newUpdateSplitter(queues, ds, sv, maxBytes, false)
 	s.run()
 	return s.out, nil
 }
 
-// updateSplitter packs the structs and deletions of one decoded update into
-// the updates SplitUpdateV1 returns.
+// SplitStateAsUpdateV1 returns what SplitUpdateV1 returns for
+// EncodeStateAsUpdateV1(doc, sv), byte for byte, without encoding the state
+// and decoding it back: it reads doc's own structs and writes each one as the
+// decode would have read it. It copies a struct only to cut it, to write a
+// subdocument, or when the decode would read one of its values back as
+// another Go type (see rereadsSame), which no value Yjs or ygo writes in an
+// update is. What it allocates then grows with the updates it returns and
+// doc's clients, not with doc's structs. It holds doc's lock until it
+// returns.
+//
+// The structs and deletions doc holds parked reach the state through a merge
+// of their own (see withParked), which cuts each parked struct at its client's
+// clock in doc, so that they follow doc's own structs. They are written and
+// read back alone, and merged among themselves as that merge merges them (see
+// parkedMerge), so what this allocates for them grows with what doc parks, not
+// with its structs.
+func SplitStateAsUpdateV1(doc *Doc, sv StateVector, maxBytes int) ([][]byte, error) {
+	doc.mu.Lock()
+	defer doc.mu.Unlock()
+	store := doc.store
+	ds := buildDeleteSet(store)
+	var p *parkedMerge
+	clients := len(store.clients) // the most queues the split can have
+	if store.pending != nil || len(store.pendingDs.clients) > 0 {
+		p = readParked(store, sv, &ds)
+		for c := range p.parked {
+			if _, ok := store.clients[c]; !ok {
+				clients++
+			}
+		}
+	}
+	queues := make([]splitQueue, 0, clients)
+	for c, items := range store.clients {
+		queues = appendUnsent(queues, c, items, sv)
+	}
+	if p != nil {
+		var err error
+		if queues, err = p.addTo(queues, sv); err != nil {
+			return nil, err
+		}
+	}
+	s := newUpdateSplitter(queues, ds, sv, maxBytes, true)
+	if p != nil {
+		s.runs, s.reader = p.runs, p.reader
+	}
+	s.run()
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.out, nil
+}
+
+// appendUnsent appends to queues those of the clock-ordered structs of c that
+// a receiver whose state vector is sv does not hold whole, if there are any. A
+// struct the receiver holds whole is not sent, as encodeStructStoreV1 and
+// EncodeStateAsUpdateV1 leave it out.
+func appendUnsent(queues []splitQueue, c ClientID, items []*Item, sv StateVector) []splitQueue {
+	known := sv.Clock(c)
+	from := sort.Search(len(items), func(i int) bool {
+		return items[i].ID.Clock+items[i].Content.Len() > known
+	})
+	if from == len(items) {
+		return queues
+	}
+	return append(queues, splitQueue{client: c, held: known, items: items[from:]})
+}
+
+// parkedMerge merges the structs and deletions a document holds parked into
+// the queues of its own structs, as withParked merges them into
+// EncodeStateAsUpdateV1's state and SplitUpdateV1 then reads that state back.
+type parkedMerge struct {
+	reader *Doc                    // what the parked structs are read back into
+	parked map[ClientID][]*Item    // by client, the parked structs as the merge reads them
+	runs   map[ClientID][]splitRun // by client, what follows a queue's items
+}
+
+// splitRun is a run of one client's structs, clock-ascending, that a queue
+// places after its items: structs read back from their encoding, which the
+// splitter writes as they are.
+type splitRun struct {
+	items []*Item
+	read  bool
+}
+
+// readParked reads back the structs and deletions store holds parked as
+// withParked writes them into the state, merging the deletions into ds:
+// withParked writes each parked struct as an update of its own, cut at
+// parkedCut and left out when nothing is left past it, and each client's
+// parked deletions as another, and leaves out one that does not read back
+// (mergeParts).
+func readParked(store *StructStore, sv StateVector, ds *DeleteSet) *parkedMerge {
+	p := &parkedMerge{reader: New(), parked: make(map[ClientID][]*Item)}
+	if store.pending != nil {
+		cut := make(StateVector, 1)
+		for _, it := range store.pending.heldItems() {
+			c := it.ID.Client
+			if cut[c] = parkedCut(store, sv, c); it.ID.Clock+it.Content.Len() <= cut[c] {
+				continue
+			}
+			part := encodeStructStoreV1(map[ClientID][]*Item{c: {it}}, newDeleteSet(), cut)
+			structs, _, err := decodeStructsV1(p.reader, part)
+			if err != nil {
+				continue
+			}
+			for c, items := range structs {
+				if len(items) > 0 {
+					p.parked[c] = append(p.parked[c], items...)
+				}
+			}
+		}
+	}
+	for c, ranges := range store.pendingDs.clients {
+		part := encodeStructStoreV1(nil, DeleteSet{clients: map[ClientID][]DeleteRange{c: ranges}}, sv)
+		if _, read, err := decodeStructsV1(p.reader, part); err == nil {
+			ds.Merge(read)
+		}
+	}
+	return p
+}
+
+// addTo places the parked structs after the queues' items, the document's own
+// structs, appending a queue for a client that has none. Cut at parkedCut,
+// every parked struct of a client starts at or past the end of the
+// document's structs of that client in the state, so the merge leaves those
+// as they are.
+func (p *parkedMerge) addTo(queues []splitQueue, sv StateVector) ([]splitQueue, error) {
+	if len(p.parked) == 0 {
+		return queues, nil
+	}
+	at := make(map[ClientID]int, len(p.parked))
+	for i := range queues {
+		if _, ok := p.parked[queues[i].client]; ok {
+			at[queues[i].client] = i
+		}
+	}
+	p.runs = make(map[ClientID][]splitRun, len(p.parked))
+	for c, items := range p.parked {
+		read, err := p.merge(items)
+		if err != nil {
+			return nil, err
+		}
+		if i, ok := at[c]; ok {
+			queues[i].more = true
+			p.runs[c] = []splitRun{{items: read, read: true}}
+		} else {
+			queues = append(queues, splitQueue{client: c, held: sv.Clock(c), items: read, read: true})
+		}
+	}
+	return queues, nil
+}
+
+// merge returns one client's parked structs, read back in the order the
+// pending queue holds them, as the merge in withParked leaves them: ordered
+// and trimmed as buildMergeStore trims structs that the updates carry in that
+// order, after the document's own, which end before them. They are sorted
+// here apart from the state's structs, where the merge sorts them all at
+// once; the two orders could differ only for two parked structs that start
+// on one clock, which the pending queue never holds (it keeps each clock of a
+// client once; TestUnit_PendingQueue_HoldsEachClockOfAClientOnce). A struct
+// the merge cuts is read back from its encoding, which is the struct
+// SplitUpdateV1 reads from the merged state; a struct read back once reads
+// back the same again, so the others are kept as they are.
+func (p *parkedMerge) merge(parked []*Item) ([]*Item, error) {
+	overlapping := false
+	for k := 1; k < len(parked) && !overlapping; k++ {
+		prev := parked[k-1]
+		overlapping = parked[k].ID.Clock < prev.ID.Clock+prev.Content.Len()
+	}
+	if !overlapping {
+		return dedupClientStructs(parked), nil
+	}
+	starts := make(map[*Item]uint64, len(parked))
+	for _, it := range parked {
+		starts[it] = it.ID.Clock
+	}
+	merged := mergeOverlapping(parked)
+	for i, it := range merged {
+		if it.ID.Clock != starts[it] {
+			read, err := rereadItem(p.reader, it, 0)
+			if err != nil {
+				return nil, err
+			}
+			merged[i] = read
+		}
+	}
+	return merged, nil
+}
+
+// rereadItem returns it as decodeStructsV1 reads it back from encodeItem's
+// encoding of it past offset.
+func rereadItem(reader *Doc, it *Item, offset uint64) (*Item, error) {
+	written := encoding.EncodeBytes(func(enc *encoding.Encoder) { encodeItem(enc, it, offset) })
+	read, err := decodeItem(encoding.NewDecoder(written), reader, it.ID.Client, it.ID.Clock+offset)
+	if err != nil {
+		return nil, wrapUpdateErr(err)
+	}
+	return read, nil
+}
+
+// splitQueue is the structs of one client still to place, clock-ascending,
+// and what the series has sent of that client.
+type splitQueue struct {
+	client ClientID
+	held   uint64  // the clocks of client the receiver holds once every update so far is applied
+	cut    *Item   // the rest of a struct the series has cut, ahead of items; never a store's
+	items  []*Item // read, never written: they can be a document's own
+	packed int32   // the update being packed holds a struct of client when this is updateSplitter.pieces
+	read   bool    // items were read back from their encoding, rather than being a document's own
+	more   bool    // updateSplitter.runs holds runs of client's structs to place after items
+	dels   *clientDeletes
+}
+
+// next is the struct the queue places next, or nil when it is empty.
+func (q *splitQueue) next() *Item {
+	if q.cut != nil {
+		return q.cut
+	}
+	if len(q.items) > 0 {
+		return q.items[0]
+	}
+	return nil
+}
+
+// pop drops the struct q.next returns, taking up q's next run when it was the
+// last of q's items.
+func (s *updateSplitter) pop(q *splitQueue) {
+	if q.cut != nil {
+		q.cut = nil
+		return
+	}
+	q.items = q.items[1:]
+	if len(q.items) == 0 && q.more {
+		runs := s.runs[q.client]
+		q.items, q.read = runs[0].items, runs[0].read
+		if len(runs) == 1 {
+			delete(s.runs, q.client)
+			q.more = false
+		} else {
+			s.runs[q.client] = runs[1:]
+		}
+	}
+}
+
+// offsetIn is the clocks of it, a struct of q, that the receiver already
+// holds, which the update leaves out, as encodeStructStoreV1 cuts the first
+// struct of a group at the receiver's clock. It is zero for every struct but
+// the first of a client.
+func (q *splitQueue) offsetIn(it *Item) uint64 {
+	if q.held > it.ID.Clock {
+		return q.held - it.ID.Clock
+	}
+	return 0
+}
+
+// clientDeletes is the delete ranges of one client, and how far the series
+// has sent them.
+type clientDeletes struct {
+	client ClientID
+	ranges []DeleteRange
+	idx    int    // the first range the series has not sent whole
+	from   uint64 // the clock in that range the series has sent up to
+}
+
+// pieceSpan is where one struct of the update being packed lies in
+// updateSplitter.arena.
+type pieceSpan struct {
+	client     ClientID
+	start, end int
+}
+
+// updateSplitter packs the structs and deletions of one update, or one
+// document's state, into the updates SplitUpdateV1 and SplitStateAsUpdateV1
+// return.
 type updateSplitter struct {
-	items     map[ClientID][]*Item // each client's structs still to place, clock-ascending
-	clients   []ClientID           // the clients of items, descending as the encoder writes them
-	ds        DeleteSet
-	dsClients []ClientID          // the clients of ds, descending
-	dsIdx     map[ClientID]int    // the first range of a client the series has not sent whole
-	dsFrom    map[ClientID]uint64 // the clock in that range the series has sent up to
-	held      StateVector         // what the receiver holds once every update so far is applied
-	maxBytes  int
+	queues   []splitQueue // descending by client, as the encoder writes them
+	queueOf  map[ClientID]*splitQueue
+	sv       StateVector     // what the receiver holds of a client with no queue
+	dels     []clientDeletes // descending by client
+	maxBytes int
 
 	pass    clientQueue              // the clients this pass of the walk has still to visit, highest first
 	next    clientQueue              // the clients the pass after this one visits
@@ -73,57 +348,70 @@ type updateSplitter struct {
 	waiting map[ClientID]waiterQueue // by the client whose clocks are waited for: the clients that wait, and for which clock
 	checks  int                      // readiness checks the walk has made, which its work is counted in
 
-	piece   map[ClientID][]*Item // the structs of the update being packed
-	pieceDS DeleteSet            // its deletions
-	base    StateVector          // held when the update began, for the clients in it
-	bytes   int                  // what it encodes to, never counted short
-	scratch *encoding.Encoder    // reused to measure one struct's encoding
+	// stored is set when the queues' items are a document's own structs
+	// rather than structs decoded from an update. The splitter then writes
+	// them as the decode would have read them (encodeOwn), cuts only a copy of
+	// one (materialize), and writes each struct once, into arena. A queue's
+	// items read back from their encoding (splitQueue.read) are written as
+	// they are.
+	stored bool
+	err    error // a struct of the document's that does not decode
+	// runs holds, by client, what a queue places after its items
+	// (splitQueue.more): the structs a document holds parked, merged with its
+	// own (parkedMerge).
+	runs map[ClientID][]splitRun
+
+	pieces  int32       // the updates begun, the last of them the one being packed
+	pieceDS DeleteSet   // its deletions
+	base    StateVector // what the receiver held when it began, for the clients with structs in it
+	bytes   int         // what it encodes to, never counted short
+	// Its structs: by client when they are decoded, which encodeStructStoreV1
+	// writes, and as written, in arena, when stored.
+	piece map[ClientID][]*Item
+	arena []byte
+	spans []pieceSpan
+
+	scratch    *encoding.Encoder // holds the encoding of measured, past measuredAt
+	measured   *Item
+	measuredAt uint64
+	reader     *Doc // what materialize decodes into, made when it is first needed
 
 	out [][]byte
 }
 
-func newUpdateSplitter(perClient map[ClientID][]*Item, ds DeleteSet, sv StateVector, maxBytes int) *updateSplitter {
+func newUpdateSplitter(queues []splitQueue, ds DeleteSet, sv StateVector, maxBytes int, stored bool) *updateSplitter {
 	s := &updateSplitter{
-		items:    perClient,
-		ds:       ds,
-		dsIdx:    make(map[ClientID]int, len(ds.clients)),
-		dsFrom:   make(map[ClientID]uint64, len(ds.clients)),
-		held:     make(StateVector, len(sv)),
+		queues:   queues,
+		queueOf:  make(map[ClientID]*splitQueue, len(queues)),
+		sv:       sv,
+		dels:     make([]clientDeletes, 0, len(ds.clients)),
 		maxBytes: maxBytes,
+		stored:   stored,
 		scratch:  encoding.NewEncoder(),
 	}
-	maps.Copy(s.held, sv)
-	for c, items := range perClient {
-		// A struct the receiver holds whole is not sent, as encodeStructStoreV1
-		// leaves it out; dropping it here keeps an update's entry count right
-		// and keeps it out of the readiness walk.
-		known := s.held.Clock(c)
-		for len(items) > 0 && items[0].ID.Clock+items[0].Content.Len() <= known {
-			items = items[1:]
-		}
-		if len(items) == 0 {
-			delete(s.items, c)
-			continue
-		}
-		s.items[c] = items
-		s.clients = append(s.clients, c)
+	for c, ranges := range ds.clients {
+		s.dels = append(s.dels, clientDeletes{client: c, ranges: ranges})
 	}
-	for c := range ds.clients {
-		s.dsClients = append(s.dsClients, c)
-	}
-	slices.SortFunc(s.clients, descendingClients)
-	slices.SortFunc(s.dsClients, descendingClients)
+	// Yjs writes clients in descending order, and encodeStructStoreV1 and
+	// encodeDeleteSet sort them that way too.
+	slices.SortFunc(s.queues, func(a, b splitQueue) int { return cmp.Compare(b.client, a.client) })
+	slices.SortFunc(s.dels, func(a, b clientDeletes) int { return cmp.Compare(b.client, a.client) })
 	// A pass of the walk takes the clients highest first, which a descending
 	// slice is a heap for already.
-	s.pass = slices.Clone(s.clients)
+	s.pass = make(clientQueue, len(s.queues))
+	for i := range s.queues {
+		s.queueOf[s.queues[i].client] = &s.queues[i]
+		s.pass[i] = s.queues[i].client
+	}
 	s.waiting = make(map[ClientID]waiterQueue)
+	for i := range s.dels {
+		if q := s.queueOf[s.dels[i].client]; q != nil {
+			q.dels = &s.dels[i]
+		}
+	}
 	s.newPiece()
 	return s
 }
-
-// descendingClients orders clients as Yjs writes them, which
-// encodeStructStoreV1 and encodeDeleteSet sort them by too.
-func descendingClients(a, b ClientID) int { return cmp.Compare(b, a) }
 
 // run packs every struct that can integrate on its own into updates, then the
 // deletions no update carried with its structs, and ends the series with the
@@ -152,162 +440,264 @@ func (s *updateSplitter) walk() {
 			s.pass, s.next = s.next, s.pass
 		}
 		s.cursor = s.pass.pop()
-		dep, need, waits := s.placeReady(s.cursor)
+		dep, need, waits := s.placeReady(s.queueOf[s.cursor])
 		// A need of zero is a struct naming a clock no receiver can reach,
 		// which no placement delivers, so nothing waits for it.
 		if waits && need > 0 {
-			q := s.waiting[dep]
-			q.push(waiter{clock: need, client: s.cursor})
-			s.waiting[dep] = q
+			w := s.waiting[dep]
+			w.push(waiter{clock: need, client: s.cursor})
+			s.waiting[dep] = w
 		}
 	}
 }
 
-// wake visits again the clients whose next struct waited for a clock of c the
-// update being packed now delivers. A client this pass has gone by is left to
-// the next one, which is where the walk that looked at every client in every
-// pass would have placed it.
-func (s *updateSplitter) wake(c ClientID) {
-	held, q := s.held.Clock(c), s.waiting[c]
-	for len(q) > 0 && q[0].clock <= held {
-		w := q.pop()
-		if w.client > s.cursor {
-			s.next.push(w.client)
+// wake visits again the clients whose next struct waited for a clock of q's
+// client the update being packed now delivers. A client this pass has gone by
+// is left to the next one, which is where the walk that looked at every client
+// in every pass would have placed it.
+func (s *updateSplitter) wake(q *splitQueue) {
+	w := s.waiting[q.client]
+	for len(w) > 0 && w[0].clock <= q.held {
+		woken := w.pop()
+		if woken.client > s.cursor {
+			s.next.push(woken.client)
 		} else {
-			s.pass.push(w.client)
+			s.pass.push(woken.client)
 		}
 	}
-	if len(q) == 0 {
-		delete(s.waiting, c)
+	if len(w) == 0 {
+		delete(s.waiting, q.client)
 		return
 	}
-	s.waiting[c] = q
+	s.waiting[q.client] = w
 }
 
-// placeReady places the structs of c the receiver can integrate, one after
+// placeReady places the structs of q the receiver can integrate, one after
 // another, and returns what the first one it cannot integrate waits for: the
 // client whose clocks it needs, and the clock they have to reach. It reports
-// false when c has nothing left to place.
-func (s *updateSplitter) placeReady(c ClientID) (ClientID, uint64, bool) {
+// false when q has nothing left to place.
+func (s *updateSplitter) placeReady(q *splitQueue) (ClientID, uint64, bool) {
 	for {
-		items := s.items[c]
-		if len(items) == 0 {
+		it := q.next()
+		if it == nil {
 			return 0, 0, false
 		}
 		s.checks++
-		if dep, need, blocked := s.blocker(items[0]); blocked {
+		if dep, need, blocked := s.blocker(q, it); blocked {
 			return dep, need, true
 		}
-		s.place(c)
+		s.place(q)
 	}
 }
 
-// blocker is what it waits for before it integrates into a receiver holding
-// s.held: the client whose clocks have to reach a clock, and that clock. A
+// blocker is what it, a struct of q, waits for before it integrates into the
+// receiver: the client whose clocks have to reach a clock, and that clock. A
 // struct waits for its own client's clocks to reach it, and for the structs
-// its origin, right origin and parent name to have arrived. These are the
-// dependencies the apply defers an item for — a clock gap and missingDep in
-// decodeStructs and integrateGroup, the right origin in integrateGroup, and
-// all four again in itemFutureDep, which is what parks it. It reports false
-// when the struct waits for none of them, which is when it integrates on its
-// own.
-func (s *updateSplitter) blocker(it *Item) (ClientID, uint64, bool) {
-	if it.ID.Clock > s.held.Clock(it.ID.Client) {
-		return it.ID.Client, it.ID.Clock, true
+// its encoding names as origin, right origin and parent to have arrived.
+// These are the dependencies the apply defers an item for — a clock gap and
+// missingDep in decodeStructs and integrateGroup, the right origin in
+// integrateGroup, and all four again in itemFutureDep, which is what parks
+// it. It reports false when the struct waits for none of them, which is when
+// it integrates on its own.
+func (s *updateSplitter) blocker(q *splitQueue, it *Item) (ClientID, uint64, bool) {
+	if it.ID.Clock > q.held {
+		return q.client, it.ID.Clock, true
 	}
-	if o := it.Origin; o != nil && o.Clock >= s.held.Clock(o.Client) {
-		return o.Client, o.Clock + 1, true
+	switch {
+	case it.isGCOrphan():
+		// Written as a GC struct, which names nothing.
+		return 0, 0, false
+	case it.ID.Clock < q.held:
+		// Cut at the receiver's clock, it names as origin the clock before the
+		// cut, which the receiver holds, and no parent.
+		return s.missing(q, it.OriginRight)
+	case it.Origin != nil || it.OriginRight != nil:
+		// With an origin it names no parent: the receiver takes the parent of
+		// the struct its origin names (decodeItem).
+		if dep, need, blocked := s.missing(q, it.Origin); blocked {
+			return dep, need, true
+		}
+		return s.missing(q, it.OriginRight)
 	}
-	if o := it.OriginRight; o != nil && o.Clock >= s.held.Clock(o.Client) {
-		return o.Client, o.Clock + 1, true
-	}
-	// A struct names a parent only when it has neither origin; with one it
-	// inherits the parent of the struct its origin names (decodeItem).
-	if p := it.parentID; p != nil && it.Parent == nil && p.Clock >= s.held.Clock(p.Client) {
-		return p.Client, p.Clock + 1, true
-	}
-	return 0, 0, false
+	return s.missing(q, namedParent(it))
 }
 
-// place adds the next struct of c to the update being packed, starting a new
+// missing is what the receiver waits for before it holds the struct id names,
+// as blocker returns it, or false when it holds it or id is nil; q is the
+// queue of the struct naming it.
+func (s *updateSplitter) missing(q *splitQueue, id *ID) (ClientID, uint64, bool) {
+	if s.holds(q, id) {
+		return 0, 0, false
+	}
+	return id.Client, id.Clock + 1, true
+}
+
+// holds reports whether the receiver holds the struct id names, or id is nil,
+// once every update so far is applied; q is the queue of the struct naming it.
+func (s *updateSplitter) holds(q *splitQueue, id *ID) bool {
+	if id == nil {
+		return true
+	}
+	if id.Client == q.client {
+		return id.Clock < q.held
+	}
+	if other := s.queueOf[id.Client]; other != nil {
+		return id.Clock < other.held
+	}
+	return id.Clock < s.sv.Clock(id.Client)
+}
+
+// namedParent is the container item that it is written as a child of when it
+// has no origin, or nil when it is written as a child of a root type. A
+// document's struct holds its container as Parent, a decoded one as parentID.
+func namedParent(it *Item) *ID {
+	if it.Parent != nil && it.Parent.item != nil {
+		return &it.Parent.item.ID
+	}
+	return it.parentID
+}
+
+// place adds the next struct of q to the update being packed, starting a new
 // update when it does not fit this one and cutting it when it does not fit an
 // update of its own.
-func (s *updateSplitter) place(c ClientID) {
-	it := s.items[c][0]
-	if !s.fits(c, it) {
+func (s *updateSplitter) place(q *splitQueue) {
+	it := q.next()
+	own := s.stored && q.cut == nil && !q.read
+	var rest *Item
+	if !s.fits(q, it, own) {
 		if !s.pieceEmpty() {
 			s.flush()
 		}
-		if !s.fits(c, it) {
-			s.cut(c, it)
-			it = s.items[c][0]
+		if !s.fits(q, it, own) {
+			if own && cuttableContent(it.Content) {
+				// The cut changes the struct it cuts, so it cuts the splitter's
+				// own copy of the document's.
+				if read := s.materialize(it, q.offsetIn(it)); read != nil {
+					it, own = read, false
+				}
+			}
+			if !own {
+				rest = s.cut(q, it)
+			}
 		}
 	}
-	s.add(c, it)
-	s.items[c] = s.items[c][1:]
+	s.pop(q)
+	s.add(q, it, own)
+	if rest != nil {
+		q.cut = rest
+	}
 }
 
-// fits reports whether it still leaves the update being packed within maxBytes.
-func (s *updateSplitter) fits(c ClientID, it *Item) bool {
-	return s.bytes+s.structCost(c, it) <= s.maxBytes
+// fits reports whether it, a struct of q, still leaves the update being
+// packed within maxBytes.
+func (s *updateSplitter) fits(q *splitQueue, it *Item, own bool) bool {
+	return s.bytes+s.structCost(q, it, own) <= s.maxBytes
 }
 
-// structCost is what it adds to the update being packed: the struct, and the
-// group header when it is the first struct of c in that update.
-func (s *updateSplitter) structCost(c ClientID, it *Item) int {
-	offset := s.offsetIn(it)
-	n := s.structBytes(it, offset)
-	if len(s.piece[c]) == 0 {
-		n += splitCountBytes + varUintLen(uint64(c)) + varUintLen(it.ID.Clock+offset)
+// structCost is what it, a struct of q, adds to the update being packed: the
+// struct, and the group header when it is the first struct of q's client in
+// that update.
+func (s *updateSplitter) structCost(q *splitQueue, it *Item, own bool) int {
+	offset := q.offsetIn(it)
+	n := s.structBytes(it, offset, own)
+	if q.packed != s.pieces {
+		n += splitCountBytes + varUintLen(uint64(q.client)) + varUintLen(it.ID.Clock+offset)
 	}
 	return n
 }
 
-// offsetIn is the clocks of it the receiver already holds, which the update
-// leaves out, as encodeStructStoreV1 cuts the first struct of a group at the
-// receiver's clock. It is zero for every struct but the first of a client.
-func (s *updateSplitter) offsetIn(it *Item) uint64 {
-	if held := s.held.Clock(it.ID.Client); held > it.ID.Clock {
-		return held - it.ID.Clock
+// structBytes is what it encodes to past offset, which it leaves in scratch.
+// A struct is measured to see whether it fits and again to add it, so the
+// last one measured is not written again.
+func (s *updateSplitter) structBytes(it *Item, offset uint64, own bool) int {
+	if it != s.measured || offset != s.measuredAt {
+		s.scratch.Reset()
+		if own {
+			s.encodeOwn(s.scratch, it, offset)
+		} else {
+			encodeItem(s.scratch, it, offset)
+		}
+		s.measured, s.measuredAt = it, offset
 	}
-	return 0
-}
-
-// structBytes is what it encodes to past offset.
-func (s *updateSplitter) structBytes(it *Item, offset uint64) int {
-	s.scratch.Reset()
-	encodeItem(s.scratch, it, offset)
 	return len(s.scratch.Bytes())
 }
 
-// add puts it in the update being packed, advances what the receiver holds,
-// visits again the clients waiting for the clocks it delivers, and takes the
-// deletions of those clocks, so the update that brings a struct brings its
-// deletion: a receiver never renders deleted content it is about to be told
-// is gone.
-func (s *updateSplitter) add(c ClientID, it *Item) {
-	if len(s.piece[c]) == 0 {
-		s.base[c] = s.held.Clock(c)
+// encodeOwn writes a document's struct past offset as encodeItem writes the
+// struct decodeStructsV1 reads for it from EncodeStateAsUpdateV1. The decode
+// leaves no parentSub on a struct written with an origin, which encodeItem
+// would otherwise flag, and reads values back as the Go types it decodes to,
+// which encodeItem can write in other bytes than it wrote (see rereadsSame).
+func (s *updateSplitter) encodeOwn(enc *encoding.Encoder, it *Item, offset uint64) {
+	if !rereadsSame(it.Content) {
+		if read := s.materialize(it, offset); read != nil {
+			encodeItem(enc, read, 0)
+			return
+		}
 	}
-	s.bytes += s.structCost(c, it)
-	s.piece[c] = append(s.piece[c], it)
-	s.held[c] = it.ID.Clock + it.Content.Len()
-	s.wake(c)
-	s.takeDeletes(c, s.held[c])
-}
-
-// cut shortens the struct at the head of c's queue to what fits an update of
-// its own, leaving the rest of it in the queue behind the part that fits. A
-// struct a V1 update cannot cut is left whole, and the update that carries it
-// passes maxBytes.
-func (s *updateSplitter) cut(c ClientID, it *Item) {
-	offset := s.offsetIn(it)
-	budget := s.maxBytes - s.bytes - splitCountBytes - varUintLen(uint64(c)) - varUintLen(it.ID.Clock+offset)
-	clocks := s.fittingClocks(it, offset, budget)
-	if clocks == 0 {
+	if it.ParentSub != nil && (offset > 0 || it.Origin != nil || it.OriginRight != nil) {
+		read := *it
+		read.ParentSub = nil
+		encodeItem(enc, &read, offset)
 		return
 	}
-	s.items[c] = slices.Insert(s.items[c], 1, splitItemAt(it, offset+clocks))
+	encodeItem(enc, it, offset)
+}
+
+// materialize returns a document's struct as decodeStructsV1 reads it from
+// EncodeStateAsUpdateV1, which cuts it at offset: a struct of the splitter's
+// own, which a cut may change. It returns nil, and the split fails, when the
+// struct does not decode, as the decode of the whole state would have failed.
+func (s *updateSplitter) materialize(it *Item, offset uint64) *Item {
+	if s.reader == nil {
+		s.reader = New()
+	}
+	read, err := rereadItem(s.reader, it, offset)
+	if err != nil {
+		if s.err == nil {
+			s.err = err
+		}
+		return nil
+	}
+	return read
+}
+
+// add puts it, a struct of q, in the update being packed, advances what the
+// receiver holds, visits again the clients waiting for the clocks it
+// delivers, and takes the deletions of those clocks, so the update that
+// brings a struct brings its deletion: a receiver never renders deleted
+// content it is about to be told is gone.
+func (s *updateSplitter) add(q *splitQueue, it *Item, own bool) {
+	s.bytes += s.structCost(q, it, own)
+	if q.packed != s.pieces {
+		q.packed = s.pieces
+		s.base[q.client] = q.held
+	}
+	if s.stored {
+		written := s.scratch.Bytes()
+		s.spans = append(s.spans, pieceSpan{client: q.client, start: len(s.arena), end: len(s.arena) + len(written)})
+		s.arena = append(s.arena, written...)
+	} else {
+		s.piece[q.client] = append(s.piece[q.client], it)
+	}
+	q.held = it.ID.Clock + it.Content.Len()
+	s.wake(q)
+	if q.dels != nil {
+		s.takeDeletes(q.dels, q.held)
+	}
+}
+
+// cut shortens it, a struct of q and the splitter's own, to what fits an
+// update of its own and returns the rest of it, to be placed after it, or nil
+// when it cannot be cut that small. A struct a V1 update cannot cut is left
+// whole, and the update that carries it passes maxBytes.
+func (s *updateSplitter) cut(q *splitQueue, it *Item) *Item {
+	offset := q.offsetIn(it)
+	budget := s.maxBytes - s.bytes - splitCountBytes - varUintLen(uint64(q.client)) - varUintLen(it.ID.Clock+offset)
+	clocks := s.fittingClocks(it, offset, budget)
+	if clocks == 0 {
+		return nil
+	}
+	return splitItemAt(it, offset+clocks)
 }
 
 // fittingClocks returns how many of the clocks of it past offset encode within
@@ -348,24 +738,30 @@ func (s *updateSplitter) cutBytes(it *Item, offset, clocks uint64) int {
 	head := *it
 	head.Content = it.Content.Copy()
 	_ = head.Content.Splice(offset + clocks)
-	return s.structBytes(&head, offset)
+	s.measured = nil
+	s.scratch.Reset()
+	encodeItem(s.scratch, &head, offset)
+	return len(s.scratch.Bytes())
 }
 
-// takeDeletes adds to the update being packed the delete ranges of c the
-// series has not sent that name a clock below end, cutting a range at end and
-// stopping at the first that does not fit what the update has left, and
-// returns how many it took. It takes one whatever the room left when the
-// update is empty, so a caller that flushes on nothing taken makes progress.
-func (s *updateSplitter) takeDeletes(c ClientID, end uint64) int {
-	ranges := s.ds.clients[c]
-	idx, from := s.dsIdx[c], s.dsFrom[c]
+// takeDeletes adds to the update being packed the ranges of d the series has
+// not sent that name a clock below end, cutting a range at end and stopping
+// at the first that does not fit what the update has left, and returns how
+// many it took. It takes one whatever the room left when the update is empty,
+// so a caller that flushes on nothing taken makes progress.
+func (s *updateSplitter) takeDeletes(d *clientDeletes, end uint64) int {
+	if d.idx == len(d.ranges) {
+		return 0 // every range of d has gone out
+	}
+	c := d.client
+	idx, from := d.idx, d.from
 	group := 0
 	if len(s.pieceDS.clients[c]) == 0 {
 		group = splitCountBytes + varUintLen(uint64(c))
 	}
 	taken, cost := 0, 0
-	for ; idx < len(ranges); idx++ {
-		r := ranges[idx]
+	for ; idx < len(d.ranges); idx++ {
+		r := d.ranges[idx]
 		rangeEnd := r.Clock + r.Len
 		// from names a clock inside ranges[idx] alone; a later range starts at
 		// its own clock.
@@ -394,7 +790,7 @@ func (s *updateSplitter) takeDeletes(c ClientID, end uint64) int {
 	if taken > 0 {
 		s.bytes += group + cost
 	}
-	s.dsIdx[c], s.dsFrom[c] = idx, from
+	d.idx, d.from = idx, from
 	return taken
 }
 
@@ -405,9 +801,10 @@ func (s *updateSplitter) takeDeletes(c ClientID, end uint64) int {
 // which park on the receiver as they are parked on the sender. What is left
 // over stays in the update being packed, which the series ends with.
 func (s *updateSplitter) emitRemainingDeletes() {
-	for _, c := range s.dsClients {
-		for s.dsIdx[c] < len(s.ds.clients[c]) {
-			if s.takeDeletes(c, math.MaxUint64) == 0 {
+	for i := range s.dels {
+		d := &s.dels[i]
+		for d.idx < len(d.ranges) {
+			if s.takeDeletes(d, math.MaxUint64) == 0 {
 				s.flush()
 			}
 		}
@@ -420,13 +817,50 @@ func (s *updateSplitter) flush() {
 	if s.pieceEmpty() {
 		return
 	}
-	s.out = append(s.out, encodeStructStoreV1(s.piece, s.pieceDS, s.base))
+	if s.stored {
+		s.out = append(s.out, s.encodePiece())
+	} else {
+		s.out = append(s.out, encodeStructStoreV1(s.piece, s.pieceDS, s.base))
+	}
 	s.newPiece()
+}
+
+// encodePiece writes the update being packed from the structs add wrote into
+// arena, as encodeStructStoreV1 writes it: a group for each client,
+// descending as Yjs writes them, starting at the clock the receiver held when
+// the update began, and then the update's deletions.
+func (s *updateSplitter) encodePiece() []byte {
+	if len(s.base) > 1 {
+		slices.SortStableFunc(s.spans, func(a, b pieceSpan) int { return cmp.Compare(b.client, a.client) })
+	}
+	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
+		enc.WriteVarUint(uint64(len(s.base)))
+		for spans := s.spans; len(spans) > 0; {
+			c := spans[0].client
+			n := 1
+			for n < len(spans) && spans[n].client == c {
+				n++
+			}
+			enc.WriteVarUint(uint64(n))
+			enc.WriteVarUint(uint64(c))
+			enc.WriteVarUint(s.base[c])
+			for _, span := range spans[:n] {
+				enc.WriteRaw(s.arena[span.start:span.end])
+			}
+			spans = spans[n:]
+		}
+		encodeDeleteSet(enc, s.pieceDS)
+	})
 }
 
 // newPiece begins an update with nothing in it.
 func (s *updateSplitter) newPiece() {
-	s.piece = make(map[ClientID][]*Item)
+	if s.stored {
+		s.arena, s.spans = s.arena[:0], s.spans[:0]
+	} else {
+		s.piece = make(map[ClientID][]*Item)
+	}
+	s.pieces++
 	s.pieceDS = newDeleteSet()
 	s.base = make(StateVector)
 	s.bytes = splitHeaderBytes
@@ -434,24 +868,87 @@ func (s *updateSplitter) newPiece() {
 
 // pieceEmpty reports whether the update being packed carries nothing.
 func (s *updateSplitter) pieceEmpty() bool {
-	return len(s.piece) == 0 && len(s.pieceDS.clients) == 0
+	return len(s.base) == 0 && len(s.pieceDS.clients) == 0
 }
 
 // tail is the update the series ends with: the structs no update could carry
 // on its own, which the receiver parks as the sender does, and the deletions
-// left over. Its structs are above what the receiver holds, so it needs no
-// state vector to cut them at.
+// left over. It is written as encodeStructStoreV1 writes the structs left,
+// with no state vector to cut them at, since they are above what the receiver
+// holds; a document's own are written as the decode reads them, cut at what
+// the receiver holds (encodeOwn).
 func (s *updateSplitter) tail() []byte {
-	var left map[ClientID][]*Item
-	for _, c := range s.clients {
-		if rest := s.items[c]; len(rest) > 0 {
-			if left == nil {
-				left = make(map[ClientID][]*Item)
+	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
+		groups := 0
+		for i := range s.queues {
+			if s.queues[i].next() != nil {
+				groups++
 			}
-			left[c] = rest
+		}
+		enc.WriteVarUint(uint64(groups))
+		// Descending by client, as encodeStructStoreV1 writes them.
+		for i := range s.queues {
+			q := &s.queues[i]
+			if q.next() == nil {
+				continue
+			}
+			entries, first, expected := 0, uint64(0), uint64(0)
+			s.eachLeft(q, func(it *Item, offset uint64, _ bool) {
+				clock := it.ID.Clock + offset
+				if entries == 0 {
+					first, expected = clock, clock
+				}
+				if clock > expected {
+					entries++ // a skip struct over the gap
+				}
+				entries++
+				expected = it.ID.Clock + it.Content.Len()
+			})
+			enc.WriteVarUint(uint64(entries))
+			enc.WriteVarUint(uint64(q.client))
+			enc.WriteVarUint(first)
+			expected = first
+			s.eachLeft(q, func(it *Item, offset uint64, own bool) {
+				if clock := it.ID.Clock + offset; clock > expected {
+					enc.WriteUint8(10) // a skip struct over the gap
+					enc.WriteVarUint(clock - expected)
+				}
+				if own {
+					s.encodeOwn(enc, it, offset)
+				} else {
+					encodeItem(enc, it, offset)
+				}
+				expected = it.ID.Clock + it.Content.Len()
+			})
+		}
+		encodeDeleteSet(enc, s.pieceDS)
+	})
+}
+
+// eachLeft calls f with each struct of q the series has not placed, in order:
+// with the clocks of it the tail leaves out, which the receiver holds of a
+// document's own struct (see offsetIn) and none of any other, and whether it
+// is a document's own.
+func (s *updateSplitter) eachLeft(q *splitQueue, f func(it *Item, offset uint64, own bool)) {
+	if q.cut != nil {
+		f(q.cut, 0, false)
+	}
+	run := func(items []*Item, read bool) {
+		own := s.stored && !read
+		for _, it := range items {
+			offset := uint64(0)
+			if own {
+				offset = q.offsetIn(it)
+			}
+			f(it, offset, own)
 		}
 	}
-	return encodeStructStoreV1(left, s.pieceDS, nil)
+	run(q.items, q.read)
+	if q.more {
+		for _, r := range s.runs[q.client] {
+			run(r.items, r.read)
+		}
+	}
 }
 
 // splitItemAt cuts it at its offset'th clock: it keeps the clocks before
@@ -511,6 +1008,97 @@ func cutsCleanly(c Content, offset uint64) bool {
 		}
 	}
 	return units == offset
+}
+
+// rereadsSame reports whether encodeContent writes c in the same bytes as the
+// content decodeContent reads back from them. The decode reads each value back
+// as the Go type it decodes to — a JSON number as a float64, a lib0 integer as
+// an int64, or past int32 as a float64, which WriteAny then writes as a
+// float32 when one holds it exactly — and a value of those types is written
+// as it was read. A document filled by updates holds no other, so its content
+// passes. A value written through the Go API in another type passes when it
+// is an integer the decode's type writes in the same bytes, and otherwise
+// does not.
+func rereadsSame(c Content) bool {
+	switch ct := c.(type) {
+	case *ContentAny:
+		return allRereadSame(ct.Vals, anyRereadsSame)
+	case *ContentJSON:
+		return allRereadSame(ct.Vals, jsonRereadsSame)
+	case *ContentEmbed:
+		return jsonRereadsSame(ct.Val)
+	case *ContentFormat:
+		return jsonRereadsSame(ct.Val)
+	case *ContentDoc:
+		return false // the decode rebuilds its options into a new document
+	}
+	return true
+}
+
+// allRereadSame reports whether rereads holds for each of vals.
+func allRereadSame(vals []any, rereads func(any) bool) bool {
+	for _, v := range vals {
+		if !rereads(v) {
+			return false
+		}
+	}
+	return true
+}
+
+// anyRereadsSame reports it for a value WriteAny writes: one of the types
+// ReadAny returns, or an integer within int32, which both write as a lib0
+// integer.
+func anyRereadsSame(v any) bool {
+	switch x := v.(type) {
+	case nil, bool, string, []byte, float32, float64, encoding.BigInt,
+		int8, int16, int32, uint8, uint16:
+		return true
+	case int:
+		return int64(x) >= math.MinInt32 && int64(x) <= math.MaxInt32
+	case int64:
+		return x >= math.MinInt32 && x <= math.MaxInt32
+	case uint:
+		return uint64(x) <= math.MaxInt32
+	case uint32:
+		return x <= math.MaxInt32
+	case uint64:
+		return x <= math.MaxInt32
+	case []any:
+		return allRereadSame(x, anyRereadsSame)
+	case map[string]any:
+		for _, e := range x {
+			if !anyRereadsSame(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// jsonRereadsSame reports it for a value fmtValToJSON writes: one of the types
+// json.Unmarshal returns, with no string that is not UTF-8, which the
+// encoding replaces, or an integer a float64 holds, which both write in the
+// same digits.
+func jsonRereadsSame(v any) bool {
+	switch x := v.(type) {
+	case nil, bool, float64:
+		return true
+	case int64:
+		return x >= -1<<53 && x <= 1<<53
+	case string:
+		return utf8.ValidString(x)
+	case []any:
+		return allRereadSame(x, jsonRereadsSame)
+	case map[string]any:
+		for k, e := range x {
+			if !utf8.ValidString(k) || !jsonRereadsSame(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // varUintLen is how many bytes Encoder.WriteVarUint writes for v: seven bits

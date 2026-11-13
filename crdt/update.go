@@ -270,7 +270,12 @@ func EncodeStateAsUpdateV2(doc *Doc, sv StateVector) []byte {
 // pendingStructs and pendingDs; a snapshot that dropped them would lose them
 // once the filler arrives. Kept out of encodeV1Locked so OnUpdate payloads
 // stay transaction-only, as in Yjs. A part that does not merge is left out
-// alone, never the rest of the parked state with it.
+// alone, never the rest of the parked state with it. Each parked struct is
+// cut at its client's clock in doc as well as at sv's: doc's own structs hold
+// the clocks below, which the apply never takes from a parked struct, and the
+// merge keeps them for doc's structs too. Cut there, a parked struct never
+// meets doc's own structs in the merge, so SplitStateAsUpdateV1 can send
+// those as they are.
 func withParked(doc *Doc, sv StateVector, state []byte,
 	encode func(map[ClientID][]*Item, DeleteSet, StateVector) []byte,
 	merge func(...[]byte) ([]byte, error)) []byte {
@@ -281,8 +286,12 @@ func withParked(doc *Doc, sv StateVector, state []byte,
 	var parts [][]byte
 	if s.pending != nil {
 		// One update per item, so one that does not merge is left out alone.
+		cut := make(StateVector, 1)
 		for _, it := range s.pending.heldItems() {
-			parts = append(parts, encode(map[ClientID][]*Item{it.ID.Client: {it}}, newDeleteSet(), sv))
+			c := it.ID.Client
+			if cut[c] = parkedCut(s, sv, c); it.ID.Clock+it.Content.Len() > cut[c] {
+				parts = append(parts, encode(map[ClientID][]*Item{c: {it}}, newDeleteSet(), cut))
+			}
 		}
 	}
 	// One update per client's parked ranges, so a bad range costs only its
@@ -293,6 +302,13 @@ func withParked(doc *Doc, sv StateVector, state []byte,
 		parts = append(parts, encode(nil, ds, sv))
 	}
 	return mergeParts(state, parts, merge)
+}
+
+// parkedCut is where withParked cuts client's parked structs: at the clocks
+// the receiver, whose state vector is sv, or s holds of client, whichever are
+// more.
+func parkedCut(s *StructStore, sv StateVector, client ClientID) uint64 {
+	return max(sv.Clock(client), s.NextClock(client))
 }
 
 // mergeParts merges parts into state, leaving out each part that does not
