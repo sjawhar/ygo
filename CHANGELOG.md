@@ -36,7 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -2^31, which read back as an `int64`. This reverses the "large-integer
   float32-vs-float64 `Any` tag" that the 1.22.0 entry left as-is: a replica
   re-encoded a Go writer's `int64(1 << 40)` to other bytes than the writer
-  sent, and now re-encodes it to the same bytes.
+  sent, and now re-encodes it to the same bytes. Yjs fixtures in
+  `crdt/testdata/anynumber_yjs_fixtures.json` pin the V1 and V2 bytes Yjs
+  writes for 14 numbers at the edges of lib0's dispatch, and the bytes ygo
+  writes for the Go integers that hold them.
 
 ## [1.55.0] — 2026-10-31
 
