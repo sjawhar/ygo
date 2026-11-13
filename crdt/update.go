@@ -765,6 +765,10 @@ func drainAfterApply(txn *Transaction, err error) (retErr error) {
 	if drainErr := drainParked(txn, drainPending); retErr == nil {
 		retErr = drainErr
 	}
+	if txn.doc.store.pending == nil {
+		// No parked struct is left to carry a list.
+		txn.doc.parkedRoots = nil
+	}
 	return retErr
 }
 

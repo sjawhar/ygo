@@ -293,6 +293,7 @@ func parkWithinUpdatePending(txn *Transaction, pending []*Item) error {
 		// A struct that parks is the update's as much as one that integrates,
 		// and counts against its budget here (noteParked).
 		noteParked(txn, item)
+		noteParkedRoot(txn, item)
 		if s.pending == nil {
 			s.pending = &pendingUpdate{missing: make(StateVector), tailClient: item.ID.Client, tailValid: true}
 		}

@@ -230,9 +230,12 @@ func (d *Doc) SetApplyBudget(budget func(origin any) ApplyBudget) {
 // stopped, and keeps nothing on a document that also has
 // WithWholeOrNothingApplies. An update that names a root the document holds
 // and writes nothing under it, as a peer handing back the whole state does,
-// is applied. A parked struct that the drain integrates under a root the
-// answer does not name is dropped, and the apply returns ErrRootNotAllowed.
-// Every failed remote apply on the document returns a RefusedUpdateError.
+// is applied. A struct that parks behind a clock the document lacks is checked
+// when it parks, and one whose parent is not known yet keeps the answer of
+// the apply that parked it. A parked struct that the drain integrates under a
+// root either answer does not name is dropped, and the apply returns
+// ErrRootNotAllowed. Every failed remote apply on the document returns a
+// RefusedUpdateError.
 func WithAllowedRoots(roots func(origin any) []string) DocOption {
 	return func(d *Doc) { d.allowedRoots = roots }
 }
@@ -306,6 +309,9 @@ type Doc struct {
 	applyBudget  func(origin any) ApplyBudget
 	allowedRoots func(origin any) []string
 	counting     *applyTally
+	// parkedRoots is the allowed-roots list of the apply that parked each
+	// parked struct whose parent was not known yet, nil when none is.
+	parkedRoots map[*Item][]string
 
 	store *StructStore
 	share map[string]sharedType // named root types

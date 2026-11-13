@@ -211,6 +211,7 @@ func (t *applyTally) nestedAll(vals []any) {
 // of the parked queue adds is checked against the list but not counted: the
 // update that parked it was charged for it (noteParked).
 func noteIntegrated(txn *Transaction, item *Item) {
+	checkParkedRoot(txn.doc, item)
 	t := txn.doc.tally()
 	if t == nil {
 		return
@@ -219,6 +220,53 @@ func noteIntegrated(txn *Transaction, item *Item) {
 	if !t.draining {
 		t.count(item)
 	}
+}
+
+// noteParkedRoot checks item, a struct of the update about to park, against
+// the apply's roots: one whose parent is known is refused when it hangs under
+// a root the list does not allow, and one whose parent is not known yet keeps
+// the list, for the drain that integrates it (checkParkedRoot).
+func noteParkedRoot(txn *Transaction, item *Item) {
+	t := txn.doc.tally()
+	if t == nil || len(t.roots) == 0 || isGCStruct(item) {
+		return
+	}
+	if item.Parent != nil {
+		t.checkItemRoot(txn.doc, item.Parent)
+		return
+	}
+	d := txn.doc
+	if d.parkedRoots == nil {
+		d.parkedRoots = make(map[*Item][]string)
+	}
+	d.parkedRoots[item] = t.roots
+}
+
+// checkParkedRoot refuses the apply integrating item, a parked struct whose
+// parent was not known when it parked, when the root it now hangs under is
+// not in the list of the apply that parked it, so a parked write stays inside
+// its own sender's roots whoever fills its gap.
+func checkParkedRoot(d *Doc, item *Item) {
+	roots, parked := d.parkedRoots[item]
+	if !parked {
+		return
+	}
+	delete(d.parkedRoots, item)
+	if item.Parent == nil {
+		return
+	}
+	root := item.Parent
+	for root.item != nil && root.item.Parent != nil {
+		root = root.item.Parent
+	}
+	name, isRoot := rootName(d, root)
+	if isRoot && slices.Contains(roots, name) {
+		return
+	}
+	if t := d.tally(); t != nil {
+		t.root = name
+	}
+	panic(rootNotAllowed{})
 }
 
 // noteParked counts item, a struct of the update about to park behind a

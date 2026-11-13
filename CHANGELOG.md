@@ -55,16 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WithIntegrateScanBudget`, so the zero value bounds nothing and the
   smallest limit is 1: `Split: 1` allows one split, and `Structs` never
   refuses an update that only deletes. An apply that would pass its budget,
-  or create, write under or delete under a root the list does not name, stops
-  before that struct enters the document and returns `ErrApplyBudget` or
-  `ErrRootNotAllowed`, both wrapping `ErrInvalidUpdate`, in a
-  `RefusedUpdateError` that reports what the apply decoded and added. As for
-  the scan bound, the document keeps what the apply integrated before it
-  stopped, which `ApplyUpdateV1Landed` reports, and keeps nothing with
-  `WithWholeOrNothingApplies`. A struct of the update that parks behind a
-  clock the document lacks counts when it parks, and the drain that later
-  integrates it does not count it against the apply that fills its gap. An
-  option set to limit nothing changes nothing an apply does.
+  or create, write under or delete under a root the list does not name, a
+  struct that parks included, stops before that struct enters the document
+  and returns `ErrApplyBudget` or `ErrRootNotAllowed`, both wrapping
+  `ErrInvalidUpdate`, in a `RefusedUpdateError` that reports what the apply
+  decoded and added. As for the scan bound, the document keeps what the apply
+  integrated before it stopped, which `ApplyUpdateV1Landed` reports, and keeps
+  nothing with `WithWholeOrNothingApplies`. A struct of the update that parks
+  behind a clock the document lacks counts when it parks, and the drain that
+  later integrates it does not count it against the apply that fills its gap.
+  An option set to limit nothing changes nothing an apply does.
 
 ### Changed
 

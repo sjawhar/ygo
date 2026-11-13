@@ -195,7 +195,8 @@ below is no limit, as `WithIntegrateScanBudget` reads its bound, so the zero
 value bounds nothing and the smallest limit is 1. `Decoded` is counted as the
 update is read, so a frame that declares millions of values is refused before
 they are in memory. `crdt.WithAllowedRoots(func(origin any) []string)` names
-the root types an apply may write under, at any depth. An apply that would
+the root types an apply may write under, at any depth; a struct that parks
+keeps the list of the apply that sent it until it lands. An apply that would
 pass its budget or leave its roots stops before that struct enters the
 document and returns `crdt.ErrApplyBudget` or `crdt.ErrRootNotAllowed` in a
 `crdt.RefusedUpdateError` that reports what it decoded and added. A struct

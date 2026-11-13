@@ -1912,3 +1912,84 @@ func TestUnit_ApplyBudget_CountsTheStructsAnUpdateParks(t *testing.T) {
 		t.Fatalf("the document reads %q with %d parked, want \"ABC\" and none", got, doc.PendingStats().Items)
 	}
 }
+
+// parkedUnderRoot is an update of one string struct for client 2 at clock 1,
+// parented to the named root: clock 0 is never sent, so a document that has
+// not seen it parks the struct with its parent already known.
+func parkedUnderRoot(root, value string) []byte {
+	enc := encoding.NewEncoder()
+	enc.WriteVarUint(1) // clients
+	enc.WriteVarUint(1) // one struct
+	enc.WriteVarUint(2) // client
+	enc.WriteVarUint(1) // first clock: clock 0 is the gap
+	enc.WriteUint8(wireString)
+	enc.WriteUint8(1) // parent info: a named root follows
+	enc.WriteVarString(root)
+	enc.WriteVarString(value)
+	enc.WriteVarUint(0) // delete set: no clients
+	return bytes.Clone(enc.Bytes())
+}
+
+// An allowed-roots list keeps a sender out of a root whether its struct
+// integrates or parks: a parked struct is stored, carried in the document's
+// state and integrated once its gap is filled. A struct that parks under a
+// root the list names is taken.
+func TestUnit_AllowedRoots_RefusesAStructThatParksUnderADisallowedRoot(t *testing.T) {
+	const base = "hello world"
+	doc := guardedDoc(t, base)
+	doc.SetAllowedRoots(func(any) []string { return []string{"t"} })
+	before := stateOf(doc)
+	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, parkedUnderRoot("m", "forged"), nil), ErrRootNotAllowed)
+	if refused.Root != "m" {
+		t.Fatalf("the refusal reports root %q, want \"m\"", refused.Root)
+	}
+
+	allowed := guardedDoc(t, base)
+	allowed.SetAllowedRoots(func(any) []string { return []string{"t"} })
+	if err := ApplyUpdateV1(allowed, parkedUnderRoot("t", "later"), nil); err != nil {
+		t.Fatalf("a struct parking under the allowed root was refused: %v", err)
+	}
+	if got := allowed.PendingStats().Items; got != 1 {
+		t.Fatalf("%d structs parked under the allowed root, want one", got)
+	}
+}
+
+// A struct that parks before its parent is known keeps the list of the
+// apply that parked it. A sender allowed only "m" writes beside an item of
+// "t" that has not arrived; when a trusted peer, allowed every root, brings
+// that item, the drain integrates the parked write under "t", which its
+// sender may not touch, so the write is dropped and the trusted peer's
+// update stands.
+func TestUnit_AllowedRoots_AParkedWriteKeepsItsOwnSendersPermissions(t *testing.T) {
+	trusted := New(WithClientID(3))
+	trustedText := trusted.GetText("t")
+	trusted.Transact(func(txn *Transaction) { trustedText.Insert(txn, 0, "Z", nil) })
+	privateItem := EncodeStateAsUpdateV1(trusted, nil)
+
+	sender := New(WithClientID(4))
+	if err := ApplyUpdateV1(sender, privateItem, nil); err != nil {
+		t.Fatal(err)
+	}
+	senderText := sender.GetText("t")
+	sender.Transact(func(txn *Transaction) { senderText.Insert(txn, 1, "Q", nil) })
+	forged := EncodeStateAsUpdateV1(sender, trusted.StateVector())
+
+	doc := New(WithClientID(7), WithAllowedRoots(func(origin any) []string {
+		if origin == "sender" {
+			return []string{"m"}
+		}
+		return nil
+	}))
+	if err := ApplyUpdateV1(doc, forged, "sender"); err != nil {
+		t.Fatalf("the write that waits on a missing item was refused at park: %v", err)
+	}
+	if got := doc.PendingStats().Items; got != 1 {
+		t.Fatalf("%d structs parked, want the forged write", got)
+	}
+	if err := ApplyUpdateV1(doc, privateItem, "trusted"); !errors.Is(err, ErrRootNotAllowed) {
+		t.Fatalf("the trusted update returned %v, want ErrRootNotAllowed for the dropped write", err)
+	}
+	if got := doc.GetText("t").ToString(); got != "Z" || doc.PendingStats().Items != 0 {
+		t.Fatalf("the document reads %q with %d parked, want \"Z\" and none", got, doc.PendingStats().Items)
+	}
+}
