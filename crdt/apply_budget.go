@@ -295,11 +295,18 @@ func rootName(d *Doc, root *abstractType) (string, bool) {
 }
 
 // countSplit counts the struct a split of an item the document held adds,
-// where txn's apply splits one (splitItem).
+// where txn's apply splits one (splitItem), and refuses the apply before the
+// split when it would pass the budget, so a refused split leaves the item
+// whole.
 func countSplit(txn *Transaction) {
-	if t := txn.doc.tally(); t != nil {
-		t.split++
+	t := txn.doc.tally()
+	if t == nil {
+		return
 	}
+	if over(t.budget.Split, t.split+1) {
+		panic(applyBudgetExceeded{})
+	}
+	t.split++
 }
 
 // countDecodedRanges counts n, the delete ranges the apply read off the frame

@@ -565,6 +565,9 @@ func nextDeleteItem(current, root *Item) *Item {
 // item.Content is mutated to hold [0, offset); the returned item holds [offset, end).
 // Both halves are registered in the store. The linked-list pointers are updated.
 func splitItem(txn *Transaction, item *Item, offset uint64) *Item {
+	// A remote apply's split budget is checked before the split cuts anything,
+	// so a refused split leaves the item whole (countSplit).
+	countSplit(txn)
 	rightContent := item.Content.Splice(offset) // mutates item.Content → [0, offset)
 	right := &Item{
 		ID:          ID{Client: item.ID.Client, Clock: item.ID.Clock + offset},
@@ -584,7 +587,6 @@ func splitItem(txn *Transaction, item *Item, offset uint64) *Item {
 		right.Right.Left = right
 	}
 	item.Right = right
-	countSplit(txn)
 	txn.doc.store.insertItem(right)
 	// A key's entry is its rightmost unit, so Set's origin stays the run's end.
 	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {

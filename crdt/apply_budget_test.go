@@ -359,9 +359,9 @@ func TestUnit_ApplyBudget_BytesCountsContentAndNotADelete(t *testing.T) {
 
 // A field of zero or below is no limit, as WithIntegrateScanBudget reads its
 // bound. For each field, 1, the smallest limit, refuses an update of three
-// inserts that decodes and adds past it, which shows the field is read; 0
-// and -1 apply the same update and leave the document as one with no budget
-// leaves it. So do the zero value and a budget of -1 in every field.
+// inserts that decodes, adds and splits past it, which shows the field is
+// read; 0 and -1 apply the same update and leave the document as one with no
+// budget leaves it. So do the zero value and a budget of -1 in every field.
 func TestUnit_ApplyBudget_ZeroAndNegativeFieldsLimitNothing(t *testing.T) {
 	const base = "hello world"
 	update := threeInserts(t, base)
@@ -389,6 +389,7 @@ func TestUnit_ApplyBudget_ZeroAndNegativeFieldsLimitNothing(t *testing.T) {
 		{"Decoded", func(b *ApplyBudget, n int) { b.Decoded = n }},
 		{"Structs", func(b *ApplyBudget, n int) { b.Structs = n }},
 		{"Bytes", func(b *ApplyBudget, n int) { b.Bytes = n }},
+		{"Split", func(b *ApplyBudget, n int) { b.Split = n }},
 	} {
 		for _, n := range []int{1, 0, -1} {
 			var budget ApplyBudget
@@ -397,7 +398,9 @@ func TestUnit_ApplyBudget_ZeroAndNegativeFieldsLimitNothing(t *testing.T) {
 		}
 	}
 	t.Run("the zero value", func(t *testing.T) { run(t, ApplyBudget{}, false) })
-	t.Run("-1 in every field", func(t *testing.T) { run(t, ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1}, false) })
+	t.Run("-1 in every field", func(t *testing.T) {
+		run(t, ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1, Split: -1}, false)
+	})
 }
 
 // A document with an allowed-roots list refuses a remote update naming a root
@@ -525,7 +528,7 @@ func TestUnit_ApplyBudget_AnOptionThatLimitsNothingRefusesNothing(t *testing.T) 
 	update := EncodeStateAsUpdateV1(peer, nil)
 
 	zero := func(any) ApplyBudget { return ApplyBudget{} }
-	negative := func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1} }
+	negative := func(any) ApplyBudget { return ApplyBudget{Decoded: -1, Structs: -1, Bytes: -1, Split: -1} }
 	everyRoot := func(any) []string { return []string{"m"} }
 	for name, opts := range map[string][]DocOption{
 		"no option":                  nil,
@@ -1755,5 +1758,88 @@ func TestUnit_AllowedRoots_AHandoffNamingAHeldRootItDoesNotWriteUnderApplies(t *
 	}
 	if refused.Structs != 0 {
 		t.Fatalf("the refusal reports %d structs, want none: the name check refuses before one integrates", refused.Structs)
+	}
+}
+
+// Split bounds the structs a delete makes by splitting items the document
+// holds, which Structs does not count: a delete of five characters inside
+// the run of "hello world" cuts it into three. Split: 1, the smallest limit,
+// allows one split and refuses the second: the delete is refused at its
+// second split, before that split cuts anything, and an insert inside the
+// run, which makes one split, applies. Under Split: 2 the delete applies and
+// the document keeps the two structs it made.
+func TestUnit_ApplyBudget_RefusesADeleteWhoseSplitsPassWhatItAllows(t *testing.T) {
+	const base = "hello world"
+	deleteOnly := editUpdate(t, base, func(txn *Transaction, text *YText) { text.Delete(txn, 3, 5) })
+	split := func(n int) func(any) ApplyBudget {
+		return func(any) ApplyBudget { return ApplyBudget{Split: n} }
+	}
+
+	doc := budgetDoc(t, base)
+	doc.SetApplyBudget(split(1))
+	before := stateOf(doc)
+	refused := requireRefused(t, doc, before, ApplyUpdateV1(doc, deleteOnly, nil), ErrApplyBudget)
+	if refused.Split != 1 || refused.Structs != 0 {
+		t.Fatalf("the refusal reports %d splits and %d structs, want the one split before the refused one and none",
+			refused.Split, refused.Structs)
+	}
+	oneSplit := editUpdate(t, base, func(txn *Transaction, text *YText) { text.Insert(txn, 3, "x", nil) })
+	requireApplied(t, doc, before, ApplyUpdateV1(doc, oneSplit, nil))
+	if got, want := storeStructs(doc), before.structs+2; got != want {
+		t.Fatalf("the insert left %d structs, want the %d held, the one split and the character", got, want)
+	}
+
+	fits := budgetDoc(t, base)
+	fits.SetApplyBudget(split(2))
+	fitsBefore := stateOf(fits)
+	requireApplied(t, fits, fitsBefore, ApplyUpdateV1(fits, deleteOnly, nil))
+	if got, want := storeStructs(fits), fitsBefore.structs+2; got != want {
+		t.Fatalf("the applied delete left %d structs, want the %d it held and the 2 its splits made", got, want)
+	}
+}
+
+// The splits the drain of the parked queue makes count against the apply that
+// fills the gap. A drain that would pass Split stops and parks the rest, and
+// the apply that filled the gap stands; a later apply with room in its budget
+// drains the rest.
+func TestUnit_ApplyBudget_ADrainsSplitsCountAgainstTheApplyThatFillsTheGap(t *testing.T) {
+	const base = "hello world"
+	writer := New(WithClientID(2))
+	if err := ApplyUpdateV1(writer, baseState(t, base), nil); err != nil {
+		t.Fatal(err)
+	}
+	text := writer.GetText("t")
+	held := writer.StateVector()
+	writer.Transact(func(txn *Transaction) { text.Insert(txn, 3, "x", nil) })
+	first := EncodeStateAsUpdateV1(writer, held)
+	afterFirst := writer.StateVector()
+	writer.Transact(func(txn *Transaction) { text.Insert(txn, 7, "y", nil) })
+	second := EncodeStateAsUpdateV1(writer, afterFirst)
+
+	doc := New(WithClientID(7))
+	if err := ApplyUpdateV1(doc, baseState(t, base), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyUpdateV1(doc, second, nil); err != nil {
+		t.Fatal(err)
+	}
+	// "x" makes one split to land; the parked "y" then needs a second.
+	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{Split: 1} })
+	if err := ApplyUpdateV1(doc, first, nil); err != nil {
+		t.Fatalf("the apply that filled the gap returned %v, want it to stand", err)
+	}
+	if got := doc.PendingStats().Items; got != 1 {
+		t.Fatalf("%d structs are parked, want the one the drain could not split for", got)
+	}
+	if got, want := doc.GetText("t").ToString(), "helxlo world"; got != want {
+		t.Fatalf("the document reads %q, want %q", got, want)
+	}
+
+	doc.SetApplyBudget(func(any) ApplyBudget { return ApplyBudget{} })
+	if err := ApplyUpdateV1(doc, first, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := doc.GetText("t").ToString(), text.ToString(); got != want || doc.PendingStats().Items != 0 {
+		t.Fatalf("the document reads %q with %d parked, want %q and none", got, doc.PendingStats().Items, want)
 	}
 }

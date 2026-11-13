@@ -161,8 +161,8 @@ func WithWholeOrNothingApplies(on bool) DocOption {
 // ApplyBudget is what one remote apply may decode and add. A field of zero or
 // below is no limit in that measure, as WithIntegrateScanBudget reads its
 // bound, so the zero value bounds nothing. The smallest limit is 1, and a
-// budget cannot refuse every value, struct or byte: a caller that wants an
-// origin's updates refused whole refuses them before the apply.
+// budget cannot refuse every value, struct, byte or split: a caller that
+// wants an origin's updates refused whole refuses them before the apply.
 type ApplyBudget struct {
 	// Decoded is the values the apply may read: each struct, each delete
 	// range, each lib0 Any value at any depth, each entry of an Any map and
@@ -178,6 +178,13 @@ type ApplyBudget struct {
 	// decoded values, a format's key and value, and an XML element's or
 	// hook's name.
 	Bytes int
+	// Split is the structs the apply may make by splitting items the
+	// document holds, which Structs does not count: a delete of a range
+	// inside a run cuts it into three. The splits the drain of the parked
+	// queue makes count against the apply that fills the gap, and a drain
+	// that would pass it stops and parks the rest without failing the apply.
+	// Split: 1 allows one split and refuses the second.
+	Split int
 }
 
 // WithApplyBudget bounds each remote apply (ApplyUpdate and its V1 and V2

@@ -49,12 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Doc.SetApplyBudget` and `Doc.SetAllowedRoots` set them on a document
   already made. An `ApplyBudget` bounds `Decoded`, the values the apply reads,
   counted before it allocates for a declared length; `Structs`, the structs of
-  the update it adds; and `Bytes`, the bytes of content they carry. A field
-  of zero or below is no limit, as for `WithIntegrateScanBudget`, so the zero
-  value bounds nothing and the smallest limit is 1; `Structs` never refuses
-  an update that only deletes. An apply that would pass its budget, or create,
-  write under or delete under a root the list does not name, stops before that
-  struct enters the document and returns `ErrApplyBudget` or
+  the update it adds; `Bytes`, the bytes of content they carry; and `Split`,
+  the structs it makes by splitting items the document holds, its drain's
+  included. A field of zero or below is no limit, as for
+  `WithIntegrateScanBudget`, so the zero value bounds nothing and the
+  smallest limit is 1: `Split: 1` allows one split, and `Structs` never
+  refuses an update that only deletes. An apply that would pass its budget,
+  or create, write under or delete under a root the list does not name, stops
+  before that struct enters the document and returns `ErrApplyBudget` or
   `ErrRootNotAllowed`, both wrapping `ErrInvalidUpdate`, in a
   `RefusedUpdateError` that reports what the apply decoded and added. As for
   the scan bound, the document keeps what the apply integrated before it
