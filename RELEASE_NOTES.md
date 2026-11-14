@@ -272,9 +272,14 @@ text, but only 511 map values of 32,800 characters (16,768,471 bytes), one
 to a frame: a map value cannot be cut, and two of these do not fit in one. A
 struct that cannot be cut and is longer than 64 KiB goes out in one frame of
 its own size, so no single state size covers every room. `crdt.SplitUpdateV1`
-is the cut itself, for a caller with its own transport, and
-`sync.EncodeSyncStep2Split` is the answer as sync messages;
-`sync.EncodeSyncStep2` is unchanged.
+is the cut itself, for a caller with its own transport,
+`crdt.SplitStateAsUpdateV1` is the same cut of a document's state, read from
+its structs where they are, and `sync.EncodeSyncStep2Split` is the answer as
+sync messages; `sync.EncodeSyncStep2` is unchanged. Cutting the answer costs
+the server up to 11% more CPU time than the single SyncStep2 did for a room
+of 20,000 characters typed into the middle, and 43% more for a room of
+16,000 small structs: map entries, XML elements and attributes, formatted
+text.
 
 **Who is affected: stores that merge the updates a document took, and
 documents that hold a struct parked over clocks they hold.** A merge in which
