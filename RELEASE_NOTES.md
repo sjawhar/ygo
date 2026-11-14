@@ -29,6 +29,15 @@ is written, so the room's broadcasts cannot fill its write queue or its
 close frame that cannot be written within `PeerWriteTimeout` closes the
 connection at once, as before.
 
+The close for a cancel cause that names a close code, which an embedder sends
+by cancelling `ServeHTTP`'s request context, and the close the server writes
+at once when the peer's write queue is full had closed the socket straight
+after the frame as well. Both now do the same handshake, and the frames still
+queued behind such a close are dropped as soon as it is written. While the
+server waits for a peer's answer, it drops what the peer sends as it reads it,
+through a small buffer, so a peer cannot make it hold a frame as large as
+`MaxMessageBytes` for nothing.
+
 ## v1.55.1-sami.10
 
 This fork release retains the complete

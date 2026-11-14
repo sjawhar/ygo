@@ -77,7 +77,7 @@ func (p *peer) writeHandshake(frames ...[]byte) {
 func (p *peer) writeSeries(frames ...[]byte) {
 	p.wmu.Lock()
 	defer p.wmu.Unlock()
-	if p.closed || p.queueClosed || p.closeCode != 0 {
+	if p.closed || p.queueClosed || p.closingLocked() {
 		return
 	}
 	if p.overBudgetLocked() {

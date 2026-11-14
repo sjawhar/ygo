@@ -5,7 +5,9 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -22,7 +24,8 @@ import (
 	ygsync "github.com/reearth/ygo/sync"
 )
 
-// The close every update is refused with in these tests.
+// The close the server sends in these tests: for every update a peer sends, or
+// for an embedder's cancel cause.
 const (
 	refusalCode   = 4413
 	refusalReason = "too large"
@@ -50,6 +53,31 @@ func refusingServer(t *testing.T, stored []byte, configure func(*ygws.Server)) *
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	return ts
+}
+
+// causeServer serves rooms that load stored, and hands the test the cancel of
+// each connection's request context, as an embedder revoking a session holds
+// it.
+func causeServer(t *testing.T, stored []byte) (*httptest.Server, <-chan context.CancelCauseFunc) {
+	t.Helper()
+	srv := ygws.NewServerWithPersistence(storedDoc(stored))
+	cancels := make(chan context.CancelCauseFunc, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancelCause(r.Context())
+		defer cancel(nil)
+		cancels <- cancel
+		srv.ServeHTTP(w, r.WithContext(ctx))
+	}))
+	t.Cleanup(ts.Close)
+	return ts, cancels
+}
+
+// textState is a stored state holding n bytes of text.
+func textState(n int) []byte {
+	stored := crdt.New(crdt.WithClientID(1))
+	text := stored.GetText("t")
+	stored.Transact(func(txn *crdt.Transaction) { text.Insert(txn, 0, strings.Repeat("x", n), nil) })
+	return crdt.EncodeStateAsUpdateV1(stored, nil)
 }
 
 // serverLog is a log destination that the server's goroutines write while a
@@ -107,28 +135,16 @@ func dialSmallReceiveBuffer(t *testing.T, ts *httptest.Server, room string) *gws
 	return conn
 }
 
-// A peer that has sent frames after the server's last read still receives the
-// close frame, with its code and reason. The peer here reads nothing while the
-// server writes the room's state and then the close, as a busy browser reads
-// nothing, so the close waits in the server's send buffer; and it keeps sending
-// awareness all the while, as a browser does. A server that closes the socket
-// right after the close frame receives that awareness on a closed socket, which
-// resets the connection and discards what the peer had not yet received, the
-// close frame among it: the peer then reads a reset and no code.
-func TestInteg_CloseHandshake_APeerStillSendingReceivesTheCloseCode(t *testing.T) {
-	stored := crdt.New(crdt.WithClientID(1))
-	text := stored.GetText("t")
-	stored.Transact(func(txn *crdt.Transaction) { text.Insert(txn, 0, strings.Repeat("x", 192<<10), nil) })
-	ts := refusingServer(t, crdt.EncodeStateAsUpdateV1(stored, nil), nil)
-	conn := dialSmallReceiveBuffer(t, ts, "room")
-
-	doc := crdt.New(crdt.WithClientID(2))
-	// Answered with the room's state, which is more than the client's receive
-	// buffer holds.
-	sendSync(t, conn, ygsync.EncodeSyncStep1(doc))
-	// Refused, so the close is written right behind the state.
-	sendSync(t, conn, ygsync.EncodeUpdate(textUpdate(doc, "refused")))
-
+// requireCloseWhileSending requires conn to receive the close frame, with its
+// code and reason, while the peer acts as a busy browser does: it reads nothing
+// for 200 ms, so that what the server writes meanwhile, the close among it,
+// waits in the buffers at both ends, and it keeps sending awareness all the
+// while. A server that closes the socket right after the close frame receives
+// that awareness on a closed socket, which resets the connection and discards
+// what the peer had not yet received, the close frame among it: the peer then
+// reads a reset and no code.
+func requireCloseWhileSending(t *testing.T, conn *gws.Conn) {
+	t.Helper()
 	presence := awareness.New(2)
 	presence.SetLocalState(map[string]any{"cursor": 7})
 	frame := encoding.EncodeBytes(func(enc *encoding.Encoder) {
@@ -171,6 +187,22 @@ func TestInteg_CloseHandshake_APeerStillSendingReceivesTheCloseCode(t *testing.T
 	assert.Equal(t, refusalReason, closed.Text)
 }
 
+// A peer that has sent frames after the server's last read still receives the
+// close frame, with its code and reason. The server writes the room's state
+// and then the close while the peer reads nothing (requireCloseWhileSending).
+func TestInteg_CloseHandshake_APeerStillSendingReceivesTheCloseCode(t *testing.T) {
+	ts := refusingServer(t, textState(192<<10), nil)
+	conn := dialSmallReceiveBuffer(t, ts, "room")
+
+	doc := crdt.New(crdt.WithClientID(2))
+	// Answered with the room's state, which is more than the client's receive
+	// buffer holds.
+	sendSync(t, conn, ygsync.EncodeSyncStep1(doc))
+	// Refused, so the close is written right behind the state.
+	sendSync(t, conn, ygsync.EncodeUpdate(textUpdate(doc, "refused")))
+	requireCloseWhileSending(t, conn)
+}
+
 // A peer that never answers the close frame with its own does not hold its
 // connection open: the server closes it once the closing handshake's wait of
 // five seconds has passed.
@@ -184,8 +216,14 @@ func TestInteg_CloseHandshake_APeerThatNeverAnswersIsClosed(t *testing.T) {
 	sendSync(t, conn, ygsync.EncodeUpdate(textUpdate(doc, "refused")))
 	readClose(t, conn)
 
-	// The peer sends nothing more, so only the server can end the connection,
-	// and it must within twice its wait.
+	requireServerCloses(t, conn)
+}
+
+// requireServerCloses requires the server to close conn, which has read the
+// close frame and sends nothing more, within twice the closing handshake's
+// wait.
+func requireServerCloses(t *testing.T, conn *gws.Conn) {
+	t.Helper()
 	start := time.Now()
 	require.NoError(t, conn.NetConn().SetReadDeadline(time.Now().Add(10*time.Second)))
 	_, err := conn.NetConn().Read(make([]byte, 1))
@@ -238,4 +276,94 @@ func TestInteg_CloseHandshake_RoomTrafficDoesNotCloseAPeerBeingClosed(t *testing
 		}
 	}
 	assert.NotContains(t, logs.String(), "closing slow peer", "a peer being closed must not be closed again as a slow peer")
+}
+
+// A peer whose write queue is full when the server closes it still receives
+// the close frame, with its code and reason. The close cannot then wait in the
+// queue behind the frames ahead of it, so the server writes it at once and
+// writes nothing of the queue after it, and must still wait for the peer's
+// answer. The peer reads nothing while the server writes it a state far larger
+// than the buffers at both ends take, so the server's writer blocks, and the
+// room echoes the peer's awareness back to it until its queue is full; the
+// server keeps a peer whose queue is full (SlowPeerResync) where the default
+// would close it as a slow one.
+func TestInteg_CloseHandshake_APeerWithAFullQueueReceivesTheCloseCode(t *testing.T) {
+	const queueSize = 256
+	ts := refusingServer(t, textState(8<<20), func(srv *ygws.Server) {
+		srv.PeerWriteQueueSize = queueSize
+		srv.SlowPeerPolicy = ygws.SlowPeerResync
+	})
+	conn := dialSmallReceiveBuffer(t, ts, "room")
+
+	doc := crdt.New(crdt.WithClientID(2))
+	sendSync(t, conn, ygsync.EncodeSyncStep1(doc))
+	presence := awareness.New(2)
+	for i := range 2 * queueSize {
+		presence.SetLocalState(map[string]any{"cursor": i})
+		sendAwareness(t, conn, presence.EncodeUpdate(nil))
+	}
+	// Refused while the queue is full.
+	sendSync(t, conn, ygsync.EncodeUpdate(textUpdate(doc, "refused")))
+	requireCloseWhileSending(t, conn)
+}
+
+// What a peer sends while the server waits for its answer to a close is
+// dropped as it is read, through a small buffer, rather than read whole: a
+// frame the size of the read limit would otherwise take that much memory, for
+// nothing.
+func TestInteg_CloseHandshake_AFrameSentDuringTheHandshakeIsNotHeld(t *testing.T) {
+	const frameBytes = 48 << 20
+	ts := refusingServer(t, nil, nil)
+	conn := dial(t, ts, "room")
+	conn.SetCloseHandler(func(int, string) error { return nil }) // answers below, by hand
+	doc := crdt.New(crdt.WithClientID(2))
+	drainHandshake(t, conn, doc)
+	sendSync(t, conn, ygsync.EncodeUpdate(textUpdate(doc, "refused")))
+	readClose(t, conn)
+
+	frame := make([]byte, frameBytes)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	require.NoError(t, conn.WriteMessage(gws.BinaryMessage, frame))
+	require.NoError(t, conn.WriteControl(gws.CloseMessage, gws.FormatCloseMessage(gws.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+	// The server closes the connection once it reads the answer, which is
+	// behind the frame.
+	require.NoError(t, conn.NetConn().SetReadDeadline(time.Now().Add(10*time.Second)))
+	_, err := conn.NetConn().Read(make([]byte, 1))
+	require.Error(t, err)
+	require.False(t, isTimeout(err), "the server did not close the connection after the peer's answer")
+	runtime.ReadMemStats(&after)
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(frameBytes/4),
+		"the server allocated about as much as the frame it was to drop")
+}
+
+// A peer that has sent frames after the server's last read still receives the
+// close frame an embedder's cancel cause asks for (Server.ServeHTTP), with its
+// code and reason, as it receives the close for a refused update.
+func TestInteg_CloseHandshake_APeerStillSendingReceivesTheCauseCloseCode(t *testing.T) {
+	ts, cancels := causeServer(t, textState(192<<10))
+	conn := dialSmallReceiveBuffer(t, ts, "room")
+	cancel := <-cancels
+
+	// Answered with the room's state, which is more than the client's receive
+	// buffer holds.
+	sendSync(t, conn, ygsync.EncodeSyncStep1(crdt.New(crdt.WithClientID(2))))
+	// Once the state is written, the close is written right behind it.
+	time.Sleep(100 * time.Millisecond)
+	cancel(closeCodeCause{code: refusalCode, reason: refusalReason})
+	requireCloseWhileSending(t, conn)
+}
+
+// A peer that never answers the close frame for a cancel cause with its own
+// does not hold its connection open either.
+func TestInteg_CloseHandshake_APeerThatNeverAnswersTheCauseCloseIsClosed(t *testing.T) {
+	ts, cancels := causeServer(t, nil)
+	conn := dial(t, ts, "room")
+	cancel := <-cancels
+	conn.SetCloseHandler(func(int, string) error { return nil }) // sends no close in reply
+	drainHandshake(t, conn, crdt.New(crdt.WithClientID(2)))
+
+	cancel(closeCodeCause{code: refusalCode, reason: refusalReason})
+	readClose(t, conn)
+	requireServerCloses(t, conn)
 }

@@ -29,6 +29,11 @@ wire format changes.
   are dropped rather than queued, since nothing after the close frame is
   written, so the room's broadcasts cannot fill its write queue or its
   `PeerWriteQueueBytes` budget and close it as a slow peer before it answers.
+  The close for a cancel cause that names a close code (`ServeHTTP`) and the
+  close the server writes at once when the peer's write queue is full do the
+  same handshake; both had closed the socket straight after the frame as well.
+  What a peer being closed sends is dropped as it is read, through a small
+  buffer, so the wait never holds a frame as large as `MaxMessageBytes`.
 
 ## [1.55.1-sami.10] — 2026-11-12
 
