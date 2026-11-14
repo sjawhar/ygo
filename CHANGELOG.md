@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`crdt`: `Doc.SetMaxPendingItems(n)`** sets the pending cap after
   construction, so stored state over a cap can load first.
 
+- **`crdt`: `Doc.StructCount` returns how many structs the document holds.**
+  Every client's items count, deleted items and garbage-collected placeholders
+  included. Structs parked until a missing dependency arrives do not count
+  until they integrate (`PendingStats` reports them), and a subdocument's
+  structs count in its own `Doc`. A struct is a run of content, and the count
+  is this replica's: text typed one character per transaction is a struct per
+  character on the writer and on a replica that applied each transaction's
+  update, and one struct on a replica that loads the writer's state in one
+  update. The call takes the document's read lock, so it must not be made
+  inside a `Transact` callback; it walks the clients, not the structs, and
+  allocates nothing. `StructStore.Count` is the same count on the store.
+
 - `provider/websocket`: add `Server.CloseRoomWithinContext` to cancel a room-load
   wait without closing the room. `CloseRoomWithin` retains its signature and
   uses a background context. Once close starts, teardown runs to completion.
