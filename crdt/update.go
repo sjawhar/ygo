@@ -263,12 +263,6 @@ func encodeV1Locked(doc *Doc, sv StateVector) []byte {
 	})
 }
 
-// isGCOrphan reports whether item is a GC struct: no parent, origins or parent
-// ID. An item whose parent is only unresolved keeps an origin or parent ID.
-func (item *Item) isGCOrphan() bool {
-	return item.Parent == nil && item.Origin == nil && item.OriginRight == nil && item.parentID == nil
-}
-
 // markGCOrphan turns an item whose parent cannot be resolved into the GC struct
 // Yjs integrates it as: deleted, length-only content, and no parent or origins.
 // It then encodes as a GC struct, and nothing can resolve a parent through it,
