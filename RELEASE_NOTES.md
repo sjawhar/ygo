@@ -1,3 +1,28 @@
+## v1.55.1-sami.11
+
+This release adds one method to `Doc`. There are no wire format changes, and
+nothing that exists changes.
+
+### How many clients a document holds structs from
+
+`crdt.Doc.ClientCount` is how many clients the document holds structs from.
+What a document costs follows its clients as well as its structs, and a peer
+chooses its own client ID. The same 100,000 one-character structs, each typed
+at the front, are a 683,494-byte state whose encoding allocates 3.9 MB when
+one client wrote them, and a 1,166,983-byte state whose encoding allocates
+30.0 MB when each came from a client of its own. `StructCount` is 100,000 for
+both.
+
+A client counts from the first of its writes that integrates, and stays
+counted when its content is deleted and collected. A client that has only
+deleted is not counted, nor is a client whose every struct is parked, and a
+subdocument's clients are counted by its own `Doc`. The count is the number
+of clients `StateVector` returns.
+
+`ClientCount` takes the document's read lock, so call it outside `Transact`.
+It allocates nothing and takes the same time however many clients the
+document holds.
+
 ## v1.55.1-sami.10
 
 This fork release retains the complete
