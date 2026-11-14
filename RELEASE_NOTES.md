@@ -19,8 +19,24 @@ is a struct per character on the writer and on a server that applied each
 keystroke's update as it arrived, and one struct on a replica that loads the
 writer's state in one update.
 
-`StructCount` takes the document's read lock, so call it outside `Transact`.
-It walks the document's clients rather than its structs and allocates nothing.
+**`Doc.ClientCount` reports how many clients a document holds structs from.**
+What a document costs follows its clients as well as its structs, and a peer
+chooses its own client ID. The same 100,000 one-character structs, each typed
+at the front, are a 683,494-byte state whose encoding allocates 8.4 MB in 64
+allocations when one client wrote them, and a 1,166,983-byte state whose
+encoding allocates 30.8 MB in 100,069 allocations when each came from a
+client of its own. `StructCount` is 100,000 for both.
+
+A client counts from the first of its writes that integrates, and stays
+counted when its content is deleted and collected. A client that has only
+deleted is not counted, nor is a client whose every struct is parked, and a
+subdocument's clients are counted by its own `Doc`. The count is the number
+of clients `StateVector` returns.
+
+Both methods take the document's read lock, so call them outside `Transact`,
+and neither allocates. `StructCount` walks the document's clients rather than
+its structs, and `ClientCount` takes the same time however many clients the
+document holds.
 
 ## v1.55.0
 

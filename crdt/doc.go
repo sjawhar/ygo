@@ -957,6 +957,24 @@ func (d *Doc) StructCount() int {
 	return d.store.Count()
 }
 
+// ClientCount returns how many clients the document holds structs from: every
+// client with an item in the document, whether deleted or garbage-collected
+// since, so a client counts from the first of its writes that integrates here
+// and stays counted. It is the number of clients StateVector returns.
+//
+// A client that has only deleted is not counted, nor is a client whose every
+// struct is parked until a missing dependency arrives (PendingStats reports
+// them), and a subdocument's clients are counted by its own Doc.
+//
+// ClientCount allocates nothing and takes the same time however many clients
+// the document holds. It takes the document's read lock, and so must not be
+// called inside a Transact callback (see Transact and GetText).
+func (d *Doc) ClientCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.store.clients)
+}
+
 // EncodeStateAsUpdate encodes the full document state as a V1 binary update.
 func (d *Doc) EncodeStateAsUpdate() []byte {
 	return EncodeStateAsUpdateV1(d, nil)
