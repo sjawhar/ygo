@@ -99,6 +99,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`crdt`: a merge keeps an earlier update's struct where a later update
+  names other content on its clocks.** A struct that names a struct no update
+  carries parks, also over clocks the document holds, because the apply looks
+  up what a struct names before it checks the struct's clocks, as Yjs does.
+  `MergeUpdatesV1` and `MergeUpdatesV2` kept, on each clock, the struct that
+  started first and was longest, so such a struct took those clocks from the
+  structs that held them. A reader of the merge parked it again, and
+  everything of its client after it: a stored log of 1,000 keystrokes and one
+  such update read back as 3 characters. `EncodeStateAsUpdateV1` and
+  `EncodeStateAsUpdateV2` merge a document's parked structs into its state,
+  and the same 1,000 keystrokes read back as 5. Where the struct the old rule
+  keeps names another origin, right origin, parent or key than the struct of
+  the earliest update on that clock, the earlier update's struct is now kept,
+  and the other keeps only the clocks past it, as an apply of the updates in
+  order integrates only those. A merge in which no two insertions claim one
+  clock returns the same bytes as before.
+
 - **`crdt`: logical span lengths and offsets do not depend on the build's
   integer width.** Coalesced GC and deleted spans retain their lengths on
   32-bit builds. V1 and V2 accept the same wide spans, including offsets
