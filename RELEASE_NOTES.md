@@ -1,3 +1,34 @@
+## v1.55.1-sami.15
+
+This release fixes a close code lost on its way to a peer that was still
+sending. There are no API or wire format changes.
+
+### A close code that reaches a peer still sending
+
+The server closes a peer with a code when `OnPeerUpdate` or `OnStateAnswer`
+refuses it (with a `PeerClose`'s code, or 4205), when its token auth fails,
+and when it sends a malformed sync message on Hocuspocus framing. It wrote the
+close frame and closed the socket straight after. A browser that had sent
+frames the server had not yet read, such as awareness it sends while it
+applies a large SyncStep2, had them arrive at a closed socket. That resets the
+connection, and the reset discards whatever the browser had not yet received,
+the close frame among it, so the browser reported 1006 (abnormal closure) and
+not the code. A client that tells refusals apart by their code, to stop
+retrying a permanent one or to back off a transient one, could not tell them
+apart.
+
+The server now does the WebSocket closing handshake: it writes the close
+frame, reads and drops what the peer sends until the peer's own close frame
+arrives, then closes the connection. A peer that has not answered within five
+seconds is closed anyway. That leaves a peer still reading through frames
+queued ahead of the close time to reach it, and keeps a peer that never
+answers, with its place in its room, for five seconds at most. Frames for a
+peer being closed are dropped meanwhile, since nothing after the close frame
+is written, so the room's broadcasts cannot fill its write queue or its
+`PeerWriteQueueBytes` budget and close it as a slow peer before it answers. A
+close frame that cannot be written within `PeerWriteTimeout` closes the
+connection at once, as before.
+
 ## v1.55.1-sami.10
 
 This fork release retains the complete

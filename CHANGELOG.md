@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.15] — 2026-11-14
+
+Fixes a close code lost on its way to a peer that was still sending. No API or
+wire format changes.
+
+### Fixed
+
+- **`provider/websocket`: a peer the server closes with a code receives the
+  code even while it is still sending.** The server wrote the close frame and
+  closed the socket straight after. Frames the peer had sent that the server
+  had not read, such as awareness a browser sends while it applies a large
+  SyncStep2, then reached a closed socket, which resets the connection, and the
+  reset discarded what the peer had not yet received, the close frame among it:
+  the peer saw an abnormal closure (1006) and not the code of the
+  `OnPeerUpdate` or `OnStateAnswer` refusal, failed token auth or malformed
+  Hocuspocus sync message that closed it. The server now does RFC 6455's
+  closing handshake: it writes the close frame, reads and drops what the peer
+  sends until the peer's own close frame arrives or five seconds pass, then
+  closes the connection. A peer that never answers is closed after those five
+  seconds, and a close frame that cannot be written within `PeerWriteTimeout`
+  closes the connection at once, as before. Frames for a peer being closed
+  are dropped rather than queued, since nothing after the close frame is
+  written, so the room's broadcasts cannot fill its write queue or its
+  `PeerWriteQueueBytes` budget and close it as a slow peer before it answers.
+
 ## [1.55.1-sami.10] — 2026-11-12
 
 Fork release on [1.55.1-sami.9](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.9),
