@@ -692,7 +692,7 @@ type room struct {
 	// of every exit path — before its final drain of persistCh, whatever
 	// triggered the exit (persistStop, or the server-wide shutdownCh). That
 	// ordering is the whole point, and it is what makes the handoff in
-	// loadRoom's doc.OnUpdate observer race-free (#229):
+	// loadRoom's persistence observer race-free (#229):
 	//
 	//	if a producer's send into persistCh completed while persistRetire was
 	//	still open, the worker's final drain — which strictly follows
@@ -707,7 +707,7 @@ type room struct {
 	persistRetire chan struct{}
 
 	// persistFallbackMu serialises the post-retirement direct writes performed
-	// by persistStranded. doc.OnUpdate observers fire OUTSIDE the doc lock
+	// by persistStranded. Persistence observers fire OUTSIDE the doc lock
 	// (crdt.buildPhase2), so two committing goroutines can be inside the
 	// observer at once; the adapter contract only promises serialised calls per
 	// room, so the fallback must provide that serialisation itself.
@@ -880,7 +880,7 @@ type Server struct {
 	shutdownCh   chan struct{} // closed by Shutdown
 
 	// stranded counts committing goroutines that are anywhere inside
-	// loadRoom's doc.OnUpdate observer — EVERY commit, not only the ones that
+	// loadRoom's persistence observer — EVERY commit, not only the ones that
 	// end up on the retirement branch and perform the adapter write themselves
 	// (#229). Shutdown waits for it to reach zero so it does not return while
 	// such a write is still on its way to the adapter; without that wait the fix
@@ -1986,49 +1986,7 @@ func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 		r.persistRetire = make(chan struct{})
 		r.flushReq = make(chan chan bool)
 		s.startPersistenceWorker(r, name)
-		r.doc.OnUpdate(func(update []byte, _ any) {
-			// #229 — handing the update to persistCh is only safe while the
-			// worker is still reading it. The worker publishes its retirement
-			// by closing persistRetire BEFORE its final drain, which gives this
-			// observer two airtight cases and no third one:
-			//
-			//   1. persistRetire is still open when the send completes. Then
-			//      close(persistRetire) — and therefore the final drain that
-			//      follows it — happens after the send, so the buffered element
-			//      is still there to be drained. Nothing to do.
-			//   2. persistRetire is already closed. A select whose case is a
-			//      closed channel is always ready, so the check below sees it
-			//      with certainty (no scheduling window), and this goroutine
-			//      takes over the write itself.
-			//
-			// The escape hatch must stay: without it a producer would block
-			// forever on a full 256-slot buffer once the worker has gone. What
-			// #229 changes is that the escape hatch now has a durable
-			// destination instead of dropping the update on the floor.
-			//
-			// The enter/leave pair brackets the WHOLE observer, including the
-			// latch reads, so Shutdown can see this goroutine from before it
-			// decides whether it must write. Registering only inside the
-			// retirement branches would leave a gap in which Shutdown observes
-			// zero and returns while this goroutine is already committed to a
-			// write it has not started (see Server.stranded).
-			s.stranded.enter()
-			defer s.stranded.leave()
-
-			select {
-			case r.persistCh <- update:
-				// Case 1 unless retirement began in between; re-check, since
-				// select picks uniformly among ready cases and may have taken
-				// the send even with persistRetire already closed.
-				select {
-				case <-r.persistRetire:
-					s.persistStranded(r, name, nil)
-				default:
-				}
-			case <-r.persistRetire:
-				s.persistStranded(r, name, update)
-			}
-		})
+		s.recordRoomPersistence(r, name)
 	}
 	// Wire relay observers (doc.OnUpdate + awareness.OnUpdate) so local changes
 	// are published to other nodes. Registered AFTER the bootstrap decode (so the

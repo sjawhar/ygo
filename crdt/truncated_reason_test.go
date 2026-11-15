@@ -160,7 +160,7 @@ func TestUnit_ApplyUpdate_ACappedDocumentRefusesWithTheDecodersReason(t *testing
 					break
 				}
 			}
-			if err := f.apply(New(WithMaxPendingItems(1)), f.update, nil); u.pastCap && !errors.Is(err, ErrPendingCap) {
+			if err := f.apply(New(WithMaxPendingItems(1)), f.update, nil); u.pastCap && (!errors.Is(err, ErrPendingCap) || !errors.Is(err, ErrInvalidUpdate)) {
 				t.Errorf("%s %s past a one-item cap: %v, want ErrPendingCap", u.name, f.name, err)
 			}
 			if u.column && f.name == "V2" {
@@ -335,7 +335,7 @@ func TestUnit_ApplyUpdate_ADocumentWithLittleRoomRefusesWithTheDecodersReason(t 
 	}
 	two := EncodeStateAsUpdateV1(parkingFork(t, one, 9, 0, 0), one.StateVector())
 	for _, f := range formats(t, two) {
-		if err := f.apply(target(room), f.update, nil); !errors.Is(err, ErrPendingCap) {
+		if err := f.apply(target(room), f.update, nil); !errors.Is(err, ErrPendingCap) || !errors.Is(err, ErrInvalidUpdate) {
 			t.Errorf("%s whole: %v, want ErrPendingCap", f.name, err)
 		}
 		// Every cut but the delete set's last byte leaves the second struct

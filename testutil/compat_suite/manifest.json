@@ -1,0 +1,42 @@
+{
+  "legacy_ref": "aa31c1532f604f67c065b0de0544e69e5eb8a2d0",
+  "renames": {
+    "crdt/TestUnit_Doc_OnPersistUpdate": "crdt/TestUnit_Doc_UpdateLog_ParkedReplayAndClose",
+    "crdt/TestUnit_ResolveParents_InterleavedChainBoundWork": "crdt/TestUnit_MergeUpdates_InterleavedChainBoundWork",
+    "crdt/TestUnit_ResolveParents_OriginCyclesBoundWork": "crdt/TestUnit_MergeUpdates_OriginCyclesBoundWork",
+    "provider/websocket/TestUnit_ServerHandshake_SendsStep1AndStep2ThenAwareness": "provider/websocket/TestUnit_ServerHandshake_AnswersStep1WithoutEmptyAwareness"
+  },
+  "baseline_functions": 1961,
+  "changed_test_files": [
+    "crdt/clock_bounds_test.go",
+    "crdt/coverage_test.go",
+    "crdt/crdt_test.go",
+    "crdt/interleaved_yjs_conformance_test.go",
+    "crdt/merge_graph_work_test.go",
+    "crdt/merge_test.go",
+    "crdt/parked_deletes_predict_test.go",
+    "crdt/parked_deletes_test.go",
+    "crdt/pending_budget_test.go",
+    "crdt/pending_cover_bench_test.go",
+    "crdt/pending_cover_test.go",
+    "crdt/pending_cursor_test.go",
+    "crdt/pending_groups_test.go",
+    "crdt/pending_resolver_bench_test.go",
+    "crdt/pending_resolver_test.go",
+    "crdt/pending_resolver_work_test.go",
+    "crdt/persist_update_test.go",
+    "crdt/struct_walk_test.go",
+    "crdt/subdoc_test.go",
+    "crdt/truncated_reason_test.go",
+    "crdt/update_groups_test.go",
+    "persistence/adapter_test.go",
+    "provider/websocket/conn_awareness_cap_test.go",
+    "provider/websocket/export_test.go",
+    "provider/websocket/idle_test.go",
+    "provider/websocket/persistence_autoversion_test.go",
+    "provider/websocket/persistence_coalesce_test.go",
+    "provider/websocket/server_internal_test.go",
+    "provider/websocket/server_test.go",
+    "provider/websocket/sync_status_test.go"
+  ]
+}

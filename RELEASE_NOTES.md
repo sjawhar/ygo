@@ -36,6 +36,15 @@ that enforces its own slow-peer bound can set a shorter deadline, so a reader
 draining a backlog that is within that bound is not dropped by the package
 constant before the embedder's own policy can act.
 
+### Persistence replay
+
+- **`provider/websocket`: persist newly parked work as well as integrated
+  changes.** Persistence drains a commit-ordered `UpdateLog` after transactions,
+  retaining updates that fire no `OnUpdate` and the parked portion of a partial
+  apply. Replaying storage after restart preserves pending edits until their
+  dependencies arrive. Yjs-compatible `OnUpdate` events stay unchanged; a queued
+  notification is not a durable-write acknowledgement.
+
 ## v1.55.1-sami.9
 
 This fork release retains the complete

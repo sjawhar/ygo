@@ -10,8 +10,82 @@ import (
 	"github.com/reearth/ygo/crdt"
 )
 
+// recordRoomPersistence logs integrated and parked changes under the document
+// lock, then drains them after every transaction. OnUpdate alone omits a
+// parked-only apply, so a persistence log based on it cannot rebuild the room.
+func (s *Server) recordRoomPersistence(r *room, name string) {
+	updates := r.doc.OpenUpdateLog()
+	var drainMu sync.Mutex
+	r.doc.OnAfterTransaction(func(*crdt.Transaction) {
+		// Register before waiting on the drain lock so shutdown also waits for
+		// callbacks whose committed records another callback has not queued yet.
+		s.stranded.enter()
+		defer s.stranded.leave()
+		drainMu.Lock()
+		defer drainMu.Unlock()
+
+		// The room's loaded state is already in its adapter. Only changes after
+		// the log opened need storing; the log's first base is not stored again.
+		_, records := updates.Drain()
+		for _, record := range records {
+			update := record.Update
+			if record.Parked != nil {
+				merged, err := crdt.MergeUpdatesV1(update, record.Parked)
+				if err != nil {
+					// Retain both parts even if a future encoder change makes the
+					// merge fail. Replay can apply them separately with the same result.
+					log.Printf("ygo/websocket: merge of persistence update for room %q: %v; storing separately", name, err)
+					s.enqueuePersistence(r, name, update)
+					s.enqueuePersistence(r, name, record.Parked)
+					continue
+				}
+				update = merged
+			}
+			s.enqueuePersistence(r, name, update)
+		}
+	})
+}
+
+// enqueuePersistence retains the worker's retire-before-drain handoff. The
+// caller registers with s.stranded before draining the log and holds its
+// drain lock until every record has been handed to the worker or fallback.
+func (s *Server) enqueuePersistence(r *room, name string, update []byte) {
+	// #229 — handing the update to persistCh is only safe while the
+	// worker is still reading it. The worker publishes its retirement
+	// by closing persistRetire BEFORE its final drain, which gives this
+	// observer two airtight cases and no third one:
+	//
+	//   1. persistRetire is still open when the send completes. Then
+	//      close(persistRetire) — and therefore the final drain that
+	//      follows it — happens after the send, so the buffered element
+	//      is still there to be drained. Nothing to do.
+	//   2. persistRetire is already closed. A select whose case is a
+	//      closed channel is always ready, so the check below sees it
+	//      with certainty (no scheduling window), and this goroutine
+	//      takes over the write itself.
+	//
+	// The escape hatch must stay: without it a producer would block
+	// forever on a full 256-slot buffer once the worker has gone. What
+	// #229 changes is that the escape hatch now has a durable
+	// destination instead of dropping the update on the floor.
+	//
+	select {
+	case r.persistCh <- update:
+		// Case 1 unless retirement began in between; re-check, since
+		// select picks uniformly among ready cases and may have taken
+		// the send even with persistRetire already closed.
+		select {
+		case <-r.persistRetire:
+			s.persistStranded(r, name, nil)
+		default:
+		}
+	case <-r.persistRetire:
+		s.persistStranded(r, name, update)
+	}
+}
+
 // persistStranded is the durable destination for updates a room's persistence
-// worker can no longer take (#229). It is called from the doc.OnUpdate observer
+// worker can no longer take (#229). It is called from the persistence observer
 // registered in loadRoom, on the two paths where the worker has begun retiring:
 // an update that could not be enqueued at all (passed as extra), and updates
 // that were enqueued but may have missed the worker's final drain.
@@ -23,13 +97,10 @@ import (
 // never waits on a producer, and Shutdown/eviction wait on persistDone too, not
 // on this function.
 //
-// Anything still stranded in persistCh is stored FIRST, then extra, so a single
-// stranded call writes in commit order. That is best-effort ordering WITHIN one
-// call only: two committing goroutines can be in the observer at once (see
-// room.persistFallbackMu), so across concurrent stranded calls the adapter may
-// see the room's updates out of commit order. Harmless for a CRDT log — updates
-// merge order-independently — but do not read it as a stronger promise than it
-// is. Errors are logged, not returned: the observer has no caller to report to.
+// Anything still stranded in persistCh is stored FIRST, then extra. The log
+// drain serializes producers, including retirement handoffs, so these writes
+// retain commit order. Errors are logged, not returned: the observer has no
+// caller to report to.
 // Auto-versioning and compaction are deliberately NOT re-run here — the worker
 // already performed its final maybeVersion/maybeCompact, and a stranded update
 // is by definition a late straggler, not a new steady state.
@@ -39,8 +110,7 @@ import (
 // alternative — the pre-#229 behaviour — was silent data loss. Two consequences
 // worth stating rather than discovering:
 //
-//   - crdt.buildPhase2 fires OnUpdate observers in registration order and
-//     loadRoom registers persistence BEFORE the relay observers, so a stranded
+//   - The persistence observer runs before the OnUpdate relay observers, so a stranded
 //     write delays that update's cluster fan-out for as long as the adapter
 //     takes. Bounded to room retirement, and a publish onto an already-retired
 //     lane is counted in RelayStats().Dropped rather than lost silently — but
@@ -103,7 +173,7 @@ func (s *Server) persistStranded(r *room, name string, extra []byte) {
 // committing throughout Shutdown, and Shutdown closes shutdownCh long before it
 // closes the peer connections. So the FIRST act of every exit path is to close
 // r.persistRetire, publishing "I am leaving" before the final drain rather than
-// after it. loadRoom's doc.OnUpdate observer reads that latch and either relies
+// after it. loadRoom's persistence observer reads that latch and either relies
 // on the final drain (its send completed while the latch was open, so the drain
 // necessarily follows it) or performs the write itself via persistStranded.
 // Without the latch, everything committed after the drain landed in an unread
@@ -159,7 +229,7 @@ func (s *Server) startPersistenceWorker(r *room, name string) {
 	go func() {
 		defer close(r.persistDone)
 
-		// retire publishes "this worker is leaving" to the doc.OnUpdate producer
+		// retire publishes "this worker is leaving" to the persistence producer
 		// (#229). Ordering is load-bearing in two directions:
 		//
 		//   - it must run BEFORE the final drain, so a send that completed while
@@ -410,7 +480,7 @@ func (s *Server) startPersistenceWorker(r *room, name string) {
 			}
 		}
 		// exit runs the shared retire-then-drain-then-flush sequence for both
-		// exit triggers. retire() must come FIRST so the doc.OnUpdate producer
+		// exit triggers. retire() must come FIRST so the persistence producer
 		// can never hand an update to a channel this worker has already swept
 		// for the last time (#229); the flush uses a background ctx so the last
 		// batched write survives the very signal that triggered the exit.

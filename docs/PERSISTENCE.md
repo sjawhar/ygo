@@ -36,8 +36,11 @@ type PersistenceAdapter interface {
 `LoadDoc` is called once when the first peer connects to a room.  The returned
 bytes are passed to `crdt.ApplyUpdateV1` to seed the in-memory document.
 
-`StoreUpdate` is called on every committed transaction that changes the doc,
-via `doc.OnUpdate`.
+The server drains a commit-ordered `doc.OpenUpdateLog()` after transactions.
+`StoreUpdate` receives integrated changes together with newly parked structs
+and delete ranges, including a parked-only apply that emits no `OnUpdate`.
+The loaded base is not stored again. The worker retains its existing batching
+and retirement handoff; queuing a record does not acknowledge a durable write.
 For durability the implementation should write to stable storage before
 returning; the server does not retry failed writes.
 

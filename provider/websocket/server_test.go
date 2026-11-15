@@ -750,3 +750,31 @@ func TestServer_HandshakeTimeout_ClosesIdleConnection(t *testing.T) {
 	_, _, readErr := c.ReadMessage()
 	assert.Error(t, readErr, "idle peer should be disconnected by the server within HandshakeTimeout")
 }
+
+func TestUnit_ServerHandshake_AnswersStep1WithoutEmptyAwareness(t *testing.T) {
+	ts := httptest.NewServer(ygws.NewServer())
+	defer ts.Close()
+	conn := dial(t, ts, "room1")
+	outerType, payload := readOne(t, conn, 2*time.Second)
+	require.Equal(t, uint64(0), outerType)
+	syncType, _, err := ygsync.ReadSyncMessage(payload)
+	require.NoError(t, err)
+	require.Equal(t, ygsync.MsgSyncStep1, syncType)
+
+	doc := crdt.New()
+	sendSync(t, conn, ygsync.EncodeSyncStep1(doc))
+	outerType, payload = readOne(t, conn, 2*time.Second)
+	require.Equal(t, uint64(0), outerType)
+	syncType, _, err = ygsync.ReadSyncMessage(payload)
+	require.NoError(t, err)
+	require.Equal(t, ygsync.MsgSyncStep2, syncType)
+	_, err = ygsync.ApplySyncMessage(doc, payload, nil)
+	require.NoError(t, err)
+	require.Empty(t, doc.StateVector())
+	// An empty room sends no awareness frame and answers this request once.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
+	_, _, err = conn.ReadMessage()
+	var timeout net.Error
+	require.ErrorAs(t, err, &timeout)
+	require.True(t, timeout.Timeout(), "no unsolicited state or empty awareness follows the answer")
+}

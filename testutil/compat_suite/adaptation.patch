@@ -1,0 +1,734 @@
+--- a/crdt/clock_bounds_test.go
++++ b/crdt/clock_bounds_test.go
+@@ -120 +120 @@
+-	return encodeStructStoreV2(map[ClientID][]*Item{30: {gc}}, newDeleteSet(), nil, New().store)
++	return encodeStructStoreV2(map[ClientID][]*Item{30: {gc}}, newDeleteSet(), nil)
+@@ -150 +150 @@
+-		encodeItemV2(enc, &Item{ID: ID{Client: 30, Clock: c}, Parent: &root.abstractType, Content: NewContentString("qq")}, 0, New().store)
++		encodeItemV2(enc, &Item{ID: ID{Client: 30, Clock: c}, Parent: &root.abstractType, Content: NewContentString("qq")}, 0)
+@@ -163 +163 @@
+-	encodeItemV2(enc, item, 0, New().store)
++	encodeItemV2(enc, item, 0)
+--- a/crdt/coverage_test.go
++++ b/crdt/coverage_test.go
+@@ -76 +76 @@
+-	// but with the same guid and opts
++	// but with the same wire options; collection ID is inherited on attach.
+@@ -78 +78 @@
+-	assert.Equal(t, "cid", cpDoc.CollectionID())
++	assert.Empty(t, cpDoc.CollectionID())
+--- a/crdt/crdt_test.go
++++ b/crdt/crdt_test.go
+@@ -1575 +1575 @@
+-	got, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
++	got, _, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
+@@ -1583 +1583 @@
+-	got2, err := decodeDeleteSetV2(dec2)
++	got2, _, err := decodeDeleteSetV2(dec2)
+@@ -1596 +1596 @@
+-	ds, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
++	ds, _, err := decodeDeleteSet(encoding.NewDecoder(enc.Bytes()))
+@@ -1613 +1613 @@
+-	ds, err = decodeDeleteSetV2(dec2)
++	ds, _, err = decodeDeleteSetV2(dec2)
+--- a/crdt/interleaved_yjs_conformance_test.go
++++ b/crdt/interleaved_yjs_conformance_test.go
+@@ -266,22 +265,0 @@
+-func TestUnit_ResolveParents_InterleavedChainBoundWork(t *testing.T) {
+-	const people, n = 5, 2000
+-	doc := New()
+-	defer doc.Destroy()
+-	work := resolverWork{}
+-	first, rest := interleavedWorkItems(doc, people, n, &work)
+-	store := &StructStore{clients: make(map[ClientID][]*Item)}
+-	for _, item := range append([]*Item{first}, rest...) {
+-		if item != first {
+-			item.Parent = nil
+-		}
+-		store.clients[item.ID.Client] = append(store.clients[item.ID.Client], item)
+-	}
+-	work.lengths = 0
+-	resolveParents(store)
+-	for _, items := range store.clients {
+-		for _, item := range items {
+-			require.Equal(t, first.Parent, item.Parent)
+-		}
+-	}
+-	require.LessOrEqual(t, work.lengths, 8*n, "each origin chain must be followed once")
+-}
+@@ -291,31 +269,4 @@
+-func TestUnit_ResolveParents_OriginCyclesBoundWork(t *testing.T) {
+-	const n = 3000
+-	work := resolverWork{}
+-	store := &StructStore{clients: make(map[ClientID][]*Item)}
+-	add := func(client ClientID, origin ClientID) {
+-		store.clients[client] = append(store.clients[client], &Item{
+-			ID:      ID{Client: client},
+-			Origin:  &ID{Client: origin},
+-			Content: &resolverWorkContent{NewContentDeleted(1), &work},
+-		})
+-	}
+-	for c := ClientID(1); c <= n; c++ {
+-		add(c, c) // self-loop
+-	}
+-	for c := ClientID(n + 1); c <= 2*n; c += 2 {
+-		add(c, c+1)
+-		add(c+1, c)
+-	}
+-	const loop = ClientID(4 * n)
+-	for c := loop; c < loop+n; c++ {
+-		add(c, c+1) // tail into a loop over the last half
+-	}
+-	add(loop+n, loop+n/2)
+-	resolveParents(store)
+-	for _, items := range store.clients {
+-		for _, item := range items {
+-			require.Nil(t, item.Parent)
+-		}
+-	}
+-	require.LessOrEqual(t, work.lengths, 64*n, "origin cycles must not cost a walk the length of the store")
+-}
++
++// self-loop
++
++// tail into a loop over the last half
+--- /dev/null
++++ b/crdt/merge_graph_work_test.go
+@@ -0,0 +1,124 @@
++package crdt
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Instrument the retained item graph at buildMergeStore's decoder boundary.
++// This counts actual merge work without substituting a
++// parent resolver. The public merge is then checked for lossless output.
++func mergeGraphWithWork(t *testing.T, clients map[ClientID][]*Item, work *resolverWork, v2 bool) []byte {
++	t.Helper()
++	work.lengths = 0
++	merged, ds, err := buildMergeStore([][]byte{{}}, func(*Doc, []byte) (map[ClientID][]*Item, DeleteSet, error) {
++		return clients, newDeleteSet(), nil
++	})
++	require.NoError(t, err)
++	encode, merge := encodeStructStoreV1, MergeUpdatesV1
++	if v2 {
++		encode, merge = encodeStructStoreV2, MergeUpdatesV2
++	}
++	n := 0
++	for _, items := range clients {
++		n += len(items)
++	}
++	require.LessOrEqual(t, work.lengths, 8*n, "merging must inspect each struct a bounded number of times")
++	// The wire encoder dispatches on concrete content types. Unwrap only
++	// after the merge work has been counted, then exercise the public codec.
++	for _, items := range merged {
++		for _, item := range items {
++			if wrapped, ok := item.Content.(*resolverWorkContent); ok {
++				item.Content = wrapped.Content
++			}
++		}
++	}
++	wire := encode(merged, ds, nil)
++	public, err := merge(wire)
++	require.NoError(t, err)
++	require.Equal(t, wire, public, "merging must preserve the origin graph")
++	return public
++}
++
++func TestUnit_MergeUpdates_InterleavedChainBoundWork(t *testing.T) {
++	for _, v2 := range []bool{false, true} {
++		t.Run(map[bool]string{false: "V1", true: "V2"}[v2], func(t *testing.T) {
++			const people, n = 5, 2000
++			source := New(WithClientID(100001))
++			defer source.Destroy()
++			work := resolverWork{}
++			first, rest := interleavedWorkItems(source, people, n, &work)
++			clients := make(map[ClientID][]*Item)
++			for _, item := range append([]*Item{first}, rest...) {
++				item.Content = &resolverWorkContent{NewContentString("x"), &work}
++				if item != first {
++					item.Parent = nil
++				}
++				clients[item.ID.Client] = append(clients[item.ID.Client], item)
++			}
++			wire := mergeGraphWithWork(t, clients, &work, v2)
++			dst := New(WithClientID(100002))
++			defer dst.Destroy()
++			text := dst.GetText("text")
++			apply := ApplyUpdateV1
++			if v2 {
++				apply = ApplyUpdateV2
++			}
++			require.NoError(t, apply(dst, wire, nil))
++			require.Equal(t, n, text.Len())
++			require.Zero(t, dst.PendingStats().Items)
++			for client := ClientID(1); client <= people; client++ {
++				require.Equal(t, uint64(n/people), dst.StateVector().Clock(client))
++				for _, item := range dst.store.clients[client] {
++					require.Equal(t, text.baseType(), item.Parent)
++				}
++			}
++		})
++	}
++}
++
++func TestUnit_MergeUpdates_OriginCyclesBoundWork(t *testing.T) {
++	for _, v2 := range []bool{false, true} {
++		t.Run(map[bool]string{false: "V1", true: "V2"}[v2], func(t *testing.T) {
++			const n = 3000
++			work := resolverWork{}
++			clients := make(map[ClientID][]*Item)
++			origins := make(map[ClientID]ClientID)
++			add := func(client, origin ClientID) {
++				origins[client] = origin
++				clients[client] = append(clients[client], &Item{ID: ID{Client: client}, Origin: &ID{Client: origin}, Content: &resolverWorkContent{NewContentDeleted(1), &work}})
++			}
++			for c := ClientID(1); c <= n; c++ {
++				add(c, c)
++			}
++			for c := ClientID(n + 1); c <= 2*n; c += 2 {
++				add(c, c+1)
++				add(c+1, c)
++			}
++			const loop = ClientID(4 * n)
++			for c := loop; c < loop+n; c++ {
++				add(c, c+1)
++			}
++			add(loop+n, loop+n/2)
++			wire := mergeGraphWithWork(t, clients, &work, v2)
++			decode := decodeStructsV1
++			if v2 {
++				decode = decodeStructsV2
++			}
++			decoded, _, err := decode(New(), wire)
++			require.NoError(t, err)
++			require.Len(t, decoded, len(origins))
++			for client, items := range clients {
++				require.Len(t, decoded[client], len(items))
++				for i := range items {
++					got := decoded[client][i]
++					require.Equal(t, ID{Client: client}, got.ID)
++					require.Equal(t, &ID{Client: origins[client]}, got.Origin)
++					require.Nil(t, got.Parent, "cycles must remain unrooted")
++					require.Equal(t, uint64(1), got.Content.Len())
++				}
++			}
++		})
++	}
++}
+--- a/crdt/merge_test.go
++++ b/crdt/merge_test.go
+@@ -70,2 +70 @@
+-	gappy := encodeStructStoreV1(map[ClientID][]*Item{1: items}, newDeleteSet(), StateVector{},
+-		&StructStore{clients: map[ClientID][]*Item{1: items}})
++	gappy := encodeStructStoreV1(map[ClientID][]*Item{1: items}, newDeleteSet(), StateVector{})
+@@ -76 +75 @@
+-	per2, _, _, err := buildMergeStore([][]byte{merged}, decodeStructsV1)
++	per2, _, err := buildMergeStore([][]byte{merged}, decodeStructsV1)
+--- a/crdt/parked_deletes_predict_test.go
++++ b/crdt/parked_deletes_predict_test.go
+@@ -92 +92 @@
+-			ds, err := deleteSetOf(&pendingBudget{update: update, v2: format.v2})
++			ds, _, err := deleteSetOf(&pendingBudget{update: update, v2: format.v2})
+@@ -146 +146 @@
+-				ds, err := deleteSetOf(&pendingBudget{update: update, v2: format.v2})
++				ds, _, err := deleteSetOf(&pendingBudget{update: update, v2: format.v2})
+--- a/crdt/parked_deletes_test.go
++++ b/crdt/parked_deletes_test.go
+@@ -563 +563 @@
+-	ds, err := deleteSetOf(&pendingBudget{update: update})
++	ds, _, err := deleteSetOf(&pendingBudget{update: update})
+--- a/crdt/pending_budget_test.go
++++ b/crdt/pending_budget_test.go
+@@ -30 +30 @@
+-	parentUpdate = encode(map[ClientID][]*Item{parentClient: {container}}, newDeleteSet(), nil, doc.store)
++	parentUpdate = encode(map[ClientID][]*Item{parentClient: {container}}, newDeleteSet(), nil)
+@@ -54 +54 @@
+-	return encode(groups, newDeleteSet(), nil, doc.store), parentUpdate
++	return encode(groups, newDeleteSet(), nil), parentUpdate
+@@ -155 +155 @@
+-		data := encode(map[ClientID][]*Item{1: items}, newDeleteSet(), nil, doc.store)
++		data := encode(map[ClientID][]*Item{1: items}, newDeleteSet(), nil)
+@@ -242 +242 @@
+-			update := encode(groups, newDeleteSet(), nil, source.store)
++			update := encode(groups, newDeleteSet(), nil)
+@@ -303 +303 @@
+-			update := encode(groups, newDeleteSet(), nil, source.store)
++			update := encode(groups, newDeleteSet(), nil)
+@@ -434,4 +434,4 @@
+-		return encodeStructStoreV2(groups, newDeleteSet(), nil, doc.store)
+-	}
+-	return encodeStructStoreV1(groups, newDeleteSet(), nil, doc.store)
+-}
++		return encodeStructStoreV2(groups, newDeleteSet(), nil)
++	}
++	return encodeStructStoreV1(groups, newDeleteSet(), nil)
++}
+--- a/crdt/pending_cover_bench_test.go
++++ b/crdt/pending_cover_bench_test.go
+@@ -151 +151 @@
+-		return encodeStructStoreV1(map[ClientID][]*Item{2: {it}}, newDeleteSet(), nil, newStructStore())
++		return encodeStructStoreV1(map[ClientID][]*Item{2: {it}}, newDeleteSet(), nil)
+@@ -190 +190 @@
+-		return encodeStructStoreV1(map[ClientID][]*Item{2: items}, newDeleteSet(), nil, newStructStore())
++		return encodeStructStoreV1(map[ClientID][]*Item{2: items}, newDeleteSet(), nil)
+@@ -238 +238 @@
+-		return encodeStructStoreV1(map[ClientID][]*Item{2: items}, newDeleteSet(), nil, newStructStore())
++		return encodeStructStoreV1(map[ClientID][]*Item{2: items}, newDeleteSet(), nil)
+--- a/crdt/pending_cover_test.go
++++ b/crdt/pending_cover_test.go
+@@ -100 +100 @@
+-		return encodeStructStoreV1(map[ClientID][]*Item{2: {it}}, newDeleteSet(), nil, newStructStore())
++		return encodeStructStoreV1(map[ClientID][]*Item{2: {it}}, newDeleteSet(), nil)
+@@ -274 +274 @@
+-	return encodeStructStoreV1(m, newDeleteSet(), nil, newStructStore())
++	return encodeStructStoreV1(m, newDeleteSet(), nil)
+--- a/crdt/pending_cursor_test.go
++++ b/crdt/pending_cursor_test.go
+@@ -37,3 +37,3 @@
+-		return encodeStructStoreV2(groups, newDeleteSet(), nil, doc.store)
+-	}
+-	return encodeStructStoreV1(groups, newDeleteSet(), nil, doc.store)
++		return encodeStructStoreV2(groups, newDeleteSet(), nil)
++	}
++	return encodeStructStoreV1(groups, newDeleteSet(), nil)
+@@ -269 +269 @@
+-				update := encode(groups, newDeleteSet(), nil, source.store)
++				update := encode(groups, newDeleteSet(), nil)
+@@ -403 +403 @@
+-				encodeItem(enc, item, 0, source.store)
++				encodeItem(enc, item, 0)
+@@ -405 +405 @@
+-				encodeItemV2(v2, item, 0, source.store)
++				encodeItemV2(v2, item, 0)
+--- a/crdt/pending_groups_test.go
++++ b/crdt/pending_groups_test.go
+@@ -57 +57 @@
+-	return encode(groups, newDeleteSet(), nil, doc.store)
++	return encode(groups, newDeleteSet(), nil)
+@@ -147 +147 @@
+-				encodeItem(enc, item, 0, source.store)
++				encodeItem(enc, item, 0)
+@@ -160 +160 @@
+-			encodeItemV2(enc, item, 0, source.store)
++			encodeItemV2(enc, item, 0)
+--- a/crdt/pending_resolver_bench_test.go
++++ b/crdt/pending_resolver_bench_test.go
+@@ -33 +33 @@
+-	return encode(groups, newDeleteSet(), nil, source.store)
++	return encode(groups, newDeleteSet(), nil)
+--- a/crdt/pending_resolver_test.go
++++ b/crdt/pending_resolver_test.go
+@@ -114 +114 @@
+-		data := encode(groups, newDeleteSet(), nil, source.store)
++		data := encode(groups, newDeleteSet(), nil)
+@@ -278,3 +278,3 @@
+-		return encodeStructStoreV2(groups, newDeleteSet(), nil, source.store)
+-	}
+-	return encodeStructStoreV1(groups, newDeleteSet(), nil, source.store)
++		return encodeStructStoreV2(groups, newDeleteSet(), nil)
++	}
++	return encodeStructStoreV1(groups, newDeleteSet(), nil)
+--- a/crdt/pending_resolver_work_test.go
++++ b/crdt/pending_resolver_work_test.go
+@@ -273,4 +273,3 @@
+-	// Combined observer and durable replay bookkeeping fits in 32 words.
+-	require.LessOrEqual(t, unsafe.Sizeof(Transaction{}), 32*word)
+-	require.Equal(t, 10*word, unsafe.Sizeof(StructStore{}))
+-}
++	require.Equal(t, 31*word, unsafe.Sizeof(Transaction{}))
++	require.Equal(t, 13*word, unsafe.Sizeof(StructStore{}))
++}
+--- a/crdt/persist_update_test.go
++++ b/crdt/persist_update_test.go
+@@ -11 +11 @@
+-func TestUnit_Doc_OnPersistUpdate(t *testing.T) {
++func TestUnit_Doc_UpdateLog_ParkedReplayAndClose(t *testing.T) {
+@@ -25 +24,0 @@
+-	var stored [][]byte
+@@ -28,4 +27,2 @@
+-	unsubscribe := room.OnPersistUpdate(func(update []byte, got any) {
+-		require.Same(t, origin, got)
+-		stored = append(stored, append([]byte(nil), update...))
+-	})
++	log := room.OpenUpdateLog()
++	defer log.Close()
+@@ -35 +32,5 @@
+-	require.Len(t, stored, 1)
++	base, records := log.Drain()
++	require.NotNil(t, base)
++	require.Len(t, records, 1)
++	require.Same(t, origin, records[0].Origin)
++	require.NotNil(t, records[0].Parked)
+@@ -39 +40,2 @@
+-	require.Len(t, stored, 1, "re-sending parked state must not persist it again")
++	_, duplicate := log.Drain()
++	require.Empty(t, duplicate, "re-sending parked state must not log it again")
+@@ -42 +44,5 @@
+-	require.NoError(t, crdt.ApplyUpdateV1(replay, stored[0], nil))
++	require.NoError(t, crdt.ApplyUpdateV1(replay, base, nil))
++	for _, record := range records {
++		require.NoError(t, crdt.ApplyUpdateV1(replay, record.Update, nil))
++		require.NoError(t, crdt.ApplyUpdateV1(replay, record.Parked, nil))
++	}
+@@ -52 +58 @@
+-	unsubscribe()
++	log.Close()
+@@ -54 +60,4 @@
+-	require.Len(t, stored, 1, "unsubscribing detaches the persistence observer")
++	_, closed := log.Drain()
++	require.Empty(t, closed, "closing detaches the update log")
++	require.Equal(t, 1, updates, "integrating the dependency still emits OnUpdate")
++	require.Zero(t, room.PendingStats().Items)
+--- a/crdt/struct_walk_test.go
++++ b/crdt/struct_walk_test.go
+@@ -117 +117 @@
+-				wantDS, err = decodeDeleteSetV2(full.v2)
++				wantDS, _, err = decodeDeleteSetV2(full.v2)
+@@ -119 +119 @@
+-				wantDS, err = decodeDeleteSet(full.rest)
++				wantDS, _, err = decodeDeleteSet(full.rest)
+@@ -126 +126 @@
+-			gotDS, err := deleteSetOf(&b)
++			gotDS, _, err := deleteSetOf(&b)
+--- a/crdt/subdoc_test.go
++++ b/crdt/subdoc_test.go
+@@ -206,2 +206,8 @@
+-	if cp.Doc == orig || cp.Doc.GUID() != "g" || !cp.Doc.AutoLoad() || cp.Doc.CollectionID() != "cid" {
+-		t.Fatalf("Copy must clone opts into a fresh Doc; got %+v", cp.Doc)
++	if cp.Doc == orig || cp.Doc.GUID() != "g" || !cp.Doc.AutoLoad() || cp.Doc.CollectionID() != "" {
++		t.Fatalf("Copy must clone Yjs opts into a fresh Doc; got %+v", cp.Doc)
++	}
++	// Yjs createDocFromOpts takes the copy's shouldLoad from autoLoad, not
++	// from the original's load state.
++	loaded := New(WithGUID("h"), WithAutoLoad(false), WithShouldLoad(true))
++	if (&ContentDoc{loaded}).Copy().(*ContentDoc).Doc.ShouldLoad() {
++		t.Fatal("a copy must start with ShouldLoad() equal to AutoLoad()")
+@@ -232 +238,2 @@
+-	if len(subs) != 1 || subs[0].GUID() != "c" || !subs[0].AutoLoad() || subs[0].CollectionID() != "cid" || !subs[0].ShouldLoad() {
++	// Yjs ContentDoc opts carry no collection ID, so it stays local.
++	if len(subs) != 1 || subs[0].GUID() != "c" || !subs[0].AutoLoad() || subs[0].CollectionID() != "" || !subs[0].ShouldLoad() {
+@@ -394,0 +402,23 @@
++
++func TestSubdocs_InheritParentCollectionID(t *testing.T) {
++	parent := New(WithCollectionID("ws"))
++	plain, own := New(WithGUID("plain")), New(WithGUID("own"), WithCollectionID("mine"))
++	embedSubdoc(t, parent, "plain", plain)
++	embedSubdoc(t, parent, "own", own)
++	if plain.CollectionID() != "ws" || own.CollectionID() != "mine" {
++		t.Fatalf("local collection IDs: plain=%q own=%q", plain.CollectionID(), own.CollectionID())
++	}
++	remote := New(WithCollectionID("ws2"))
++	if err := ApplyUpdateV1(remote, EncodeStateAsUpdateV1(parent, nil), nil); err != nil {
++		t.Fatal(err)
++	}
++	subs := remote.GetSubdocs()
++	if len(subs) != 2 {
++		t.Fatalf("got %d subdocuments", len(subs))
++	}
++	for _, sd := range subs {
++		if sd.CollectionID() != "ws2" {
++			t.Errorf("received %s has collection ID %q, want the receiver's", sd.GUID(), sd.CollectionID())
++		}
++	}
++}
+--- a/crdt/truncated_reason_test.go
++++ b/crdt/truncated_reason_test.go
+@@ -163 +163 @@
+-			if err := f.apply(New(WithMaxPendingItems(1)), f.update, nil); u.pastCap && (err == nil || err.Error() != ErrInvalidUpdate.Error()) {
++			if err := f.apply(New(WithMaxPendingItems(1)), f.update, nil); u.pastCap && (!errors.Is(err, ErrPendingCap) || !errors.Is(err, ErrInvalidUpdate)) {
+@@ -230 +230 @@
+-			encodeItem(enc, it, 0, doc.store)
++			encodeItem(enc, it, 0)
+@@ -244 +244 @@
+-		encodeItemV2(e2, it, 0, doc.store)
++		encodeItemV2(e2, it, 0)
+@@ -338 +338 @@
+-		if err := f.apply(target(room), f.update, nil); err == nil || err.Error() != ErrInvalidUpdate.Error() {
++		if err := f.apply(target(room), f.update, nil); !errors.Is(err, ErrPendingCap) || !errors.Is(err, ErrInvalidUpdate) {
+@@ -398,2 +398,2 @@
+-	return encodeStructStoreV1(map[ClientID][]*Item{5: items}, newDeleteSet(), nil, src.store)
+-}
++	return encodeStructStoreV1(map[ClientID][]*Item{5: items}, newDeleteSet(), nil)
++}
+--- a/crdt/update_groups_test.go
++++ b/crdt/update_groups_test.go
+@@ -106 +106 @@
+-			encodeItem(enc, it, 0, src.store)
++			encodeItem(enc, it, 0)
+@@ -111 +111 @@
+-		encodeItem(enc, items[0], 0, src.store)
++		encodeItem(enc, items[0], 0)
+@@ -129 +129 @@
+-		encodeItemV2(e2, it, 0, src.store)
++		encodeItemV2(e2, it, 0)
+@@ -134 +134 @@
+-	encodeItemV2(e2, items[0], 0, src.store)
++	encodeItemV2(e2, items[0], 0)
+--- a/persistence/adapter_test.go
++++ b/persistence/adapter_test.go
+@@ -272,3 +272,4 @@
+-func drainWS(t *testing.T, conn *gws.Conn, doc *crdt.Doc) {
+-	t.Helper()
+-	for i := 0; i < 3; i++ {
++func drainWS(t testing.TB, conn *gws.Conn, doc *crdt.Doc) {
++	t.Helper()
++	require.NoError(t, conn.WriteMessage(gws.BinaryMessage, syncStep1Frame(doc)))
++	for {
+@@ -282,2 +283,7 @@
+-		if outer == 0 { // msgSync
+-			_, _ = ygsync.ApplySyncMessage(doc, dec.RemainingBytes(), nil)
++		if outer != 0 { // msgSync
++			continue
++		}
++		payload := dec.RemainingBytes()
++		_, _ = ygsync.ApplySyncMessage(doc, payload, nil)
++		if sub, _, err := ygsync.ReadSyncMessage(payload); err == nil && sub == ygsync.MsgSyncStep2 {
++			return
+@@ -297,0 +304,8 @@
++
++
++func syncStep1Frame(doc *crdt.Doc) []byte {
++	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
++		enc.WriteVarUint(0) // msgSync
++		enc.WriteRaw(ygsync.EncodeSyncStep1(doc))
++	})
++}
+--- a/provider/websocket/conn_awareness_cap_test.go
++++ b/provider/websocket/conn_awareness_cap_test.go
+@@ -3,0 +4 @@
++ "github.com/reearth/ygo/crdt"
+@@ -644,6 +645 @@
+-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+-	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+-	for i := 0; i < 3; i++ {
+-		_, _, err := conn.ReadMessage()
+-		require.NoError(t, err)
+-	}
++	require.NoError(t, drainConnErr(conn, crdt.New()))
+--- a/provider/websocket/export_test.go
++++ b/provider/websocket/export_test.go
+@@ -26 +26 @@
+-func StrandedWritesInFlight(s *Server) int64 { return s.strandedInFlight.Load() }
++func StrandedWritesInFlight(s *Server) int64 { return s.stranded.n.Load() }
+--- a/provider/websocket/idle_test.go
++++ b/provider/websocket/idle_test.go
+@@ -79,2 +79,5 @@
+-	for i := 0; i < 3; i++ {
+-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
++	if err := conn.WriteMessage(gws.BinaryMessage, syncStep1Frame(doc)); err != nil {
++		return fmt.Errorf("send sync step 1: %w", err)
++	}
++	for i := 0; ; i++ {
++		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+@@ -91,7 +94,11 @@
+-		if outer == msgSync {
+-			if _, err := ygsync.ApplySyncMessage(doc, dec.RemainingBytes(), nil); err != nil {
+-				return fmt.Errorf("apply sync frame: %w", err)
+-			}
+-		}
+-	}
+-	return nil
++		if outer != msgSync {
++			continue
++		}
++		payload := dec.RemainingBytes()
++		if _, err := ygsync.ApplySyncMessage(doc, payload, nil); err != nil {
++			return fmt.Errorf("apply sync frame: %w", err)
++		}
++		if sub, _, err := ygsync.ReadSyncMessage(payload); err == nil && sub == ygsync.MsgSyncStep2 {
++			return nil
++		}
++	}
+--- a/provider/websocket/persistence_autoversion_test.go
++++ b/provider/websocket/persistence_autoversion_test.go
+@@ -140 +140,3 @@
+-	// Unload the room.
++	// Unload the room after the release getOrCreateRoom's caller owes, since
++	// CloseRoom refuses a room a caller is inside.
++	s.releaseInflight(r)
+@@ -161,0 +164 @@
++	s.releaseInflight(r) // balance getOrCreateRoom; see TestAutoVersion_FinalVersionOnUnloadWhenDirty
+@@ -179,0 +183 @@
++	s.releaseInflight(r) // balance getOrCreateRoom; see TestAutoVersion_FinalVersionOnUnloadWhenDirty
+@@ -199,2 +203,3 @@
+-	require.NoError(t, s.CloseRoom("doc1", true))
+-}
++	s.releaseInflight(r) // balance getOrCreateRoom; see TestAutoVersion_FinalVersionOnUnloadWhenDirty
++	require.NoError(t, s.CloseRoom("doc1", true))
++}
+--- a/provider/websocket/persistence_coalesce_test.go
++++ b/provider/websocket/persistence_coalesce_test.go
+@@ -499,14 +499 @@
+-	for i := 0; i < 3; i++ {
+-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+-		_, data, err := conn.ReadMessage()
+-		_ = conn.SetReadDeadline(time.Time{})
+-		require.NoError(t, err)
+-		dec := encoding.NewDecoder(data)
+-		outer, err := dec.ReadVarUint()
+-		require.NoError(t, err)
+-		if outer == msgSync {
+-			if _, err := ygsync.ApplySyncMessage(doc, dec.RemainingBytes(), nil); err != nil {
+-				t.Fatalf("apply sync frame: %v", err)
+-			}
+-		}
+-	}
++	require.NoError(t, drainConnErr(conn, doc))
+@@ -765,0 +753,8 @@
++
++
++func syncStep1Frame(doc *crdt.Doc) []byte {
++	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
++		enc.WriteVarUint(msgSync)
++		enc.WriteRaw(ygsync.EncodeSyncStep1(doc))
++	})
++}
+--- a/provider/websocket/server_internal_test.go
++++ b/provider/websocket/server_internal_test.go
+@@ -193,0 +194,2 @@
++	// Release the count getOrCreateRoom took, since CloseRoom refuses a room a caller is inside.
++	s.releaseInflight(rm)
+--- a/provider/websocket/server_test.go
++++ b/provider/websocket/server_test.go
+@@ -131 +131,2 @@
+-	for i := 0; i < 3; i++ {
++	sendSync(t, conn, ygsync.EncodeSyncStep1(doc))
++	for {
+@@ -133,2 +134,6 @@
+-		if outerType == 0 { // msgSync
+-			_, _ = ygsync.ApplySyncMessage(doc, payload, nil)
++		if outerType != 0 { // msgSync
++			continue
++		}
++		_, _ = ygsync.ApplySyncMessage(doc, payload, nil)
++		if sub, _, err := ygsync.ReadSyncMessage(payload); err == nil && sub == ygsync.MsgSyncStep2 {
++			return
+@@ -166 +171 @@
+-func TestUnit_ServerHandshake_SendsStep1AndStep2ThenAwareness(t *testing.T) {
++func TestUnit_ServerHandshake_AnswersStep1WithoutEmptyAwareness(t *testing.T) {
+@@ -169 +173,0 @@
+-
+@@ -171,2 +174,0 @@
+-
+-	// Message 1: msgSync + step-1
+@@ -174,7 +176,7 @@
+-	assert.Equal(t, uint64(0), outerType, "first msg should be msgSync")
+-	dec := encoding.NewDecoder(payload)
+-	syncType, err := dec.ReadVarUint()
+-	require.NoError(t, err)
+-	assert.Equal(t, uint64(ygsync.MsgSyncStep1), syncType)
+-
+-	// Message 2: msgSync + step-2
++	require.Equal(t, uint64(0), outerType)
++	syncType, _, err := ygsync.ReadSyncMessage(payload)
++	require.NoError(t, err)
++	require.Equal(t, ygsync.MsgSyncStep1, syncType)
++
++	doc := crdt.New()
++	sendSync(t, conn, ygsync.EncodeSyncStep1(doc))
+@@ -182,9 +184,13 @@
+-	assert.Equal(t, uint64(0), outerType, "second msg should be msgSync")
+-	dec = encoding.NewDecoder(payload)
+-	syncType, err = dec.ReadVarUint()
+-	require.NoError(t, err)
+-	assert.Equal(t, uint64(ygsync.MsgSyncStep2), syncType)
+-
+-	// Message 3: msgAwareness
+-	outerType, _ = readOne(t, conn, 2*time.Second)
+-	assert.Equal(t, uint64(1), outerType, "third msg should be msgAwareness")
++	require.Equal(t, uint64(0), outerType)
++	syncType, _, err = ygsync.ReadSyncMessage(payload)
++	require.NoError(t, err)
++	require.Equal(t, ygsync.MsgSyncStep2, syncType)
++	_, err = ygsync.ApplySyncMessage(doc, payload, nil)
++	require.NoError(t, err)
++	require.Empty(t, doc.StateVector())
++	// An empty room sends no awareness frame and answers this request once.
++	require.NoError(t, conn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
++	_, _, err = conn.ReadMessage()
++	var timeout net.Error
++	require.ErrorAs(t, err, &timeout)
++	require.True(t, timeout.Timeout(), "no unsolicited state or empty awareness follows the answer")
+@@ -400 +406 @@
+-	//   2. Both peers drain their 3-message handshake.
++	//   2. Both peers drain their handshake.
+@@ -425,7 +431 @@
+-	_ = fastConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+-	for i := 0; i < 3; i++ {
+-		if _, _, e := fastConn.ReadMessage(); e != nil {
+-			break
+-		}
+-	}
+-	_ = fastConn.SetReadDeadline(time.Time{})
++	drainHandshake(t, fastConn, fastDoc)
+@@ -447,8 +447,3 @@
+-	// Drain slow peer's 3-message handshake to free up writeCh capacity.
+-	_ = slowConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+-	for i := 0; i < 3; i++ {
+-		if _, _, e := slowConn.ReadMessage(); e != nil {
+-			break
+-		}
+-	}
+-	_ = slowConn.SetReadDeadline(time.Time{}) // stop reading — writes to slow peer now block
++	// Drain slow peer's handshake to free up writeCh capacity, then stop
++	// reading — writes to slow peer now block.
++	drainHandshake(t, slowConn, crdt.New())
+@@ -519,7 +514 @@
+-	_ = fastConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+-	for i := 0; i < 3; i++ {
+-		if _, _, e := fastConn.ReadMessage(); e != nil {
+-			break
+-		}
+-	}
+-	_ = fastConn.SetReadDeadline(time.Time{})
++	drainHandshake(t, fastConn, fastDoc)
+@@ -534,2 +523,2 @@
+-	// Slow peer: connects, drains its 3-message handshake, then stops reading so
+-	// the server-side write queue overflows.
++	// Slow peer: connects, drains its handshake, then stops reading so the
++	// server-side write queue overflows.
+@@ -540,10 +529 @@
+-	_ = slowConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+-	for i := 0; i < 3; i++ {
+-		if _, data, e := slowConn.ReadMessage(); e == nil {
+-			dec := encoding.NewDecoder(data)
+-			if ot, e2 := dec.ReadVarUint(); e2 == nil && ot == 0 {
+-				_, _ = ygsync.ApplySyncMessage(slowDoc, dec.RemainingBytes(), nil)
+-			}
+-		}
+-	}
+-	_ = slowConn.SetReadDeadline(time.Time{}) // stop reading — writes now overflow
++	drainHandshake(t, slowConn, slowDoc)
+@@ -788,7 +768,6 @@
+-	// Drain the three server-initiated handshake messages (step1, step2, awareness)
+-	// so they don't interfere with the idle-connection detection.
+-	for i := 0; i < 3; i++ {
+-		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+-		_, _, err := c.ReadMessage()
+-		require.NoError(t, err, "handshake message %d should arrive cleanly", i+1)
+-	}
++	// Drain the one server-initiated handshake message (step1; an empty room
++	// has no awareness) so it does not interfere with the idle-connection
++	// detection.
++	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
++	_, _, err = c.ReadMessage()
++	require.NoError(t, err, "the handshake message should arrive cleanly")
+--- a/provider/websocket/sync_status_test.go
++++ b/provider/websocket/sync_status_test.go
+@@ -86 +86,2 @@
+-	for range 3 {
++	hpSend(t, conn, room, tagSync, ygsync.EncodeSyncStep1(doc))
++	for {
+@@ -89,2 +90,6 @@
+-		if tag == tagSync {
+-			_, _ = ygsync.ApplySyncMessage(doc, body, nil)
++		if tag != tagSync {
++			continue
++		}
++		_, _ = ygsync.ApplySyncMessage(doc, body, nil)
++		if sub, _, err := ygsync.ReadSyncMessage(body); err == nil && sub == ygsync.MsgSyncStep2 {
++			return
