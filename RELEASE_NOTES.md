@@ -1,3 +1,60 @@
+## v1.55.1-sami.20
+
+This release adds one opt-in option of the WebSocket server, an optional
+persistence interface it reads, and two methods that act on one peer: one
+closes it, the other asks it for its state again. There are no wire format
+changes, and a server that does not set the option behaves exactly as before.
+
+### An edit is answered applied once it is stored
+
+Until now a peer was answered `SyncStatus(1)` as soon as the room applied its
+update, before the room's persistence worker had stored it. A client that
+keeps an edit until it is answered applied then dropped it, and when the store
+failed, or the server stopped first, the edit was in no stored copy of the
+room and in no client that would send it again.
+
+`Server.AnswerOnceStored`, on a server with persistence, holds that answer
+until the room's persistence has stored the commit the update made, and
+answers 0 when it was not stored: the adapter call that took it returned an
+error or panicked, or an adapter that implements the new
+`PersistenceAdapterStored` says it did not store it. The client keeps the edit
+and sends it again. Only the answer waits: the update is relayed to the
+room's other peers as soon as the room applies it, as without the option. A
+frame whose apply changed nothing is answered as soon as every answer before
+it is, so each peer's answers still go out in the order its frames arrived,
+and the answers to the frames one coalesced write stores
+(`PersistCoalesceWindow`) wait for that write. On a server without
+persistence nothing stores an update, and the option changes nothing.
+
+`PersistenceAdapterStored.StoreUpdateStored` is `StoreUpdateContext` that
+also says whether the update is stored once the call returns, for an adapter
+that can return nil for an update it dropped (one of a room it has given up
+on, say). Under `AnswerOnceStored` the worker calls it in place of
+`StoreUpdateContext` and `StoreUpdate`; without the option it is never called.
+
+### Closing one peer, and asking one for its state again
+
+`Server.ClosePeer(origin, code, reason)` closes the peer whose updates carry
+`origin` as their transaction origin, the `PeerUpdateInfo.Origin` an
+`OnPeerUpdate` hook is handed, from any goroutine, and reports whether it was
+an open peer of the server. A code `ServeHTTP` would not send closes with 4205
+"Reset Connection", as a hook's refusal does, and nothing the peer sends from
+then on lands. Under `AnswerOnceStored` the close goes out after the answers
+the peer is owed for the frames it sent before the call, so the client reads
+those answers first.
+
+`Server.ResyncPeer(origin)` sends that peer the room's `SyncStep1`, the room's
+state vector, and reports whether it was an open peer of the server. Its
+provider answers with a `SyncStep2` carrying what it holds and the room
+lacks, which the room applies and answers as any other update. So a server
+that answered a frame not applied because part of it parked
+(`AnswerParkedNotApplied`), and later sees the room land that part, can have
+the client send its state again and be answered applied. It is safe from any
+goroutine, with the room's document locked too: the state vector is read on a
+goroutine of its own once the document's lock is free. Under
+`AnswerOnceStored` the `SyncStep1` goes out after the answers the peer is owed
+for the frames it sent before the call.
+
 ## v1.55.1-sami.19
 
 This release adds two opt-in options of the WebSocket server and the apply
