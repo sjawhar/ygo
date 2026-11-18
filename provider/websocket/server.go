@@ -662,6 +662,10 @@ type room struct {
 	doc       *crdt.Doc
 	awareness *awareness.Awareness
 	peers     map[*peer]struct{}
+	// storeWaiters holds, under Server.AnswerOnceStored, the peer answer
+	// each committed update waits on, by the update's first byte
+	// (armStoreWait, noteStored).
+	storeWaiters sync.Map
 
 	// ready is closed exactly once, by the goroutine that created the room, when
 	// the off-lock load (LoadDoc + decode + OnLoadDocument) has finished — whether
@@ -1026,6 +1030,24 @@ type Server struct {
 	// sent. It is off by default: the room answers 1 for every update it
 	// applied, parked content included, as @hocuspocus/server does.
 	AnswerParkedNotApplied bool
+
+	// AnswerOnceStored, when true on a server with persistence, holds the
+	// SyncStatus a peer is answered for an update until the room's
+	// persistence has stored the commit that update made, and answers 0 when
+	// it was not stored: the adapter call that took it failed, or a
+	// PersistenceAdapterStored adapter says it dropped it. So a client that
+	// keeps an edit until it is answered applied keeps it until it is stored,
+	// and sends it again after a store that failed. Only the answer waits:
+	// the update is relayed to the room's other peers as soon as it
+	// integrates, as without the option, and an update whose apply changed
+	// nothing is answered as soon as every answer before it is. Each peer's
+	// answers still go out in the order its frames arrived, and the close of
+	// a peer whose update the OnPeerUpdate hook refused, or that ClosePeer
+	// closes, goes out after the answers before it. The answer to a coalesced
+	// write (PersistCoalesceWindow) waits for the write that stores its batch.
+	// It is off by default: a peer is answered as soon as the room applies
+	// its update.
+	AnswerOnceStored bool
 
 	// OnStateAnswer, if non-nil, runs immediately before the room answers a
 	// peer's SyncStep1 with the room's whole state, and its release runs
@@ -2015,7 +2037,10 @@ func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 		r.persistRetire = make(chan struct{})
 		r.flushReq = make(chan chan bool)
 		s.startPersistenceWorker(r, name)
-		r.doc.OnUpdate(func(update []byte, _ any) {
+		r.doc.OnUpdate(func(update []byte, origin any) {
+			// A peer's commit is the update its answer waits on
+			// (AnswerOnceStored), from before the worker can store it.
+			s.armStoreWait(r, update, origin)
 			// #229 — handing the update to persistCh is only safe while the
 			// worker is still reading it. The worker publishes its retirement
 			// by closing persistRetire BEFORE its final drain, which gives this

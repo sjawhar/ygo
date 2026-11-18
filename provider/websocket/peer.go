@@ -52,6 +52,12 @@ type peer struct {
 	// ctx is the request context ServeHTTP served this connection on, which
 	// Server.OnTokenAuthContext receives.
 	ctx context.Context
+	// answers is what the peer is owed under Server.AnswerOnceStored, in the
+	// order its frames arrived, and storeWait is the store wait of the apply
+	// in hand, which the room's persistence observer takes for that apply's
+	// commit (armStoreWait).
+	answers   peerAnswers
+	storeWait *storeWait
 
 	// disconnectOnce runs handleDisconnect's teardown once when callers race,
 	// such as closeConn() waking the read loop during a ctx-cancel teardown.
@@ -266,6 +272,12 @@ func (p *peer) handleMessage(data []byte) {
 // Server.AnswerParkedNotApplied, an applied update the room left part of
 // parked is answered 0 too (crdt.ApplyOutcome.Parked). A sync message whose
 // own framing does not decode never reaches here: see discardMalformedSync.
+//
+// Under Server.AnswerOnceStored the answer to a frame whose apply changed the
+// room waits until the room's persistence has stored that commit, and is 0
+// when it was not stored; the relay does not wait. The answers still go out
+// in the order the frames arrived, and the close of a peer whose update the
+// hook refused goes out after them (resolveAnswer).
 func (p *peer) applySyncUpdate(subType int, update, payload []byte) {
 	if p.readOnly {
 		if p.hocuspocusFraming {
@@ -273,23 +285,42 @@ func (p *peer) applySyncUpdate(subType int, update, payload []byte) {
 		}
 		return
 	}
+	var answer *peerAnswer
+	if p.server.answersOnceStored() {
+		answer = p.reserveAnswer()
+		p.storeWait = &storeWait{}
+	}
 	applied, out, closeWith := p.applyPeerUpdate(update)
-	if !applied {
-		p.sendSyncStatus(false)
+	wait := p.storeWait
+	p.storeWait = nil
+	if applied {
+		switch {
+		case p.server.RelayIntegratedOnly:
+			if out.Integrated != nil {
+				p.broadcastSync(ygsync.EncodeUpdate(out.Integrated))
+			}
+		case !out.Held:
+			p.broadcastSync(payload)
+		}
+	}
+	ok := applied && !(p.server.AnswerParkedNotApplied && out.Parked)
+	if answer == nil {
+		p.sendSyncStatus(ok)
 		if closeWith != nil {
 			p.enqueueClose(closeWith.Code, closeWith.Reason)
 		}
 		return
 	}
-	switch {
-	case p.server.RelayIntegratedOnly:
-		if out.Integrated != nil {
-			p.broadcastSync(ygsync.EncodeUpdate(out.Integrated))
-		}
-	case !out.Held:
-		p.broadcastSync(payload)
+	if closeWith != nil {
+		// Nothing more from the connection lands, though the close itself
+		// waits for the answers before it.
+		p.inputClosed.Store(true)
 	}
-	p.sendSyncStatus(!(p.server.AnswerParkedNotApplied && out.Parked))
+	if wait.taken {
+		wait.whenStored(func(stored bool) { p.resolveAnswer(answer, ok && stored, closeWith) })
+		return
+	}
+	p.resolveAnswer(answer, ok, closeWith)
 }
 
 // applyToRoom applies update to the room's document and reports what the
