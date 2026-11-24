@@ -1,3 +1,33 @@
+## v1.55.1-sami.2.1
+
+This fork release retains the complete
+[v1.55.1-sami.2 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2)
+and adds two opt-in `provider/websocket` server options. There are no wire
+format changes, and a server that sets neither behaves exactly as before.
+
+### A configurable peer write deadline
+
+`Server.PeerWriteTimeout` sets the deadline on one WebSocket write to a peer,
+in the shape of the existing `PeerWriteQueueBytes`. Left unset it keeps the
+existing 10-second default, so no deployment's behaviour changes. An embedder
+that enforces its own slow-peer bound can set a shorter deadline, so a reader
+draining a backlog that is within that bound is not dropped by the package
+constant before the embedder's own policy can act. This is the field
+v1.55.1-sami.10 adds, with the same name, type and default, so moving to that
+release later keeps the setting as it is.
+
+### A configurable close-frame deadline
+
+`Server.CloseFrameTimeout` sets the deadline on the close frame `ServeHTTP`
+sends when the request context is cancelled with a cause that names a close
+code. Left unset it keeps the existing 1-second default, so no deployment's
+behaviour changes. The frame waits behind any write already in progress to
+the peer; a frame that has not gone by the deadline is abandoned, and the peer
+sees the connection close as 1006 rather than the code. An embedder that
+revokes sessions of peers that may still be taking a large frame on a slow
+link can set a longer deadline so the code reaches them. The connection stays
+open, with the peer's input dropped, while the frame waits.
+
 ## v1.55.1-sami.2
 
 This fork release retains the complete
