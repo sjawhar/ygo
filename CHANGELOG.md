@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.2.1] — 2026-11-24
+
+Fork release on [1.55.1-sami.2](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2),
+adding two opt-in `provider/websocket` server options. No wire format changes,
+and a server that sets neither behaves exactly as before.
+
+### Added
+
+- **`provider/websocket` `Server.PeerWriteTimeout`** — the deadline on one
+  write to a peer, in the shape of `PeerWriteQueueBytes`. Unset keeps the
+  existing 10-second default, so no deployment's behaviour moves; an embedder
+  with its own slow-peer bound can set a shorter one so a reader draining a
+  backlog inside that bound is not dropped by the package default. The field
+  is the one 1.55.1-sami.10 adds, with the same name, type and default.
+- **`provider/websocket` `Server.CloseFrameTimeout`** — the deadline on the
+  close frame sent when a request context is cancelled with a cause that
+  names a close code. Unset keeps the existing 1-second default. A frame that
+  has not gone by the deadline is abandoned and the peer sees 1006 instead of
+  the code; an embedder whose peers may still be taking a large frame when
+  their session is revoked can set a longer one so the code reaches them.
+
 ## [1.55.1-sami.2] — 2026-11-04
 
 Fork release on upstream main 510c2cf5, retaining the complete
