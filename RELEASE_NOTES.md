@@ -1,3 +1,23 @@
+## v1.55.1-sami.11
+
+This fork release retains the complete
+[v1.55.1-sami.10 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.10)
+and adds one opt-in `provider/websocket` server option. There are no wire
+format changes, and a server that does not set it behaves exactly as before.
+
+### A configurable close-frame deadline
+
+`Server.CloseFrameTimeout` sets the deadline on the close frame `ServeHTTP`
+sends when the request context is cancelled with a cause that names a close
+code, as `PeerWriteTimeout` sets the deadline on every other write. Left unset
+it keeps the existing 1-second default, so no deployment's behaviour changes.
+The frame waits behind any write already in progress to the peer; a frame that
+has not gone by the deadline is abandoned, and the peer sees the connection
+close as 1006 rather than the code. An embedder that revokes sessions of peers
+that may still be taking a large frame on a slow link can set a longer
+deadline so the code reaches them. The connection stays open, with the peer's
+input dropped, while the frame waits.
+
 ## v1.55.1-sami.10
 
 This fork release retains the complete

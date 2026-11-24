@@ -82,6 +82,11 @@ func MemoryPersistenceBackoffState(m *MemoryPersistence, room string) (failures 
 // teardown bounds it against the number the server uses, not a copy of it.
 const DefaultPeerWriteTimeout = defaultPeerWriteTimeout
 
+// DefaultCloseFrameTimeout is the deadline on the close frame sent for a
+// cancel cause when Server.CloseFrameTimeout is unset. Test-only, for the
+// same reason as DefaultPeerWriteTimeout.
+const DefaultCloseFrameTimeout = defaultCloseFrameTimeout
+
 // StateFrameBytes is the cap on each frame a peer's SyncStep1 is answered
 // with. Test-only: a test asserting the cap must assert against the one the
 // server uses, not a copy of the number.

@@ -53,9 +53,10 @@ func (s *Server) safeHook(name string, fn func()) {
 // broadcast loop for every other peer.
 const defaultPeerWriteTimeout = 10 * time.Second
 
-// closeFrameTimeout bounds the close frame sent for a cancel cause. A peer that
-// cannot take a control frame this quickly is not reading anyway.
-const closeFrameTimeout = time.Second
+// defaultCloseFrameTimeout is the deadline on the close frame sent for a
+// cancel cause when Server.CloseFrameTimeout is not set. A peer that cannot
+// take a control frame this quickly is not reading anyway.
+const defaultCloseFrameTimeout = time.Second
 
 // maxCloseReasonBytes is the largest reason a close frame can carry: a control
 // frame payload is at most 125 bytes, two of them the code.
@@ -189,6 +190,14 @@ func (s *Server) peerWriteTimeout() time.Duration {
 		return s.PeerWriteTimeout
 	}
 	return defaultPeerWriteTimeout
+}
+
+// closeFrameTimeout returns the configured close-frame deadline or the default.
+func (s *Server) closeFrameTimeout() time.Duration {
+	if s.CloseFrameTimeout > 0 {
+		return s.CloseFrameTimeout
+	}
+	return defaultCloseFrameTimeout
 }
 
 // SlowPeerPolicy selects how the server reacts when a peer's broadcast write
@@ -1175,6 +1184,27 @@ type Server struct {
 	// without synchronisation, on each write, and must not be mutated
 	// while the server is handling connections.
 	PeerWriteTimeout time.Duration
+
+	// CloseFrameTimeout is the deadline on the close frame ServeHTTP sends
+	// when the request context is cancelled with a cause that names a close
+	// code. The frame waits behind any write already in progress to the
+	// peer. A frame that has not gone by the deadline is abandoned and the
+	// connection closes without it, which the reader sees as 1006 instead
+	// of the code the cause named. Zero (the default) uses 1 s, the
+	// deadline this server used before the field existed.
+	//
+	// It is a field because how long a cancelled peer may take to be told
+	// why is the embedder's to say: a reader on a slow link that is still
+	// taking a large frame when its session is revoked can need longer
+	// than 1 s before the close frame behind that frame can go, and is
+	// closed with no code to say why. The connection stays open while the
+	// frame waits, with the peer's input dropped, so a longer deadline
+	// keeps a cancelled peer's connection open that much longer.
+	//
+	// Like the other config fields, set it before serving; it is read
+	// without synchronisation, on each cancel, and must not be mutated
+	// while the server is handling connections.
+	CloseFrameTimeout time.Duration
 
 	// SlowPeerPolicy selects the reaction when a peer's broadcast write queue
 	// overflows: SlowPeerDisconnect (default) closes the connection; SlowPeerResync
@@ -2282,7 +2312,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// wait on a writer stuck on a peer that has stopped reading.
 			if frame := closeFrameFor(context.Cause(ctx)); frame != nil {
 				p.inputClosed.Store(true)
-				_ = ws.WriteControl(gws.CloseMessage, frame, time.Now().Add(closeFrameTimeout))
+				_ = ws.WriteControl(gws.CloseMessage, frame, time.Now().Add(s.closeFrameTimeout()))
 			}
 			p.closeConn()
 		case <-s.shutdownCh:
