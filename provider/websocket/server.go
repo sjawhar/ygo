@@ -722,6 +722,20 @@ type room struct {
 	// room, so the fallback must provide that serialisation itself.
 	persistFallbackMu sync.Mutex
 
+	// persistMu guards persistOverflow and persistDrained. persistOverflow
+	// holds, in the order they were committed, the updates the doc.OnUpdate
+	// observer could not hand to persistCh without waiting - the buffer was
+	// full, earlier updates already waited ahead of them, or the worker had
+	// retired - and a feeder goroutine (feedPersistence) hands them on.
+	// persistDrained is non-nil while that feeder runs and closed when it ends:
+	// a peer's read loop waits on it before it applies its next update
+	// (awaitPersistence), so storage lag still slows a fast peer, while a
+	// committer - a Server.Apply caller, or the consumer's own code inside a
+	// peer's apply - is never held by the worker.
+	persistMu       sync.Mutex
+	persistOverflow [][]byte
+	persistDrained  chan struct{}
+
 	// flushReq requests an on-demand durable flush of the pending batch without
 	// stopping the worker. The worker drains persistCh, flushes with a
 	// background ctx, and reports the result on the sent ack channel: true only
@@ -1991,7 +2005,9 @@ func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 		// Serialise persistence writes through a buffered channel so that a
 		// slow storage backend does not block the Transact caller (N-H7) and
 		// writes arrive in order. Registered AFTER the bootstrap decode so the
-		// loaded state is not re-persisted.
+		// loaded state is not re-persisted. The observer never waits on that
+		// channel: an update it cannot hand over at once queues behind it
+		// (persistUpdate), so a full buffer cannot hold a committing goroutine.
 		r.persistCh = make(chan []byte, 256)
 		r.persistStop = make(chan struct{})
 		r.persistDone = make(chan struct{})
@@ -1999,25 +2015,6 @@ func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 		r.flushReq = make(chan chan bool)
 		s.startPersistenceWorker(r, name)
 		r.doc.OnUpdate(func(update []byte, _ any) {
-			// #229 — handing the update to persistCh is only safe while the
-			// worker is still reading it. The worker publishes its retirement
-			// by closing persistRetire BEFORE its final drain, which gives this
-			// observer two airtight cases and no third one:
-			//
-			//   1. persistRetire is still open when the send completes. Then
-			//      close(persistRetire) — and therefore the final drain that
-			//      follows it — happens after the send, so the buffered element
-			//      is still there to be drained. Nothing to do.
-			//   2. persistRetire is already closed. A select whose case is a
-			//      closed channel is always ready, so the check below sees it
-			//      with certainty (no scheduling window), and this goroutine
-			//      takes over the write itself.
-			//
-			// The escape hatch must stay: without it a producer would block
-			// forever on a full 256-slot buffer once the worker has gone. What
-			// #229 changes is that the escape hatch now has a durable
-			// destination instead of dropping the update on the floor.
-			//
 			// The enter/leave pair brackets the WHOLE observer, including the
 			// latch reads, so Shutdown can see this goroutine from before it
 			// decides whether it must write. Registering only inside the
@@ -2026,20 +2023,7 @@ func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 			// write it has not started (see Server.stranded).
 			s.stranded.enter()
 			defer s.stranded.leave()
-
-			select {
-			case r.persistCh <- update:
-				// Case 1 unless retirement began in between; re-check, since
-				// select picks uniformly among ready cases and may have taken
-				// the send even with persistRetire already closed.
-				select {
-				case <-r.persistRetire:
-					s.persistStranded(r, name, nil)
-				default:
-				}
-			case <-r.persistRetire:
-				s.persistStranded(r, name, update)
-			}
+			s.persistUpdate(r, name, update)
 		})
 	}
 	// Wire relay observers (doc.OnUpdate + awareness.OnUpdate) so local changes
