@@ -22,8 +22,9 @@ import (
 // closed when the first such store waits for its token. A store on
 // context.Background - the worker's exit drain, an on-demand flush on the
 // coalescing path, and every write for a retired worker (persistStranded) - is
-// not paced, so a room's retirement never waits on the test. Closing free ends
-// the pacing.
+// not paced, so once the worker reaches its exit path its retirement does not
+// wait on the test; a paced store the worker is inside when it is told to stop
+// still waits for a token, or for free. Closing free ends the pacing.
 type pacedAdapter struct {
 	storeLog
 
@@ -78,18 +79,21 @@ func replayText(t *testing.T, updates [][]byte, key string) string {
 	return d.GetText(key).ToString()
 }
 
-// A flush barrier covers the updates committed before it and waits for no
-// others: an update committed while it waits queues behind it rather than
-// extending it. The worker stores one update for every two that a goroutine
-// commits into the room's document, so the queue beyond the buffer grows for
-// as long as that goroutine commits and never drains. CloseRoom must still
-// return while the goroutine commits, with every update committed before
-// CloseRoom was called already stored. A barrier that waited for the queue to
-// drain would wait for as long as the goroutine commits.
+// A flush barrier waits at most for the updates queued before it began: an
+// update handed over while it waits queues behind it rather than extending
+// it. The flush that follows stores what the channel holds when it reaches
+// the worker, which can include later updates, but not the queue behind the
+// barrier. The worker stores one update for every two that a goroutine commits
+// into the room's document, so the queue beyond the buffer grows for as long
+// as that goroutine commits and never drains. CloseRoom must
+// still return while the goroutine commits, with every update the test made
+// before calling CloseRoom - each by a Transact whose observers ran before it
+// returned - already stored. A barrier that waited for the queue to drain would
+// wait for as long as the goroutine commits.
 func TestPersistence_FlushBarrierCoversOnlyEarlierCommits(t *testing.T) {
 	a := newPacedAdapter()
 	s := ygws.NewServerWithPersistence(a)
-	s.PersistCoalesceWindow = -1 // one store per update, each paced by the test
+	s.PersistCoalesceWindow = -1 // one store per update; pacedAdapter says which the test paces
 	ctx := context.Background()
 	require.NoError(t, s.Apply(ctx, "room", func(_ *crdt.Doc, transact func(func(*crdt.Transaction))) {
 		transact(func(txn *crdt.Transaction) {
@@ -189,7 +193,7 @@ func TestPersistence_PeerWaitCoversOnlyEarlierUpdates(t *testing.T) {
 	release := sync.OnceFunc(func() { close(a.free) })
 	t.Cleanup(release)
 	s := ygws.NewServerWithPersistence(a)
-	s.PersistCoalesceWindow = -1 // one store per update, each paced by the test
+	s.PersistCoalesceWindow = -1 // one store per update; pacedAdapter says which the test paces
 	ctx := context.Background()
 	var marks []string
 	apply := func(mark string) {
@@ -220,7 +224,8 @@ func TestPersistence_PeerWaitCoversOnlyEarlierUpdates(t *testing.T) {
 		wait()
 		queuedAtRelease <- ygws.PersistenceQueueLen(s, "room")
 	}()
-	// Each store frees a slot in the buffer, and the feeder fills it with the
+	// Each store the test lets through lets the worker take the next update
+	// off the buffer, which frees a slot, and the feeder fills it with the
 	// oldest queued update: two stores hand on the two queued before the wait.
 	// The worker then waits inside its next store with the buffer full again.
 	a.storeOne()

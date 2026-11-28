@@ -636,22 +636,30 @@ func (s *Server) closeRoom(ctx context.Context, name string, force bool, within 
 	// block to avoid deadlock.
 	closePeerConns(peers, dones)
 
-	// FLUSH-BEFORE-EVICT (#175 follow-up). Make the pending coalesced batch
-	// durable while rm is still in s.rooms — before re-acquiring s.rmu to
-	// delete it — so a concurrent GetDoc / reconnect reads up-to-date state
-	// rather than a stale store. Uses the flushReq path (worker stays alive,
-	// room discoverable) instead of relying on close(persistStop)'s exit-flush.
-	// Guard against a worker that already exited: a last-peer handleDisconnect
-	// forced above may have already evicted the room and closed persistStop, in
-	// which case the persistDone branch is taken and the flush is a harmless
-	// no-op. No lock is held across the send/ack; the ack is buffered (cap 1) so
-	// the worker never blocks reporting the result.
+	// FLUSH-BEFORE-EVICT (#175 follow-up). Ask the worker to flush the pending
+	// batch before this call re-acquires s.rmu to delete rm, so the updates
+	// the flush covers (see room.flushReq and awaitOverflow) have had their
+	// stores attempted before a reconnect after this call's delete can load
+	// the store; updates the room's feeder still holds can land later. A
+	// competing teardown that also passed admission may already have removed
+	// rm and closed persistStop, and the worker can still take this request
+	// after that removal, before it selects its closed persistStop. Uses the
+	// flushReq path (it does not stop the worker) instead of relying on
+	// close(persistStop)'s exit-flush. Guard against a worker that already
+	// exited: a last-peer handleDisconnect forced above, or another close, may
+	// have already evicted the room and closed persistStop; this call then
+	// either finds persistDone closed and makes no flush, or the worker takes
+	// the request first. No lock is held across the send/ack; the ack is
+	// buffered (cap 1) so the worker never blocks reporting the result.
 	//
 	// Unlike handleDisconnect, CloseRoom is a FORCED admin removal: it proceeds to
 	// evict regardless of flush success. The close(persistStop) below drives the
-	// worker's exit-flush as the retry, so a false result here is not fatal — we
-	// only log it (best effort) and do not abort. Without force, a peer that
-	// joined meanwhile keeps the room open below, and its worker keeps running.
+	// worker's exit-flush, which retries a batch the coalescing path retained
+	// (the strict path retains a failed store only when the worker finds its
+	// ctx cancelled as it checks after the store returned, and drops the rest),
+	// so a false result here is not fatal — we only log it (best effort) and do
+	// not abort. Without force, a peer that joined meanwhile keeps the room
+	// open below, and this path does not stop its worker.
 	if rm.flushReq != nil {
 		ack := make(chan bool, 1)
 		rm.awaitOverflow()
@@ -676,8 +684,9 @@ func (s *Server) closeRoom(ctx context.Context, name string, force bool, within 
 		if rm.persistDone != nil {
 			<-rm.persistDone
 		}
-		// #60 — handleDisconnect already evicted the room and fired
-		// OnUnloadDocument; nothing more for CloseRoom to do here.
+		// #60 — another teardown (handleDisconnect, an idle eviction or a
+		// concurrent close) removed the room and fires OnUnloadDocument itself;
+		// nothing more for CloseRoom to do here.
 		return nil
 	}
 	// A caller may have entered while both locks were released, so the check
@@ -707,7 +716,7 @@ func (s *Server) closeRoom(ctx context.Context, name string, force bool, within 
 	if rm.persistStop != nil {
 		select {
 		case <-rm.persistStop:
-			// already closed by handleDisconnect
+			// already closed by another teardown
 		default:
 			close(rm.persistStop)
 		}

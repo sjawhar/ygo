@@ -88,12 +88,20 @@ func TestPersistence_ACommitNeverWaitsOnABehindWorker(t *testing.T) {
 	}
 }
 
-// Updates queued beyond the buffer when the worker retires are still stored,
-// after what the worker's final drain stored: the feeder hands them to the
-// retired room's stranded writer (#229's guarantee, which a queue beyond the
-// channel must keep), and with one store per commit they are stored in commit
-// order. Shutdown fires with the worker parked and the queue holding updates
-// the channel never saw.
+// In this test - an adapter whose final attempts succeed, and a Shutdown
+// whose ctx lasts until the feeder is done - updates queued beyond the buffer
+// when the worker retires are still stored. Its first, parked store can fail:
+// the gate opens after Shutdown has begun, and if the worker's ctx is
+// cancelled by then that store returns ctx.Err(), and the worker attempts the
+// update again at exit on context.Background. The feeder hands each queued
+// update on, by a send the worker's final drain still sees or, once it finds
+// the worker retired, through the retired room's stranded writer
+// (persistStranded) after that drain (#229's guarantee, which a queue beyond
+// the channel must keep). It is not a general guarantee: persistStranded logs
+// a failed store and drops it, and a Shutdown whose ctx expires first can
+// return with the feeder's queue not yet written. With one store per commit
+// they are stored in commit order. Shutdown fires with the worker parked and
+// the queue holding updates the channel never saw.
 func TestPersistence_UpdatesQueuedBeyondTheBufferSurviveShutdown(t *testing.T) {
 	const commits = persistBuffer * 2
 	for _, tc := range []struct {
