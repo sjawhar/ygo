@@ -1,3 +1,36 @@
+## v1.55.1-sami.13
+
+This fork release retains the complete
+[v1.55.1-sami.12 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.12)
+and corrects comments of its `provider/websocket` persistence fix. There are
+no code, behaviour, API or wire format changes: the code is the code of
+v1.55.1-sami.12. The same correction is released on the v1.55.1-sami.2 line as
+[v1.55.1-sami.2.3](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2.3).
+
+### What the comments, and the v1.55.1-sami.12 notes, said wrongly
+
+Some comments of the fix, and the notes of v1.55.1-sami.12, said more than the
+code does. A reader who trusts them could bring back the deadlock the fix
+removes, so the comments now say what the code does.
+
+A peer does not add at most one update to the overflow queue at a time. Its
+read loop waits before each message it applies, so until the worker retires a
+peer has in the queue at most the commits of the one message it is applying.
+That can be more than one update: the document's format cleanup
+(`crdt.WithFormatCleanup`) commits a local transaction in the same apply, and
+consumer code the apply runs can commit too. Once the worker has retired, the
+read loop no longer waits.
+
+A committer is never held by a running worker, but a retiring one can hold
+it. With no feeder running, a commit made while the worker retires waits for
+the worker's final drain, which calls the adapter. An adapter that waits on
+something the committer holds, such as a lock of yours, then deadlocks it, as
+since #229. A comment said this wait cannot deadlock; that is corrected.
+
+The queue keeps the order the observer queued updates in. That is commit order
+for the commits of one goroutine; the commits of two goroutines can reach it in
+either order, as they could reach the channel before.
+
 ## v1.55.1-sami.12
 
 This fork release retains the complete

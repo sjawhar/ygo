@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.13] — 2026-11-28
+
+Fork release on [1.55.1-sami.12](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.12),
+correcting comments of its `provider/websocket` persistence fix. No code,
+behaviour, API or wire format changes: the code is the code of 1.55.1-sami.12.
+The same correction is released on the v1.55.1-sami.2 line as
+[1.55.1-sami.2.3](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2.3).
+
+### Fixed
+
+- **`provider/websocket`: the persistence fix's comments say what its code
+  does.** Some of them, and the 1.55.1-sami.12 entry below, said more than
+  the code does. A reader who trusts them could bring back the deadlock the
+  fix removes:
+  - A peer does not add at most one update to the overflow queue at a time.
+    Its read loop waits before each message it applies, so until the worker
+    retires a peer has in the queue at most the commits of the one message it
+    is applying. That can be more than one update: the document's format
+    cleanup (`crdt.WithFormatCleanup`) commits a local transaction in the same
+    apply, and consumer code the apply runs can commit too. Once the worker
+    has retired, the read loop no longer waits.
+  - A committer is never held by a running worker, but a retiring one can
+    hold it: with no feeder running, a commit made while the worker retires
+    waits for the worker's final drain, which calls the adapter, so an adapter
+    that waits on something the committer holds deadlocks it there, as since
+    #229. The comment that said this wait cannot deadlock is corrected.
+  - The queue keeps the order the observer queued updates in. That is commit
+    order for the commits of one goroutine; the commits of two goroutines can
+    reach it in either order, as they could reach the channel before.
+
 ## [1.55.1-sami.12] — 2026-11-28
 
 Fork release on [1.55.1-sami.11](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.11),
