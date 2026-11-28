@@ -666,10 +666,11 @@ func TestPersistenceShutdown_ReturnsPromptlyWithoutProducers(t *testing.T) {
 // It asserts a property that IS sound under this race, rather than "something
 // was stored": every commit whose Transact had RETURNED before Shutdown
 // returned must be in the adapter. That follows from the design — by the time
-// the observer returns, the update has either been buffered while the
-// retirement latch was open (so the worker's final drain, which precedes
-// persistDone, which precedes Shutdown's own waits, takes it) or been written
-// synchronously by the committer. Commits still in flight when Shutdown
+// the observer returns, the update has been buffered while the retirement
+// latch was open (so the worker takes it before persistDone, which precedes
+// Shutdown's own waits), written through persistStranded before the commit
+// returns, or queued for the room's feeder, which Shutdown also waits for
+// (Server.stranded). Commits still in flight when Shutdown
 // returns are excluded on purpose: that is the acknowledged residual, and a
 // test must not assert away a limit the code really has.
 //

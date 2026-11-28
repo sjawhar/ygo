@@ -1342,11 +1342,10 @@ type Server struct {
 	SlowPeerPolicy SlowPeerPolicy
 
 	// RoomIdleTimeout, when > 0, switches room eviction from eager to lazy
-	// (#183): when the last peer leaves a room, the v1.37.0 durable
-	// flush-before-evict still runs (so pending writes are never lost), but
-	// the room is NOT deleted from the server map — it is stamped idle
-	// (its idleSince timestamp is set) and stays resident, worker and
-	// in-memory doc alive. A rejoin before eviction reuses the warm doc with
+	// (#183): when the last peer leaves a room, the v1.37.0 flush-before-evict
+	// still runs, but the room is NOT deleted from the server map — it is
+	// stamped idle (its idleSince timestamp is set) and stays resident with
+	// its in-memory doc. A rejoin before eviction reuses the warm doc with
 	// no LoadDoc / reload. Actually evicting rooms whose idle time exceeds
 	// this timeout is done by a separate background sweeper; setting this
 	// field alone only stops eager eviction and marks rooms idle — without a
