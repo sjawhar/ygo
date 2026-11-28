@@ -21,15 +21,25 @@ That can be more than one update: the document's format cleanup
 consumer code the apply runs can commit too. Once the worker has retired, the
 read loop no longer waits.
 
-A committer is never held by a running worker, but a retiring one can hold
-it. With no feeder running, a commit made while the worker retires waits for
-the worker's final drain, which calls the adapter. An adapter that waits on
+A commit never waits on a running worker, but a retiring one can hold it.
+With no feeder running, a commit made while the worker retires waits for the
+worker's final drain, which calls the adapter. An adapter that waits on
 something the committer holds, such as a lock of yours, then deadlocks it, as
 since #229. A comment said this wait cannot deadlock; that is corrected.
 
-The queue keeps the order the observer queued updates in. That is commit order
-for the commits of one goroutine; the commits of two goroutines can reach it in
-either order, as they could reach the channel before.
+The queue keeps the order the persistence observer ran in, which need not be
+commit order: observers fire after the document's lock is released, so the
+commits of two goroutines can reach it in either order, and a commit that an
+earlier observer makes reaches it before the commit that triggered it. A flush
+covers the updates handed over before it began.
+
+The unbounded queue can cost more than its depth and the time to store it.
+`Shutdown` waits for a feeder only until its `ctx` runs out, and then returns
+`ctx.Err()` with the rest of the queue not stored; and what a feeder still
+holds when teardown returns can be stored after a room of the same name has
+loaded again and written. The v1.55.1-sami.2.2 notes say "not lost or
+reordered updates" and "none is lost"; that holds only for a `Shutdown` whose
+`ctx` lasts until every feeder has stored its queue.
 
 ## v1.55.1-sami.2.2
 
