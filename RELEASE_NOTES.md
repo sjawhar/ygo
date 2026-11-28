@@ -1,3 +1,53 @@
+## v1.55.1-sami.14
+
+This fork release retains the complete
+[v1.55.1-sami.13 release](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.13)
+and corrects more comments of its `provider/websocket` persistence fix. There
+are no code, behaviour, API or wire format changes: the code is the code of
+v1.55.1-sami.12 and v1.55.1-sami.13. The same correction is released on the
+v1.55.1-sami.2 line as
+[v1.55.1-sami.2.4](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2.4).
+
+### What the comments, and the earlier notes, said wrongly
+
+Some comments of the fix, and the notes of v1.55.1-sami.12 and
+v1.55.1-sami.13, said more than the code does. A reader who trusts them could
+rely on a guarantee the code does not give, so the comments now say what the
+code does.
+
+A teardown flush (the last peer leaving, idle eviction, `CloseRoom`) first waits
+for the updates queued for the room's feeder when it began to reach the
+worker's channel, and it returns early, with no flush, once the worker has
+exited. It then asks the worker to flush and waits for its answer; the worker
+takes what its channel holds after it has the request, which can include
+updates handed over after the flush began. It does not guarantee every update
+committed before it: a transaction's observers run after it has released the
+document's lock, so an update whose observer had not run when the flush began
+can be left out.
+The v1.55.1-sami.12 notes said teardown's flush "covers every update committed
+before it".
+
+Once the worker has retired, an update the feeder has sent is stored by the
+worker's final drain when it reaches the channel in time, and otherwise by
+whichever `persistStranded` call takes it from the channel, the feeder's or a
+committer's; the feeder writes what it has not sent through `persistStranded`
+itself. The v1.55.1-sami.12 notes said the feeder "stores what it still holds
+itself".
+
+The store does not always end up with every update. A store that fails for a
+retired worker is logged and dropped, a store the worker's final drain makes
+is not retried when it fails, and a `Shutdown` whose `ctx` runs out can return
+with what a feeder still holds not stored. The v1.55.1-sami.12 notes said
+"each is stored once and none is lost".
+
+On the per-update path (`PersistCoalesceWindow = -1`) the worker keeps a failed
+store for its exit only when its context is cancelled as it checks after the
+store returned, whatever the adapter's reason, and drops the other failures. A
+feeder can start after its worker has exited. The observer's bookkeeping costs,
+on each call, an atomic add as it enters and one as it leaves, and, when a
+leave brings the count of writers to zero, a mutex, a channel allocation and a
+close; a comment said "two atomic adds".
+
 ## v1.55.1-sami.13
 
 This fork release retains the complete
