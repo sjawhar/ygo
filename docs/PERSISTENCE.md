@@ -716,7 +716,7 @@ Only a `nil` return means every wait actually resolved by the work completing
 rather than by the clock running out. See "What adapters must now tolerate"
 below for the independent things that can produce that deadline error.
 
-**Why "handed to the adapter," not "the adapter accepted it."** The observer
+**Why "handed to the adapter," not "the adapter accepted it."** The goroutine
 that performs a commit's write — whether the room's normal persistence worker
 or, for a straggler, the committing goroutine itself or the room's feeder via
 `persistStranded` — has no caller to report a failure to: an adapter error or
