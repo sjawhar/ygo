@@ -616,38 +616,22 @@ func (p *peer) handleDisconnect() {
 
 		// FLUSH-BEFORE-EVICT (#175 follow-up). When the room is now empty, ask
 		// the worker to flush the pending batch BEFORE this path removes the
-		// room from s.rooms — while, unless another teardown (a CloseRoom, a
-		// handleDisconnect of a peer that joined and left meanwhile, or an
-		// idle eviction) has already removed it, the room is still
-		// discoverable, and unless it has already exited, the worker runs; the
-		// worker can still take this request after such a removal. A quick
-		// reconnect then either finds this warm room or, once the room has
-		// left s.rooms, loads the store;
-		// when this path is the one that removes it, that is after a flush
-		// that acked true or, when the worker had already exited, with no
-		// flush at all (the persistDone branch below). See room.flushReq and
-		// awaitOverflow for what a flush covers; updates the room's feeder
-		// still holds can land later. We must NOT close persistStop for this
-		// flush: closing it triggers the worker's own exit-flush, but a
-		// reconnect can beat that; the flushReq path is what lets the flush
-		// happen before this path removes the room. Guard against a worker
-		// that already exited (e.g. CloseRoom raced us) via the persistDone
-		// branch.
+		// room from s.rooms, so a reconnect that loads the store after that
+		// removal finds what the flush stored. Another teardown may already
+		// have removed the room, and the worker can still take this request
+		// after that. See room.flushReq and awaitOverflow for what a flush
+		// covers; updates the room's feeder still holds can land later. We
+		// must NOT close persistStop for this flush: closing it triggers the
+		// worker's own exit-flush, but a reconnect can beat that. Guard against
+		// a worker that already exited via the persistDone branch.
 		//
 		// flushOK starts true and an ack sets it: true only if the flush's own
-		// stores succeeded, or it had nothing to write (room.flushReq says
-		// which updates those are). With no ack - a room that is not empty, no
-		// persistence, or a worker that had already exited - it stays true. On
-		// a false ack we ABORT eviction below: this path neither removes the
-		// room nor stops the worker (which can still exit on Shutdown: a strict
-		// flush can ack false because Shutdown cancelled its ctx, and its next
-		// select can take shutdownCh). A batch the coalescing path retained is
-		// then attempted again later - with the next update's timed flush, the
-		// next teardown's flush, or the exit path - (the strict path retains a
-		// failed store only when the worker finds its ctx cancelled as it
-		// checks after the store returned), and a reconnect meanwhile, while
-		// the room stays in s.rooms, finds the warm in-memory doc rather than
-		// reloading a stale store (which would silently lose the edit).
+		// stores succeeded, or it had nothing to write. With no ack it stays
+		// true. On a false ack we ABORT eviction below: this path neither
+		// removes the room nor stops the worker, so a batch the coalescing
+		// path retained is attempted again later, and a reconnect meanwhile,
+		// while the room stays in s.rooms, finds the warm in-memory doc rather
+		// than reloading a stale store (which would silently lose the edit).
 		// CRITICAL: no lock (rmu / rm.mu) may be held across the send/ack; the ack
 		// is buffered (cap 1) so the worker never blocks reporting the result.
 		flushOK := true
@@ -658,11 +642,9 @@ func (p *peer) handleDisconnect() {
 			case rm.flushReq <- ack:
 				flushOK = <-ack
 			case <-rm.persistDone:
-				// Worker already gone (raced by CloseRoom/shutdown); its exit-flush
-				// handled durability best-effort. Leave flushOK true so this path
-				// goes on as after a true ack, to the checks below: eviction, or
-				// with RoomIdleTimeout > 0 an idle stamp on a room whose worker
-				// has exited.
+				// Worker already gone; its exit-flush handled durability
+				// best-effort. Leave flushOK true so this path goes on as after
+				// a true ack, to the checks below.
 			}
 		}
 
@@ -676,10 +658,8 @@ func (p *peer) handleDisconnect() {
 		//
 		// IDLE RESIDENCY (#183). When Server.RoomIdleTimeout > 0, a still-empty
 		// room with flushOK true is NOT evicted: instead we stamp
-		// rm.idleSince and do not remove it (this path does not close
-		// persistStop, so the worker keeps running unless something else
-		// stopped it — as when flushOK is true because the worker had already
-		// exited) so a rejoin reuses the warm in-memory doc with no reload.
+		// rm.idleSince and do not remove it or close persistStop, so a rejoin
+		// reuses the warm in-memory doc with no reload.
 		// This only changes what happens on the flushOK path; a flush failure
 		// still leaves the room resident exactly as before (evict stays false),
 		// matching pre-#183 behaviour, and does NOT stamp idleSince — an
@@ -708,7 +688,7 @@ func (p *peer) handleDisconnect() {
 				if rm.persistStop != nil {
 					select {
 					case <-rm.persistStop:
-						// already closed by CloseRoom
+						// already closed by another teardown
 					default:
 						close(rm.persistStop)
 					}
@@ -719,10 +699,8 @@ func (p *peer) handleDisconnect() {
 
 			// Wait for the persistence goroutine to drain and exit before the
 			// room reference becomes garbage. Only wait when we actually evicted
-			// (closed persistStop, or found it already closed by CloseRoom):
-			// otherwise this path has not stopped the worker (a peer rejoined,
-			// the room stays idle-resident, a caller is inside, or we aborted on
-			// flush failure) and the wait could block forever.
+			// (closed persistStop, or found it already closed): otherwise this
+			// path has not stopped the worker and the wait could block forever.
 			if evict && rm.persistDone != nil {
 				<-rm.persistDone
 			}
@@ -734,8 +712,7 @@ func (p *peer) handleDisconnect() {
 		// currently eager but could become lazy in a future release).
 		// OnUnloadDocument fires only when we were the path that actually
 		// removed the room from the server map (roomEvicted); a room this path
-		// does not remove gets it from the teardown that does - a CloseRoom
-		// that raced us, or a later close or idle eviction. Both hooks are
+		// does not remove gets it from the teardown that does. Both hooks are
 		// panic-safe.
 		if empty {
 			if hook := p.server.OnLastPeer; hook != nil {

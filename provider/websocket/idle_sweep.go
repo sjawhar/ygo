@@ -155,15 +155,12 @@ func (s *Server) sweepIdleRooms(now time.Time) {
 // blocks eviction even though peers is still 0 and idleSince is still zero
 // (#193 review).
 //
-// On a false flush ack this path neither removes the room nor stops the worker
-// (matching handleDisconnect; the worker can still exit on Shutdown): a batch
-// the coalescing path retained is attempted again later - with the next
-// update's timed flush, the next teardown's flush, or the exit path - (the
-// strict path retains a failed store only when the worker finds its ctx
-// cancelled as it checks after the store returned), and a reconnect meanwhile
-// finds the warm in-memory doc rather than reloading a stale store. With no
-// ack, because the worker had already exited, flushOK stays true and the
-// eviction below can go on, subject to its re-check.
+// On a false flush ack this path neither removes the room nor stops the
+// worker, so a batch the coalescing path retained is attempted again later,
+// and a reconnect meanwhile, while the room stays in s.rooms, finds the warm
+// in-memory doc rather than reloading a stale store. With no ack, because the
+// worker had already exited, flushOK stays true and the eviction below can go
+// on, subject to its re-check.
 func (s *Server) evictIdleRoom(name string, rm *room, expectIdle time.Time) bool {
 	// A rejected join must not flush a room that still has peers or callers.
 	rm.mu.Lock()
@@ -178,8 +175,7 @@ func (s *Server) evictIdleRoom(name string, rm *room, expectIdle time.Time) bool
 	// can take this request after that removal, before it selects its closed
 	// persistStop. No lock is held across the send/ack; the ack is buffered
 	// (cap 1) so the worker never blocks. Guard against a worker that already
-	// exited (raced by CloseRoom/handleDisconnect/shutdown) via the persistDone
-	// branch.
+	// exited via the persistDone branch.
 	flushOK := true
 	if rm.flushReq != nil {
 		ack := make(chan bool, 1)
