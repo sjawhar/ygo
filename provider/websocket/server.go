@@ -709,8 +709,9 @@ type room struct {
 	//	otherwise the producer sees persistRetire closed and takes over the
 	//	write itself via persistStranded. A third case: while the room's
 	//	feeder runs, the producer queues the update for the feeder instead,
-	//	and the feeder writes it via persistStranded once persistRetire is
-	//	closed.
+	//	and the feeder hands it on under the same two cases: its send into
+	//	persistCh is swept by the final drain, or it sees persistRetire
+	//	closed and writes via persistStranded.
 	//
 	// Before #229 the worker exited on shutdownCh with no such latch, so every
 	// transaction committed after the one-shot drain landed in the 256-slot
@@ -725,34 +726,53 @@ type room struct {
 	// room, so the fallback must provide that serialisation itself.
 	persistFallbackMu sync.Mutex
 
-	// persistMu guards the fields below it. persistOverflow holds, in the
-	// order they were committed, the updates the doc.OnUpdate observer could
-	// not hand to persistCh without waiting - the buffer was full, earlier
-	// updates already waited ahead of them, or the worker had retired - and a
-	// feeder goroutine (feedPersistence) hands them on; persistFeeding is set
-	// while it runs. persistQueued counts the updates ever appended to
-	// persistOverflow, and persistHanded those the feeder has handed on, to
-	// persistCh or, once the worker retired, through persistStranded.
-	// persistWaiters holds the waits on that count, lowest mark first; the
-	// feeder releases each as persistHanded reaches its mark (handedOnLocked).
+	// persistMu guards the fields below it. persistOverflow holds the updates
+	// the doc.OnUpdate observer queued instead of sending them to persistCh
+	// (persistUpdate): while a feeder runs, every update, whatever the
+	// worker's state; with none running, an update the buffer had no room
+	// for, which starts one. An update the observer finds the worker retired
+	// for, with no feeder running, it stores itself (persistStranded) instead
+	// of queueing it. The queue keeps the order the observer queued them in,
+	// which is commit order for the commits of one goroutine; observers fire
+	// outside the document's lock, so the commits of two goroutines can reach
+	// it in either order. A feeder goroutine (feedPersistence) hands the
+	// queue on; persistFeeding is set while it runs. persistQueued counts the
+	// updates ever appended to persistOverflow, and persistHanded those the
+	// feeder has handed on, to persistCh or, once the worker retired, through
+	// persistStranded. persistWaiters holds the waits on that count, lowest
+	// mark first; the feeder releases each as persistHanded reaches its mark
+	// (handedOnLocked).
 	//
 	// A wait records persistQueued when it begins and covers only that many,
 	// so a commit made while it waits queues behind it instead of extending
-	// it. A peer's read loop waits so before it applies its next update
-	// (awaitPersistence): storage lag still slows a fast peer, and each peer
-	// adds at most one update to the queue at a time. A flush barrier waits so
-	// before it asks the worker to flush (awaitOverflow), so the flush covers
-	// every update committed before it. A committer - a Server.Apply caller,
-	// or the consumer's own code inside a peer's apply - is never held by the
-	// worker.
+	// it. A peer's read loop waits so before it applies each update the peer
+	// sends (awaitPersistence), so storage lag still slows a fast peer. Every
+	// commit of the peer's previous message was made before that wait began,
+	// so until the worker retires a peer has in the queue at most the commits
+	// of the one message it is applying. That can be more than one update: a
+	// remote update that changes formatted text can be followed, in the same
+	// apply, by the local transaction of the document's format cleanup
+	// (crdt.WithFormatCleanup, Doc.SetFormatCleanup), and consumer code the
+	// apply runs (Server.OnPeerUpdate, a document observer) can commit too. A
+	// flush barrier waits so before it asks the worker to flush
+	// (awaitOverflow), so the flush covers every update committed before it.
 	//
-	// The trade: committed updates not yet stored have no bound. Peers are
-	// throttled at their read loop, so untrusted input cannot size the queue,
-	// but Server.Apply, Server.Inject (the relay's inbound path) and consumer
-	// code holding the *crdt.Doc are not throttled: a writer that outpaces the
-	// adapter grows the queue for as long as it writes. What that costs is the
-	// queue's depth, and the time a teardown takes to store it, not lost or
-	// reordered updates.
+	// A committer - a Server.Apply caller, or the consumer's own code inside
+	// a peer's apply - is never held by a running worker. It waits on the
+	// worker in one place: when the observer finds the worker retired
+	// (persistRetire closed) and no feeder running, persistStranded waits for
+	// persistDone, the end of the worker's final drain, whose adapter calls
+	// can wait on what the committer holds (see persistStranded).
+	//
+	// The trade: committed updates not yet stored have no bound. While the
+	// worker runs, peers are throttled at their read loop as above; once it
+	// has retired, awaitPersistence no longer waits, and, while a feeder
+	// still runs, what peers commit queues behind it without a wait.
+	// Server.Apply, Server.Inject (the relay's inbound path) and consumer code
+	// holding the *crdt.Doc are not throttled at all: a writer that outpaces
+	// the adapter grows the queue for as long as it writes. What that costs is
+	// the queue's depth, and the time a teardown's flush barrier and Shutdown
+	// take to get through it, not lost or reordered updates.
 	persistMu       sync.Mutex
 	persistOverflow [][]byte
 	persistFeeding  bool
@@ -762,15 +782,19 @@ type room struct {
 
 	// flushReq requests an on-demand durable flush of the pending batch without
 	// stopping the worker. The worker takes what persistCh holds when the
-	// request arrives, flushes with a background ctx, and reports the result on
-	// the sent ack channel: true only if the batch was fully persisted, false
-	// if any store failed (the batch is then retained for a later retry). The
-	// ack is a real durability barrier — teardown gates eviction on a true
-	// result. A sender MUST call awaitOverflow first: the worker takes only
-	// what persistCh holds when the request arrives, so without it the flush
-	// misses the updates still queued for the feeder. Callers MUST use a
-	// buffered ack (cap 1) so the worker's send never blocks. nil when no
-	// PersistenceAdapter is configured.
+	// request arrives, flushes it - on the coalescing path with a background
+	// ctx, together with its pending batch; on the strict per-update path one
+	// store per update, with the worker's ctx - and reports the result on the
+	// sent ack channel: true only if every store succeeded, false if any
+	// failed. On failure the coalescing path retains the batch for a later
+	// retry; the strict path retains only a store that the worker's cancelled
+	// ctx aborted, for its exit path. The ack is a real durability barrier —
+	// the last peer's teardown and idle eviction gate eviction on a true
+	// result, and CloseRoom logs a false one. A sender MUST call
+	// awaitOverflow first: the worker takes only what persistCh holds when the
+	// request arrives, so without it the flush misses the updates still queued
+	// for the feeder. Callers MUST use a buffered ack (cap 1) so the worker's
+	// send never blocks. nil when no PersistenceAdapter is configured.
 	flushReq chan chan bool
 
 	// relayUnsub holds the doc.OnUpdate / awareness.OnChange unsubscribe
@@ -947,7 +971,7 @@ type Server struct {
 	// committer has already decided to write. The cost is two atomic adds on
 	// every committed transaction, which is deliberate — correctness of the
 	// shutdown join over a few nanoseconds on a path that already encodes an
-	// update, takes a mutex and sends on a channel.
+	// update, takes a mutex and sends or queues the update.
 	//
 	// The consequence of that breadth is worth stating, because it surfaces as a
 	// confusing error: a SUSTAINED producer — code holding a retained *crdt.Doc
@@ -2058,8 +2082,10 @@ func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 		// slow storage backend does not block the Transact caller (N-H7) and
 		// writes arrive in order. Registered AFTER the bootstrap decode so the
 		// loaded state is not re-persisted. The observer never waits on that
-		// channel: an update it cannot hand over at once queues behind it
-		// (persistUpdate), so a full buffer cannot hold a committing goroutine.
+		// channel: while the worker runs, an update it cannot send at once
+		// queues for the room's feeder, as does every update while earlier ones
+		// are queued (persistUpdate), so a full buffer cannot hold a committing
+		// goroutine.
 		r.persistCh = make(chan []byte, 256)
 		r.persistStop = make(chan struct{})
 		r.persistDone = make(chan struct{})

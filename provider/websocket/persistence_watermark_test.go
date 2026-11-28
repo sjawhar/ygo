@@ -16,12 +16,14 @@ import (
 )
 
 // pacedAdapter stores only as fast as the test lets it. A store the worker
-// issues on its cancellable context - each store of its running loop and of an
-// on-demand flush - takes a token from step before it stores and reports on
-// wrote after it; parked is closed when the first such store waits for its
-// token. A store on context.Background - the worker's exit drain, and every
-// write for a retired worker (persistStranded) - is not paced, so a room's
-// retirement never waits on the test. Closing free ends the pacing.
+// issues on its cancellable context - each store of its running loop and, on
+// the strict per-update path these tests use, of an on-demand flush - takes a
+// token from step before it stores and reports on wrote after it; parked is
+// closed when the first such store waits for its token. A store on
+// context.Background - the worker's exit drain, an on-demand flush on the
+// coalescing path, and every write for a retired worker (persistStranded) - is
+// not paced, so a room's retirement never waits on the test. Closing free ends
+// the pacing.
 type pacedAdapter struct {
 	storeLog
 

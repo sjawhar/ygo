@@ -12,42 +12,58 @@ import (
 
 // persistStranded is the durable destination for updates a room's persistence
 // worker can no longer take (#229). It is called once the worker has begun
-// retiring: from the doc.OnUpdate observer (persistUpdate), for an update that
-// could not be enqueued at all (passed as extra) and for updates that were
-// enqueued but may have missed the worker's final drain; and from the room's
-// feeder (feedPersistence), for the queued updates it still holds.
+// retiring: from the doc.OnUpdate observer (persistUpdate), for an update it
+// found the worker retired for and did not send (passed as extra), and, after
+// a send that raced the retirement, for updates sent that may have missed the
+// worker's final drain; and from the room's feeder (feedPersistence), for the
+// queued updates it still holds (passed as extra) and for what its own sends
+// may have left in persistCh after that drain.
 //
 // It first waits for the worker to be completely gone (persistDone). That wait
 // is what lets it call the adapter without a lock the worker also holds: the
 // adapter contract promises calls for one room are serialised, and after
-// persistDone the worker is issuing none. The wait cannot deadlock — the worker
-// never waits on a producer, and Shutdown/eviction wait on persistDone too, not
-// on this function.
+// persistDone the worker is issuing none. The wait lasts as long as the
+// worker's final drain, which calls the adapter (its last stores, then
+// SaveVersion and Compact if it makes those calls). Called from the observer,
+// the wait holds the committing goroutine, so it can deadlock: an adapter call
+// in that drain that waits on something the committer holds, such as a lock
+// of the consumer's, never returns, and the worker and the committer wait on
+// each other. persistUpdate keeps a committer from waiting on a running
+// worker; this wait on a retiring one is the limit it keeps from #229: a
+// commit made while the worker retires, with no feeder running, waits here.
+// The feeder holds nothing a committer or the adapter needs, so its own wait
+// here forms no such cycle. Teardown waits on persistDone, not on this
+// function; Shutdown waits on persistDone and then on the goroutines in this
+// function too (Server.stranded), each bounded by its ctx.
 //
 // Anything still stranded in persistCh is stored FIRST, then extra, in order,
-// so a single stranded call writes in commit order. That is best-effort ordering
-// WITHIN one call only: two committing goroutines can be in the observer at once
-// (see room.persistFallbackMu), so across concurrent stranded calls the adapter
-// may see the room's updates out of commit order. Harmless for a CRDT log —
-// updates merge order-independently — but do not read it as a stronger promise
-// than it is. Errors are logged, not returned: the observer has no caller to
-// report to. Auto-versioning and compaction are deliberately NOT re-run here —
-// the worker already performed its final maybeVersion/maybeCompact, and a
-// stranded update is by definition a late straggler, not a new steady state.
+// so a single stranded call writes in the order the updates were handed over.
+// That is best-effort ordering WITHIN one call only: two committing goroutines
+// can be in the observer at once (see room.persistFallbackMu), so across
+// concurrent stranded calls the adapter may see the room's updates out of
+// commit order. Harmless for a CRDT log — updates merge order-independently —
+// but do not read it as a stronger promise than it is. Errors are logged, not
+// returned: the observer and the feeder have no caller to report to.
+// Auto-versioning and compaction are deliberately NOT re-run here — the worker
+// already performed its final maybeVersion/maybeCompact, and everything stored
+// here missed its final drain: late commits, and updates its feeder still held
+// when it retired.
 //
-// A commit the observer stores itself, with no feeder running, has been stored
-// when it returns: the observer pays for this synchronously, on the committing
-// goroutine. That is the intended trade: it happens only during and after room
-// retirement, and the alternative — the pre-#229 behaviour — was silent data
-// loss. Two consequences worth stating rather than discovering:
+// A commit the observer stores itself, with no feeder running, has been handed
+// to the adapter when the commit returns: the observer pays for this
+// synchronously, on the committing goroutine. That is the intended trade: it
+// happens only during and after room retirement, and the alternative — the
+// pre-#229 behaviour — was silent data loss. Two consequences worth stating
+// rather than discovering:
 //
 //   - crdt.buildPhase2 fires OnUpdate observers in registration order and
 //     loadRoom registers persistence BEFORE the relay observers, so a stranded
-//     write delays that update's cluster fan-out for as long as the adapter
-//     takes. Bounded to room retirement, and a publish onto an already-retired
-//     lane is counted in RelayStats().Dropped rather than lost silently — but
-//     it does stretch the "no blocking I/O on the commit path" convention
-//     further than the rest of the package does.
+//     write the observer makes delays that update's cluster fan-out for as
+//     long as the wait above and the adapter take. Bounded to room
+//     retirement, and a publish onto an already-retired lane is counted in
+//     RelayStats().Dropped rather than lost silently — but it does stretch
+//     the "no blocking I/O on the commit path" convention further than the
+//     rest of the package does.
 //   - It writes for a room name the server may already consider gone, and can
 //     do so indefinitely if a caller retains the *crdt.Doc. See
 //     CompactableAdapter's godoc for what that means for adapters. Ordinary
@@ -56,11 +72,11 @@ import (
 //     worker (persistDone), and their flush barrier (awaitOverflow) waits only
 //     for the updates queued before it began. A feeder that holds updates
 //     committed after that - one still running when the barrier returned, or
-//     one started after it returned and before the room left s.rooms - stores
-//     them through here once the worker has gone, possibly after teardown
-//     returned and after a reload of the same name bootstrapped from a store
-//     that did not hold them yet. The store ends up with every update, and a
-//     CRDT log converges whatever the order its updates land in; a room
+//     one started after it returned - stores those it still holds when the
+//     worker retires through here, once the worker has gone, possibly after
+//     teardown returned and after a reload of the same name bootstrapped from
+//     a store that did not hold them yet. The store ends up with every update,
+//     and a CRDT log converges whatever the order its updates land in; a room
 //     reloaded meanwhile does not hold them until its name is loaded again.
 func (s *Server) persistStranded(r *room, name string, extra [][]byte) {
 	<-r.persistDone
@@ -110,22 +126,24 @@ func (s *Server) persistStranded(r *room, name string, extra [][]byte) {
 // consumer's, or a write the adapter must see finished before it stores. A
 // send that waited for the 256-slot buffer to free would then wait on a worker
 // that waits on the committer, and neither would move; the buffer exists so
-// that a slow storage backend does not block the Transact caller (N-H7). So the
-// update goes into persistCh only when that is immediate and nothing waits
-// ahead of it; otherwise it queues, in commit order, on persistOverflow, which
-// a feeder goroutine hands on (feedPersistence). While a feeder runs, every
-// update queues behind the updates it holds, whatever the worker's state, so
-// none overtakes them; once the worker has retired, the feeder writes the
-// queued updates itself, through persistStranded.
+// that a slow storage backend does not block the Transact caller (N-H7). So,
+// while the worker runs, the update goes into persistCh only when that is
+// immediate and nothing is queued ahead of it; otherwise it queues on
+// persistOverflow, behind every update queued before it, which a feeder
+// goroutine hands on (feedPersistence). While a feeder runs, every update
+// queues behind the updates it holds, whatever the worker's state, so none
+// overtakes them; once the worker has retired, the feeder writes the queued
+// updates itself, through persistStranded.
 //
 // With no feeder running, the observer handles the worker's retirement (#229)
 // itself. A send that completed while persistRetire was still open is swept by
 // the worker's final drain, which strictly follows close(persistRetire); a
 // send that raced it may have missed that drain, and an update the observer
-// finds the worker retired for cannot be sent at all, so in both cases the
+// finds the worker retired for is not sent at all, so in both cases the
 // observer writes itself (persistStranded). That one wait is on a worker that
 // has stopped taking updates and is finishing its final drain, not on a
-// running worker.
+// running worker; the drain still calls the adapter, so an adapter that waits
+// on what the committer holds deadlocks it there (see persistStranded).
 func (s *Server) persistUpdate(r *room, name string, update []byte) {
 	r.persistMu.Lock()
 	if r.persistFeeding {
@@ -164,9 +182,9 @@ func (r *room) queuePersistLocked(update []byte) {
 }
 
 // startFeederLocked starts the room's feeder (feedPersistence). It is counted
-// with the observers that write for a retired worker (Server.stranded), so
-// Shutdown waits for what the feeder still holds. The caller holds persistMu
-// and has checked that no feeder runs.
+// with the committing goroutines in the persistence observer
+// (Server.stranded), so Shutdown waits for what the feeder still holds. The
+// caller holds persistMu and has checked that no feeder runs.
 func (s *Server) startFeederLocked(r *room, name string) {
 	r.persistFeeding = true
 	s.stranded.enter()
@@ -175,15 +193,15 @@ func (s *Server) startFeederLocked(r *room, name string) {
 
 // feedPersistence hands the room's queued updates (persistOverflow) to its
 // persistence worker, oldest first, waiting for the worker, which the observer
-// never does: the feeder holds nothing a committer or the adapter needs. An
-// update stays at the head of the queue until its send completes, so the
-// observer keeps queueing behind it and the worker receives the room's updates
-// in commit order. Once the worker has retired, the feeder stores what it
-// still holds, and whatever the worker's final drain left in the channel,
-// through persistStranded, channel first. Each update it hands on, sent or
-// stored, counts in persistHanded and releases the waits that count reaches
-// (handedOnLocked). It ends when the queue is empty, by which time it has
-// released every wait.
+// never does while the worker runs: the feeder holds nothing a committer or
+// the adapter needs. An update stays at the head of the queue until its send
+// completes, so the observer keeps queueing behind it and the worker receives
+// the room's updates in the order the observer handed them over. Once the
+// worker has retired, the feeder stores what it still holds, and whatever the
+// worker's final drain left in the channel, through persistStranded, channel
+// first. Each update it hands on, sent or stored, counts in persistHanded and
+// releases the waits that count reaches (handedOnLocked). It ends when the
+// queue is empty, by which time it has released every wait.
 func (s *Server) feedPersistence(r *room, name string) {
 	defer s.stranded.leave()
 	r.persistMu.Lock()
@@ -280,15 +298,22 @@ func (r *room) awaitHandedOn(stop <-chan struct{}) {
 	}
 }
 
-// awaitPersistence holds a peer's read loop, before it applies the peer's next
-// update, until the updates queued beyond the room's 256-slot persistence
-// buffer when it began have been handed on, so storage lag slows a fast peer,
-// and a peer adds at most one update to that queue at a time: its next update
-// waits for its previous one. The read loop holds nothing the worker or a
-// committer needs, which is what makes this the place to wait. It returns once
-// those updates are handed on or the worker retires (persistRetire); nothing
-// else a parked read loop could watch closes while it waits, since the peer's
-// request context is cancelled only after the read loop returns.
+// awaitPersistence holds a peer's read loop, before it applies an update the
+// peer sent, until the updates queued beyond the room's 256-slot persistence
+// buffer when it began have been handed on, so storage lag slows a fast peer.
+// Every commit of the peer's previous message was made before the wait began,
+// so until the worker retires a peer has in that queue at most the commits of
+// the one message it is applying. That can be more than one update: a remote
+// update that changes formatted text can be followed, in the same apply, by
+// the local transaction of the document's format cleanup
+// (crdt.WithFormatCleanup, Doc.SetFormatCleanup), and consumer code the apply
+// runs (Server.OnPeerUpdate, a document observer) can commit too. The read
+// loop holds nothing the worker or a committer needs, which is what makes this
+// the place to wait. It returns once those updates are handed on or the
+// worker retires (persistRetire), and on nothing else: a connection closed
+// while the read loop waits here, by a cancelled request context or
+// otherwise, does not end the wait, and the read loop applies the update it
+// holds once the wait returns.
 func (r *room) awaitPersistence() {
 	if r.persistCh == nil {
 		return
@@ -323,7 +348,8 @@ func (r *room) awaitOverflow() {
 // on the final drain (its send completed while the latch was open, so the drain
 // necessarily follows it) or performs the write itself via persistStranded;
 // while the room's feeder runs, the observer instead queues the update for the
-// feeder, which writes it through persistStranded once the worker has retired.
+// feeder, which hands it on under the same two cases: its send is swept by the
+// final drain, or it sees the latch closed and writes via persistStranded.
 // Without the latch, everything committed after the drain landed in an unread
 // 256-slot buffer and vanished.
 //
@@ -603,9 +629,10 @@ func (s *Server) startPersistenceWorker(r *room, name string) {
 					// Store what is buffered now, which is all the flush must
 					// cover: its sender waited for every update committed
 					// before it to reach the channel (awaitOverflow). Not until
-					// the channel is empty, since the room's feeder refills each
-					// slot a store frees, and a committer that outpaces the
-					// adapter would keep the flush going as long as it commits.
+					// the channel is empty, since new commits refill each slot a
+					// store frees, through the room's feeder or the observer's
+					// own send, and a committer that outpaces the adapter would
+					// keep the flush going as long as it commits.
 					ack <- storeBuffered(ctx)
 				case <-r.persistStop:
 					exit()
@@ -631,7 +658,7 @@ func (s *Server) startPersistenceWorker(r *room, name string) {
 				maxT = nil
 			}
 		}
-		// drainBuffered pulls everything currently queued into batch without
+		// drainBuffered pulls updates from persistCh into batch without
 		// blocking, until the channel is empty. Used on stop/shutdown before the
 		// final flush.
 		drainBuffered := func() {
@@ -707,8 +734,8 @@ func (s *Server) startPersistenceWorker(r *room, name string) {
 				// The just-arrived edit may still be in persistCh, not yet in
 				// batch — take what is buffered first so an on-demand flush
 				// never misses it. Only what is buffered now, as on the strict
-				// path: the room's feeder refills each slot this frees, and the
-				// flush covers no update committed after its sender's barrier
+				// path: new commits refill each slot this frees, and the flush
+				// need not cover an update committed after its sender's barrier
 				// (awaitOverflow). Nothing else receives from persistCh while
 				// the worker runs, so this never blocks.
 				for n := len(r.persistCh); n > 0; n-- {
