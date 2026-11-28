@@ -707,7 +707,10 @@ type room struct {
 	//	still open, the worker's final drain — which strictly follows
 	//	close(persistRetire) — is guaranteed to see the buffered element;
 	//	otherwise the producer sees persistRetire closed and takes over the
-	//	write itself via persistStranded.
+	//	write itself via persistStranded. A third case: while the room's
+	//	feeder runs, the producer queues the update for the feeder instead,
+	//	and the feeder writes it via persistStranded once persistRetire is
+	//	closed.
 	//
 	// Before #229 the worker exited on shutdownCh with no such latch, so every
 	// transaction committed after the one-shot drain landed in the 256-slot
@@ -722,28 +725,52 @@ type room struct {
 	// room, so the fallback must provide that serialisation itself.
 	persistFallbackMu sync.Mutex
 
-	// persistMu guards persistOverflow and persistDrained. persistOverflow
-	// holds, in the order they were committed, the updates the doc.OnUpdate
-	// observer could not hand to persistCh without waiting - the buffer was
-	// full, earlier updates already waited ahead of them, or the worker had
-	// retired - and a feeder goroutine (feedPersistence) hands them on.
-	// persistDrained is non-nil while that feeder runs and closed when it ends:
-	// a peer's read loop waits on it before it applies its next update
-	// (awaitPersistence), so storage lag still slows a fast peer, while a
-	// committer - a Server.Apply caller, or the consumer's own code inside a
-	// peer's apply - is never held by the worker.
+	// persistMu guards the fields below it. persistOverflow holds, in the
+	// order they were committed, the updates the doc.OnUpdate observer could
+	// not hand to persistCh without waiting - the buffer was full, earlier
+	// updates already waited ahead of them, or the worker had retired - and a
+	// feeder goroutine (feedPersistence) hands them on; persistFeeding is set
+	// while it runs. persistQueued counts the updates ever appended to
+	// persistOverflow, and persistHanded those the feeder has handed on, to
+	// persistCh or, once the worker retired, through persistStranded.
+	// persistWaiters holds the waits on that count, lowest mark first; the
+	// feeder releases each as persistHanded reaches its mark (handedOnLocked).
+	//
+	// A wait records persistQueued when it begins and covers only that many,
+	// so a commit made while it waits queues behind it instead of extending
+	// it. A peer's read loop waits so before it applies its next update
+	// (awaitPersistence): storage lag still slows a fast peer, and each peer
+	// adds at most one update to the queue at a time. A flush barrier waits so
+	// before it asks the worker to flush (awaitOverflow), so the flush covers
+	// every update committed before it. A committer - a Server.Apply caller,
+	// or the consumer's own code inside a peer's apply - is never held by the
+	// worker.
+	//
+	// The trade: committed updates not yet stored have no bound. Peers are
+	// throttled at their read loop, so untrusted input cannot size the queue,
+	// but Server.Apply, Server.Inject (the relay's inbound path) and consumer
+	// code holding the *crdt.Doc are not throttled: a writer that outpaces the
+	// adapter grows the queue for as long as it writes. What that costs is the
+	// queue's depth, and the time a teardown takes to store it, not lost or
+	// reordered updates.
 	persistMu       sync.Mutex
 	persistOverflow [][]byte
-	persistDrained  chan struct{}
+	persistFeeding  bool
+	persistQueued   uint64
+	persistHanded   uint64
+	persistWaiters  []persistWaiter
 
 	// flushReq requests an on-demand durable flush of the pending batch without
-	// stopping the worker. The worker drains persistCh, flushes with a
-	// background ctx, and reports the result on the sent ack channel: true only
-	// if the batch was fully persisted, false if any store failed (the batch is
-	// then retained for a later retry). The ack is a real durability barrier —
-	// teardown gates eviction on a true result. Callers MUST use a buffered ack
-	// (cap 1) so the worker's send never blocks. nil when no PersistenceAdapter
-	// is configured.
+	// stopping the worker. The worker takes what persistCh holds when the
+	// request arrives, flushes with a background ctx, and reports the result on
+	// the sent ack channel: true only if the batch was fully persisted, false
+	// if any store failed (the batch is then retained for a later retry). The
+	// ack is a real durability barrier — teardown gates eviction on a true
+	// result. A sender MUST call awaitOverflow first: the worker takes only
+	// what persistCh holds when the request arrives, so without it the flush
+	// misses the updates still queued for the feeder. Callers MUST use a
+	// buffered ack (cap 1) so the worker's send never blocks. nil when no
+	// PersistenceAdapter is configured.
 	flushReq chan chan bool
 
 	// relayUnsub holds the doc.OnUpdate / awareness.OnChange unsubscribe
@@ -905,26 +932,30 @@ type Server struct {
 	// stranded counts committing goroutines that are anywhere inside
 	// loadRoom's doc.OnUpdate observer — EVERY commit, not only the ones that
 	// end up on the retirement branch and perform the adapter write themselves
-	// (#229). Shutdown waits for it to reach zero so it does not return while
-	// such a write is still on its way to the adapter; without that wait the fix
-	// would only NARROW the loss window, since the standard
-	// `srv.Shutdown(ctx); return` shape would let the process exit mid-write.
+	// (#229) — and each room's feeder (feedPersistence) for as long as it runs,
+	// from while its worker still runs: once the worker has retired, the feeder
+	// stores what it still holds itself, through persistStranded. Shutdown
+	// waits for it to reach zero so it does not return while such a write is
+	// still on its way to the adapter; without that wait the fix would only
+	// NARROW the loss window, since the standard `srv.Shutdown(ctx); return`
+	// shape would let the process exit mid-write.
 	//
 	// Counting every commit is not laziness, it is the requirement: the
-	// increment must happen BEFORE the observer's outer select, because an
-	// increment placed after the retirement branch is chosen leaves a gap in
-	// which Shutdown observes zero and returns while a committer has already
-	// decided to write. The cost is two atomic adds on every committed
-	// transaction, which is deliberate — correctness of the shutdown join over a
-	// few nanoseconds on a path that already encodes an update and takes a
-	// channel.
+	// increment must happen BEFORE persistUpdate takes persistMu and reads the
+	// retirement latch, because an increment placed after the retirement branch
+	// is chosen leaves a gap in which Shutdown observes zero and returns while a
+	// committer has already decided to write. The cost is two atomic adds on
+	// every committed transaction, which is deliberate — correctness of the
+	// shutdown join over a few nanoseconds on a path that already encodes an
+	// update, takes a mutex and sends on a channel.
 	//
 	// The consequence of that breadth is worth stating, because it surfaces as a
 	// confusing error: a SUSTAINED producer — code holding a retained *crdt.Doc
 	// and committing in a loop — can keep this above zero indefinitely, so
 	// Shutdown burns its whole deadline and returns context.DeadlineExceeded
-	// with no wedged adapter anywhere. Callers who need Shutdown to return early
-	// must stop their writers, not only their connections.
+	// with no wedged adapter anywhere. A feeder with a long queue keeps it above
+	// zero too, until it has stored that queue. Callers who need Shutdown to
+	// return early must stop their writers, not only their connections.
 	stranded inFlight
 
 	// serving counts ServeHTTP calls in progress, teardown included; Shutdown
@@ -1695,11 +1726,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// connection closes and its adapter write must finish before Shutdown
 	// returns.
 	//
-	// Placed HERE deliberately: after the persistence join (a stranded writer
-	// cannot even start until its worker has exited) and before the relay steps
-	// below, so #202's retire→drain→join→cancel ordering is untouched. Bounded
-	// by ctx like every other wait in this function, so a wedged adapter costs
-	// the caller its deadline and shows up as ctx.Err() rather than as a hang.
+	// Placed HERE deliberately: after the persistence join, since every write
+	// this counter waits for reaches the adapter only once its worker has
+	// exited (persistStranded waits for persistDone first), although the
+	// goroutines it counts can start earlier — a feeder starts while its
+	// worker runs; and before the relay steps below, so #202's
+	// retire→drain→join→cancel ordering is untouched. Bounded by ctx like every
+	// other wait in this function, so a wedged adapter costs the caller its
+	// deadline and shows up as ctx.Err() rather than as a hang.
 	//
 	// This bounds what Shutdown can see; it is not a claim of losslessness.
 	// Three limits, all real:

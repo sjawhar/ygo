@@ -269,13 +269,9 @@ func (p *peer) applySyncUpdate(subType int, update, payload []byte) {
 		}
 		return
 	}
-	// Storage lag still slows a fast peer, here before the apply rather than
-	// inside its commit, where the committer may hold what the worker waits on.
-	var done <-chan struct{}
-	if p.ctx != nil {
-		done = p.ctx.Done()
-	}
-	p.room.awaitPersistence(done)
+	// Storage lag slows a fast peer here, before the apply and not inside its
+	// commit, where the committer may hold what the worker waits on.
+	p.room.awaitPersistence()
 	applied, held, closeWith := p.applyPeerUpdate(update)
 	if !applied {
 		p.sendSyncStatus(false)
@@ -638,7 +634,7 @@ func (p *peer) handleDisconnect() {
 		flushOK := true
 		if empty && rm.flushReq != nil {
 			ack := make(chan bool, 1)
-			rm.awaitOverflow(rm.persistDone)
+			rm.awaitOverflow()
 			select {
 			case rm.flushReq <- ack:
 				flushOK = <-ack
