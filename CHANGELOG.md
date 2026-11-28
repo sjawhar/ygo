@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1-sami.12] — 2026-11-28
+
+Fork release on [1.55.1-sami.11](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.11),
+fixing a deadlock between a room's committers and its persistence worker in
+`provider/websocket`. No API or wire format changes. The same fix is released
+on the v1.55.1-sami.2 line as
+[1.55.1-sami.2.2](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.2.2).
+
+### Fixed
+
+- **`provider/websocket`: a commit no longer waits on a room's running
+  persistence worker.** The room's `doc.OnUpdate` observer handed each
+  committed update to the worker's 256-slot channel with a blocking send.
+  Once the worker fell 256 updates behind, that send blocked the committing
+  goroutine inside its commit, which the channel's own comment says must not
+  happen (N-H7: a slow storage backend must not block the `Transact`
+  caller). A committer holding what the adapter waits on, such as a lock of
+  the consumer's or a write the adapter must see finished, then deadlocked
+  the room: the worker waited on the committer and the committer on the
+  worker. Upstream reearth/ygo main 4b157ac has the same send. An update that
+  cannot go into the channel at once now queues on a per-room queue, which a
+  feeder goroutine hands to the worker. The worker still receives the room's
+  updates in commit order, and each is stored once and none is lost: while
+  the feeder runs, every new update queues behind it, and once the worker
+  retires the feeder stores what it still holds itself, as a committer has
+  done since #229.
+
+### Changed
+
+- **`provider/websocket`: storage lag slows a peer at its read loop, not
+  inside its commit.** Before a peer's next update is applied, its read loop
+  waits until the updates queued beyond the buffer when it began to wait have
+  been handed to the worker; updates committed after that do not extend the
+  wait. A peer therefore adds at most one update to the queue at a time. A
+  parked peer used to resume when one slot of the channel freed; it now
+  resumes when the backlog queued before it has been handed on, so one slow
+  store holds every peer in the room until that backlog is through.
+- **`provider/websocket`: teardown's flush covers what was committed before
+  it, and no more.** When the last peer leaves, on idle eviction and in
+  `CloseRoom`, the flush waits for the updates queued before it began, and
+  the worker then stores what its channel held when the flush reached it
+  rather than storing until the channel is empty, so a writer that keeps
+  committing no longer holds teardown open. Updates committed after the flush
+  began that the feeder still holds are stored once the worker has gone,
+  possibly after teardown returned and after a reload of the same room name
+  bootstrapped. The store ends up with all of them, and a CRDT log converges
+  whatever order its updates land in.
+- **`provider/websocket`: committed updates not yet stored have no bound.**
+  Peers are throttled at their read loop, so untrusted input cannot size the
+  queue, but `Server.Apply`, `Server.Inject` (the relay's inbound path) and
+  consumer code holding the `*crdt.Doc` are not throttled: a writer that
+  outpaces the adapter grows the queue for as long as it writes. The cost is
+  the queue's depth and the time it takes to store that queue, which
+  `Shutdown` waits for, not lost or reordered updates. In a measurement of
+  this change's first version (476670a2, on the v1.55.1-sami.2 line), with a
+  2 ms adapter, coalescing off and one `Apply` writer, 15 s of commits left
+  25,975 updates queued against 256 on 1.55.1-sami.2.1, and storing them
+  after the writer stopped took 76.3 s against 0.7 s; the heap stayed flat
+  (7.2 MiB against 7.7 MiB).
+- One wait remains on a commit: a commit made while the room's worker is
+  retiring, with no feeder running, waits for the worker's final drain and
+  then stores its update itself, as since #229. That is a wait on a worker
+  that has stopped taking updates, not on a running one.
+
 ## [1.55.1-sami.11] — 2026-11-24
 
 Fork release on [1.55.1-sami.10](https://github.com/sjawhar/ygo/releases/tag/v1.55.1-sami.10),
