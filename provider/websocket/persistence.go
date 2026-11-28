@@ -28,13 +28,18 @@ import (
 // the wait holds the committing goroutine, so it can deadlock: an adapter call
 // in that drain that waits on something the committer holds, such as a lock
 // of the consumer's, never returns, and the worker and the committer wait on
-// each other. persistUpdate keeps a committer from waiting on a running
-// worker; this wait on a retiring one is the limit it keeps from #229: a
-// commit made while the worker retires, with no feeder running, waits here.
-// The feeder holds nothing a committer or the adapter needs, so its own wait
-// here forms no such cycle. Teardown waits on persistDone, not on this
-// function; Shutdown waits on persistDone and then on the goroutines in this
-// function too (Server.stranded), each bounded by its ctx.
+// each other. persistUpdate keeps a commit from waiting on a running worker;
+// this wait on a retiring one is the limit it keeps from #229: a commit made
+// while the worker retires, with no feeder running, waits here. After that
+// wait every caller takes persistFallbackMu and holds it across its adapter
+// calls, so a committer here also waits for another caller's stores, the
+// feeder's included, and an adapter call of that caller's that waits on what
+// the committer holds deadlocks them the same way. The feeder holds no lock
+// while it waits on persistDone and is not a committing goroutine, so the
+// worker's drain needs nothing it holds and its own wait forms no cycle.
+// Teardown waits on persistDone, not on this function; Shutdown waits on
+// persistDone and then on the goroutines in this function too
+// (Server.stranded), each bounded by its ctx.
 //
 // Anything still stranded in persistCh is stored FIRST, then extra, in order,
 // so a single stranded call writes in the order the updates were handed over.
@@ -59,7 +64,7 @@ import (
 //   - crdt.buildPhase2 fires OnUpdate observers in registration order and
 //     loadRoom registers persistence BEFORE the relay observers, so a stranded
 //     write the observer makes delays that update's cluster fan-out for as
-//     long as the wait above and the adapter take. Bounded to room
+//     long as the waits above and the adapter take. Bounded to room
 //     retirement, and a publish onto an already-retired lane is counted in
 //     RelayStats().Dropped rather than lost silently — but it does stretch
 //     the "no blocking I/O on the commit path" convention further than the
@@ -193,8 +198,8 @@ func (s *Server) startFeederLocked(r *room, name string) {
 
 // feedPersistence hands the room's queued updates (persistOverflow) to its
 // persistence worker, oldest first, waiting for the worker, which the observer
-// never does while the worker runs: the feeder holds nothing a committer or
-// the adapter needs. An update stays at the head of the queue until its send
+// never does while the worker runs: the feeder holds no lock while it waits
+// for the worker. An update stays at the head of the queue until its send
 // completes, so the observer keeps queueing behind it and the worker receives
 // the room's updates in the order the observer handed them over. Once the
 // worker has retired, the feeder stores what it still holds, and whatever the
@@ -324,8 +329,11 @@ func (r *room) awaitPersistence() {
 // awaitOverflow returns once the updates queued beyond the room's buffer when
 // it was called have been handed to the worker's channel, or the worker has
 // exited (persistDone), so an on-demand flush (flushReq) sent after it covers
-// every update committed before it. A commit made while it waits queues
-// behind it rather than extending it.
+// every update whose persistUpdate ran before the call. A transaction
+// committed before the call whose observer had not run yet (observers fire
+// after the document's lock is released) is not covered: it is stored later,
+// as an update handed over after the call is. A commit made while it waits
+// queues behind it rather than extending it.
 func (r *room) awaitOverflow() {
 	r.awaitHandedOn(r.persistDone)
 }
@@ -344,14 +352,19 @@ func (r *room) awaitOverflow() {
 // committing throughout Shutdown, and Shutdown closes shutdownCh long before it
 // closes the peer connections. So the FIRST act of every exit path is to close
 // r.persistRetire, publishing "I am leaving" before the final drain rather than
-// after it. loadRoom's doc.OnUpdate observer reads that latch and either relies
-// on the final drain (its send completed while the latch was open, so the drain
-// necessarily follows it) or performs the write itself via persistStranded;
-// while the room's feeder runs, the observer instead queues the update for the
-// feeder, which hands it on under the same two cases: its send is swept by the
-// final drain, or it sees the latch closed and writes via persistStranded.
-// Without the latch, everything committed after the drain landed in an unread
-// 256-slot buffer and vanished.
+// after it. loadRoom's doc.OnUpdate observer (persistUpdate) reads that latch
+// when no feeder runs: it relies on the final drain when its send completed
+// while the latch was open, since the drain necessarily follows that send; it
+// stores via persistStranded when it finds the latch closed, the update itself
+// before it would send, or after its send whatever the drain left in the
+// channel; and when it finds the latch open and the buffer full it neither
+// sends nor stores, but queues the update and starts the room's feeder. While
+// a feeder runs, the observer queues the update without reading the latch,
+// and the feeder hands the queue on under the same latch: a send of its that
+// completed while the latch was open is swept by the final drain, and once it
+// finds the latch closed it stores what it still holds, and whatever its sends
+// left in the channel, via persistStranded. Without the latch, everything
+// committed after the drain landed in an unread 256-slot buffer and vanished.
 //
 // When coalescing is enabled (see resolveCoalesceConfig / Server.PersistCoalesceWindow),
 // bursts of updates are debounced into a single merged write: each new update

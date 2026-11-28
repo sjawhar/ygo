@@ -18,16 +18,16 @@ import (
 // observer's send waited there instead.
 const persistBuffer = 256
 
-// A goroutine that commits into a room never waits on the room's running
-// persistence worker, however far behind the worker is: the buffer exists so
-// that a slow storage backend does not block the Transact caller (N-H7). The
-// worker is parked inside its first store, as one is whose adapter waits on
-// something the committer holds, and the test commits well past the buffer
-// from one goroutine; before the fix, the commit after the buffer filled
-// blocked in the observer's send, which with such an adapter left the
-// committer and the worker waiting on each other for good. Once the
-// worker is let go it stores every update, and the room's flush barrier covers
-// them all; with one store per commit, it stores them in commit order.
+// A commit into a room never waits on the room's running persistence worker,
+// however far behind the worker is: the buffer exists so that a slow storage
+// backend does not block the Transact caller (N-H7). The worker is parked
+// inside its first store, as one is whose adapter waits on something the
+// committer holds, and the test commits well past the buffer from one
+// goroutine; before the fix, the commit after the buffer filled blocked in the
+// observer's send, which with such an adapter left the committer and the
+// worker waiting on each other for good. Once the worker is let go it stores
+// every update, and the room's flush barrier covers them all; with one store
+// per commit, it stores them in commit order.
 func TestPersistence_ACommitNeverWaitsOnABehindWorker(t *testing.T) {
 	const commits = persistBuffer * 3
 	for _, tc := range []struct {

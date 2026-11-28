@@ -301,18 +301,26 @@ type PersistenceAdapterContext interface {
 // (how much history to keep) is the adapter's concern.
 //
 // That serialisation is per room INSTANCE, not per room NAME — read this if
-// your Compact mutates shared state keyed by name. Two sources of overlap:
+// your Compact mutates shared state keyed by name. Three sources of overlap:
 //
 //   - Teardown followed by re-creation. A room's worker can still be in its
 //     exit-path Compact while a client reconnects and a brand-new room of the
 //     same name starts writing. This window predates #229 (see
 //     handleDisconnect's flush-then-evict sequence in peer.go).
+//   - A room's feeder after teardown. Teardown waits for the room's worker
+//     but not for its feeder, and its flush covers only the updates handed
+//     to persistence before the flush began. Updates the feeder still holds
+//     when the worker retires it stores itself, once the worker has exited,
+//     possibly after teardown returned and while a successor room of the
+//     same name writes (see persistStranded).
 //   - A retained *crdt.Doc. Nothing calls doc.Destroy on teardown, so a caller
 //     holding the doc — from GetDoc, or from an OnLoadDocument hook — keeps its
 //     persistence observer alive, and every later commit is written directly by
-//     the committing goroutine (#229; before #229 those commits were silently
-//     dropped instead). Those writes are serialised among themselves, but not
-//     against a successor room of the same name, and they are unbounded in time.
+//     the committing goroutine or, while the room's feeder still runs, queued
+//     and written by that feeder (#229; before #229 those commits were
+//     silently dropped instead). Those writes are serialised among themselves,
+//     but not against a successor room of the same name, and they are
+//     unbounded in time.
 //
 // If your adapter's Compact is not safe against a concurrent StoreUpdate for
 // the same room name, serialise inside the adapter. Every store this repo ships
@@ -703,15 +711,21 @@ type room struct {
 	// ordering is the whole point, and it is what makes the handoff in
 	// loadRoom's doc.OnUpdate observer race-free (#229):
 	//
-	//	if a producer's send into persistCh completed while persistRetire was
-	//	still open, the worker's final drain — which strictly follows
-	//	close(persistRetire) — is guaranteed to see the buffered element;
-	//	otherwise the producer sees persistRetire closed and takes over the
-	//	write itself via persistStranded. A third case: while the room's
-	//	feeder runs, the producer queues the update for the feeder instead,
-	//	and the feeder hands it on under the same two cases: its send into
-	//	persistCh is swept by the final drain, or it sees persistRetire
-	//	closed and writes via persistStranded.
+	//	With no feeder running, a producer whose send into persistCh completed
+	//	while persistRetire was still open leaves the update to the worker's
+	//	final drain, which strictly follows close(persistRetire) and is
+	//	guaranteed to see the buffered element. A producer that finds
+	//	persistRetire closed before it would send stores the update itself via
+	//	persistStranded, and one that finds it closed after its send stores,
+	//	the same way, whatever the drain left in persistCh, a send that
+	//	completed after the latch closed included. A producer that finds the
+	//	latch open and the buffer full neither sends nor stores: it queues the
+	//	update and starts the room's feeder. While a feeder runs, a producer
+	//	queues the update without reading the latch. The feeder hands the
+	//	queue on under the same latch: a send of its that completed while
+	//	persistRetire was open is swept by the final drain, and once it finds
+	//	persistRetire closed it stores what it still holds, and whatever its
+	//	sends left in persistCh, via persistStranded.
 	//
 	// Before #229 the worker exited on shutdownCh with no such latch, so every
 	// transaction committed after the one-shot drain landed in the 256-slot
@@ -732,16 +746,20 @@ type room struct {
 	// worker's state; with none running, an update the buffer had no room
 	// for, which starts one. An update the observer finds the worker retired
 	// for, with no feeder running, it stores itself (persistStranded) instead
-	// of queueing it. The queue keeps the order the observer queued them in,
-	// which is commit order for the commits of one goroutine; observers fire
-	// outside the document's lock, so the commits of two goroutines can reach
-	// it in either order. A feeder goroutine (feedPersistence) hands the
-	// queue on; persistFeeding is set while it runs. persistQueued counts the
-	// updates ever appended to persistOverflow, and persistHanded those the
-	// feeder has handed on, to persistCh or, once the worker retired, through
-	// persistStranded. persistWaiters holds the waits on that count, lowest
-	// mark first; the feeder releases each as persistHanded reaches its mark
-	// (handedOnLocked).
+	// of queueing it. The queue keeps the order persistUpdate ran in, which
+	// need not be commit order: observers fire after the document's lock is
+	// released, so the commits of two goroutines can reach it in either
+	// order, and crdt.buildPhase2 runs a commit's type, deep and
+	// after-transaction observers, and the OnUpdate observers registered
+	// before persistence's (in an OnLoadDocument hook, say), before
+	// persistence's observer, so a commit one of them makes on the same
+	// goroutine reaches persistUpdate before the commit that triggered it. A
+	// feeder goroutine (feedPersistence) hands the queue on; persistFeeding is
+	// set while it runs. persistQueued counts the updates ever appended to
+	// persistOverflow, and persistHanded those the feeder has handed on, to
+	// persistCh or, once the worker retired, through persistStranded.
+	// persistWaiters holds the waits on that count, lowest mark first; the
+	// feeder releases each as persistHanded reaches its mark (handedOnLocked).
 	//
 	// A wait records persistQueued when it begins and covers only that many,
 	// so a commit made while it waits queues behind it instead of extending
@@ -755,14 +773,20 @@ type room struct {
 	// (crdt.WithFormatCleanup, Doc.SetFormatCleanup), and consumer code the
 	// apply runs (Server.OnPeerUpdate, a document observer) can commit too. A
 	// flush barrier waits so before it asks the worker to flush
-	// (awaitOverflow), so the flush covers every update committed before it.
+	// (awaitOverflow), so the flush covers every update whose persistUpdate
+	// ran before the barrier began. Observers fire after the document's lock
+	// is released, so a transaction committed before the barrier whose
+	// persistUpdate had not run yet is not covered: it is stored later, as an
+	// update handed over after the barrier is.
 	//
-	// A committer - a Server.Apply caller, or the consumer's own code inside
-	// a peer's apply - is never held by a running worker. It waits on the
-	// worker in one place: when the observer finds the worker retired
-	// (persistRetire closed) and no feeder running, persistStranded waits for
-	// persistDone, the end of the worker's final drain, whose adapter calls
-	// can wait on what the committer holds (see persistStranded).
+	// A commit - the persistence observer, on the committing goroutine - never
+	// waits on a running worker. It waits on the worker in one place: when the
+	// observer finds the worker retired (persistRetire closed) and no feeder
+	// running, persistStranded waits for persistDone, the end of the worker's
+	// final drain, whose adapter calls can wait on what the committer holds
+	// (see persistStranded). What a committer does outside its commit can wait
+	// on a running worker: CloseRoomWithin, called from a Server.Apply
+	// callback, waits in awaitOverflow and on the flush ack.
 	//
 	// The trade: committed updates not yet stored have no bound. While the
 	// worker runs, peers are throttled at their read loop as above; once it
@@ -772,7 +796,12 @@ type room struct {
 	// holding the *crdt.Doc are not throttled at all: a writer that outpaces
 	// the adapter grows the queue for as long as it writes. What that costs is
 	// the queue's depth, and the time a teardown's flush barrier and Shutdown
-	// take to get through it, not lost or reordered updates.
+	// take to get through it. Shutdown waits for a feeder only until its ctx
+	// expires, then returns ctx.Err() with the rest of the queue not stored,
+	// and a process that exits then (`Shutdown(ctx); return`) loses it. What
+	// a feeder still holds when teardown returns is stored afterwards,
+	// possibly after a successor room of the same name has written (see
+	// persistStranded).
 	persistMu       sync.Mutex
 	persistOverflow [][]byte
 	persistFeeding  bool
@@ -2079,9 +2108,11 @@ func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 
 	if s.persistence != nil {
 		// Serialise persistence writes through a buffered channel so that a
-		// slow storage backend does not block the Transact caller (N-H7) and
-		// writes arrive in order. Registered AFTER the bootstrap decode so the
-		// loaded state is not re-persisted. The observer never waits on that
+		// slow storage backend does not block the Transact caller (N-H7) and,
+		// while the worker runs, writes arrive in the order the observer
+		// handed the updates over (persistUpdate), which need not be commit
+		// order (see room.persistMu). Registered AFTER the bootstrap decode so
+		// the loaded state is not re-persisted. The observer never waits on that
 		// channel: while the worker runs, an update it cannot send at once
 		// queues for the room's feeder, as does every update while earlier ones
 		// are queued (persistUpdate), so a full buffer cannot hold a committing

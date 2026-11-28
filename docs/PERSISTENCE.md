@@ -773,14 +773,15 @@ before `ctx` expires, no peer commits after it.
   when they queue behind it — indefinitely. Before
   v1.49.0 those commits were silently dropped. Since v1.55.1-sami.2.2 ordinary
   commits can land late too. Teardown (last peer leaving, idle eviction,
-  `CloseRoom`) flushes the updates committed before its flush began and waits
-  for the room's worker, but not for the room's feeder: updates committed
-  after the flush began that the feeder still holds are stored once the
-  worker has gone, possibly after teardown returned and after a reload of the
-  same name bootstrapped from a store that did not hold them yet. The store
-  ends up with every update, and a CRDT log converges whatever order its
-  updates land in; a room reloaded meanwhile does not hold them until its
-  name is loaded again.
+  `CloseRoom`) flushes the updates handed to persistence before its flush
+  began and waits for the room's worker, but not for the room's feeder:
+  updates handed over after the flush began that the feeder still holds are
+  stored once the worker has gone, possibly after teardown returned and after
+  a reload of the same name bootstrapped from a store that did not hold them
+  yet. A CRDT log converges whatever order its updates land in, but a room
+  reloaded meanwhile does not hold them until its name is loaded again, and a
+  `Shutdown` whose `ctx` runs out before the feeder has stored them returns
+  `ctx.Err()` with them not stored.
 - **`Compact` overlapping a `StoreUpdate` for the same room NAME.** The
   provider serialises `Compact` with `StoreUpdate` per room *instance*, not per
   name, and the point above widens that window. If your `Compact` mutates state
