@@ -129,15 +129,17 @@ func (s *Server) sweepIdleRooms(now time.Time) {
 	}
 }
 
-// evictIdleRoom evicts a single idle-resident room using the identical teardown
-// primitives as handleDisconnect / CloseRoom: a flush-before-evict durability
-// barrier (flushReq/ack, no lock held across it), a pointer-identity guarded
+// evictIdleRoom evicts a single idle-resident room using the same teardown
+// primitives as handleDisconnect / CloseRoom: a flush request before the
+// eviction (flushReq/ack, no lock held across it), a pointer-identity guarded
 // delete from s.rooms under s.rmu+rm.mu, closing persistStop, waiting persistDone,
 // stopping awareness auto-expiry, tearing down relay observers, and firing
 // OnUnloadDocument. It is purpose-built for the sweeper rather than shared with
 // those two paths (whose eviction is interleaved with peer removal, semaphore
 // release, OnLastPeer, and awareness-removal broadcasts) so their reviewed code
-// is left untouched; the teardown sequence itself is byte-for-byte the same.
+// is left untouched; it follows the same steps, except that it waits for
+// persistDone only when it removed the room itself, and that it stops at a
+// false flush ack, which CloseRoom only logs.
 //
 // CRITICAL: expectIdle is the idleSince observed in the snapshot. Eviction
 // commits only if, under rm.mu, the room is STILL empty AND idleSince is
@@ -153,9 +155,15 @@ func (s *Server) sweepIdleRooms(now time.Time) {
 // blocks eviction even though peers is still 0 and idleSince is still zero
 // (#193 review).
 //
-// On flush failure the room + worker are kept alive (matching handleDisconnect):
-// the retained batch is retried on the next sweep / teardown, and a reconnect
-// meanwhile finds the warm in-memory doc rather than reloading a stale store.
+// On a false flush ack this path neither removes the room nor stops the worker
+// (matching handleDisconnect; the worker can still exit on Shutdown): a batch
+// the coalescing path retained is attempted again later - with the next
+// update's timed flush, the next teardown's flush, or the exit path - (the
+// strict path retains a failed store only when the worker finds its ctx
+// cancelled as it checks after the store returned), and a reconnect meanwhile
+// finds the warm in-memory doc rather than reloading a stale store. With no
+// ack, because the worker had already exited, flushOK stays true and the
+// eviction below can go on, subject to its re-check.
 func (s *Server) evictIdleRoom(name string, rm *room, expectIdle time.Time) bool {
 	// A rejected join must not flush a room that still has peers or callers.
 	rm.mu.Lock()
@@ -164,11 +172,14 @@ func (s *Server) evictIdleRoom(name string, rm *room, expectIdle time.Time) bool
 	if !eligible {
 		return false
 	}
-	// FLUSH-BEFORE-EVICT (#175 follow-up). Make the pending coalesced batch
-	// durable while rm is still in s.rooms and the worker is still alive. No lock
-	// is held across the send/ack; the ack is buffered (cap 1) so the worker
-	// never blocks. Guard against a worker that already exited (raced by
-	// CloseRoom/handleDisconnect/shutdown) via the persistDone branch.
+	// FLUSH-BEFORE-EVICT (#175 follow-up). Ask the worker to flush the pending
+	// batch before this path removes rm from s.rooms, if the worker has not
+	// exited; a racing CloseRoom may already have removed rm, and the worker
+	// can take this request after that removal, before it selects its closed
+	// persistStop. No lock is held across the send/ack; the ack is buffered
+	// (cap 1) so the worker never blocks. Guard against a worker that already
+	// exited (raced by CloseRoom/handleDisconnect/shutdown) via the persistDone
+	// branch.
 	flushOK := true
 	if rm.flushReq != nil {
 		ack := make(chan bool, 1)
@@ -181,7 +192,7 @@ func (s *Server) evictIdleRoom(name string, rm *room, expectIdle time.Time) bool
 		}
 	}
 	if !flushOK {
-		// Abort: keep room + worker alive so the retained batch is retried later.
+		// Abort: neither remove the room nor stop the worker; a batch the coalescing path retained is attempted again later.
 		return false
 	}
 
@@ -199,7 +210,7 @@ func (s *Server) evictIdleRoom(name string, rm *room, expectIdle time.Time) bool
 		if rm.persistStop != nil {
 			select {
 			case <-rm.persistStop:
-				// already closed by a racing CloseRoom
+				// already closed by a racing teardown
 			default:
 				close(rm.persistStop)
 			}
