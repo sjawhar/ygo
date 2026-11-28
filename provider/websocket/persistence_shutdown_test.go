@@ -140,9 +140,11 @@ func (a *strandedGateAdapter) text(t *testing.T, key string) string {
 	return d.GetText(key).ToString()
 }
 
-// awaitStrandedWriter blocks until at least one committing goroutine has
-// registered in the stranded-write path. Tests use it to order a commit ahead
-// of the worker's exit so they assert against Shutdown's join rather than
+// awaitStrandedWriter blocks until at least one goroutine has registered in
+// the stranded-write path. That counter also counts a room's feeder, but these
+// tests commit far less than the room's buffer, so no feeder runs and the
+// goroutine it sees is the committer. Tests use it to order a commit ahead of
+// the worker's exit so they assert against Shutdown's join rather than
 // against the residual window the join cannot cover.
 func awaitStrandedWriter(t *testing.T, s *ygws.Server) {
 	t.Helper()

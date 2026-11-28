@@ -17,13 +17,58 @@ func MemoryPersistenceRecordCount(m *MemoryPersistence, room string) int {
 	return len(vs)
 }
 
-// StrandedWritesInFlight reports how many committing goroutines are registered
-// in the stranded-write path — the #229 counter Shutdown joins on. Test-only,
-// and the only way to SEQUENCE a shutdown-join test deterministically: a test
-// must know the committer has registered before it lets the worker exit,
-// otherwise it is asserting against the acknowledged residual (a commit that
-// starts after Shutdown has read the counter) rather than against the join.
+// StrandedWritesInFlight reports how many goroutines are registered in the
+// stranded-write path — the #229 counter Shutdown joins on: committing
+// goroutines inside the persistence observer, and every room's running feeder.
+// Test-only, and the only way to SEQUENCE a shutdown-join test
+// deterministically: a test must know the committer has registered before it
+// lets the worker exit, otherwise it is asserting against the acknowledged
+// residual (a commit that starts after Shutdown has read the counter) rather
+// than against the join. It tells a committer apart only while no feeder runs,
+// that is in a test that has not committed past the room's buffer.
 func StrandedWritesInFlight(s *Server) int64 { return s.stranded.n.Load() }
+
+// PersistenceQueueLen reports how many committed updates room holds queued
+// beyond its persistence buffer (persistOverflow), or 0 for a room the server
+// does not hold.
+func PersistenceQueueLen(s *Server, room string) int {
+	rm := residentRoom(s, room)
+	if rm == nil {
+		return 0
+	}
+	rm.persistMu.Lock()
+	defer rm.persistMu.Unlock()
+	return len(rm.persistOverflow)
+}
+
+// PersistenceWait begins the wait a peer's read loop makes before it applies
+// its next update (awaitPersistence) and returns the function that waits.
+// Test-only: the split lets a test commit between the two, which is how it
+// tells a wait that covers what was queued when it began from one that also
+// covers what is queued while it waits.
+func PersistenceWait(s *Server, room string) (wait func()) {
+	rm := residentRoom(s, room)
+	if rm == nil {
+		return func() {}
+	}
+	released := rm.handedOnWait(rm.persistRetire)
+	return func() {
+		if released == nil {
+			return
+		}
+		select {
+		case <-released:
+		case <-rm.persistRetire:
+		}
+	}
+}
+
+// residentRoom returns the room s holds under name, or nil.
+func residentRoom(s *Server, name string) *room {
+	s.rmu.RLock()
+	defer s.rmu.RUnlock()
+	return s.rooms[name]
+}
 
 // MemoryPersistencePendingRooms reports how many rooms hold un-compacted
 // bookkeeping. Test-only: proves the pending map is deleted, not zeroed.

@@ -3,6 +3,7 @@ package websocket_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,8 +24,8 @@ const persistBuffer = 256
 // committer holds, and the test commits well past the buffer from one goroutine;
 // before the fix, the commit after the buffer filled blocked in the observer's
 // send, and the committer and the worker waited on each other for good. Once the
-// worker is let go it stores every update, in the order they were committed,
-// and the room's flush barrier covers them all.
+// worker is let go it stores every update, and the room's flush barrier covers
+// them all; with one store per commit, it stores them in commit order.
 func TestPersistence_ACommitNeverWaitsOnABehindWorker(t *testing.T) {
 	const commits = persistBuffer * 3
 	for _, tc := range []struct {
@@ -47,23 +48,23 @@ func TestPersistence_ACommitNeverWaitsOnABehindWorker(t *testing.T) {
 					})
 				})
 			}
-			require.NoError(t, apply("a"))
+			marks := []string{"a"}
+			for i := range commits {
+				marks = append(marks, fmt.Sprintf("%d", i%10))
+			}
+			require.NoError(t, apply(marks[0]))
 			<-a.entered // the worker is parked inside its first store
 
-			want := "a"
 			committed := make(chan error, 1)
 			go func() {
-				for i := range commits {
-					if err := apply(fmt.Sprintf("%d", i%10)); err != nil {
+				for _, mark := range marks[1:] {
+					if err := apply(mark); err != nil {
 						committed <- err
 						return
 					}
 				}
 				committed <- nil
 			}()
-			for i := range commits {
-				want += fmt.Sprintf("%d", i%10)
-			}
 			select {
 			case err := <-committed:
 				require.NoError(t, err)
@@ -74,7 +75,10 @@ func TestPersistence_ACommitNeverWaitsOnABehindWorker(t *testing.T) {
 
 			close(a.gate)
 			require.NoError(t, s.CloseRoom("room", true))
-			require.Equal(t, want, a.text(t, "t"), "the worker did not store every committed update, in commit order")
+			require.Equal(t, strings.Join(marks, ""), a.text(t, "t"), "the worker did not store every committed update")
+			if tc.coalesce < 0 {
+				requireStoredInCommitOrder(t, a.snapshot(), "t", marks)
+			}
 			sctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			require.NoError(t, s.Shutdown(sctx))
@@ -83,10 +87,11 @@ func TestPersistence_ACommitNeverWaitsOnABehindWorker(t *testing.T) {
 }
 
 // Updates queued beyond the buffer when the worker retires are still stored,
-// in commit order, after what the worker's final drain stored: the feeder hands
-// them to the retired room's stranded writer (#229's guarantee, which a queue
-// beyond the channel must keep). Shutdown fires with the worker parked and the
-// queue holding updates the channel never saw.
+// after what the worker's final drain stored: the feeder hands them to the
+// retired room's stranded writer (#229's guarantee, which a queue beyond the
+// channel must keep), and with one store per commit they are stored in commit
+// order. Shutdown fires with the worker parked and the queue holding updates
+// the channel never saw.
 func TestPersistence_UpdatesQueuedBeyondTheBufferSurviveShutdown(t *testing.T) {
 	const commits = persistBuffer * 2
 	for _, tc := range []struct {
@@ -101,7 +106,7 @@ func TestPersistence_UpdatesQueuedBeyondTheBufferSurviveShutdown(t *testing.T) {
 			s := ygws.NewServerWithPersistence(a)
 			s.PersistCoalesceWindow = tc.coalesce
 			ctx := context.Background()
-			want := ""
+			var marks []string
 			apply := func(mark string) {
 				require.NoError(t, s.Apply(ctx, "room", func(_ *crdt.Doc, transact func(func(*crdt.Transaction))) {
 					transact(func(txn *crdt.Transaction) {
@@ -109,7 +114,7 @@ func TestPersistence_UpdatesQueuedBeyondTheBufferSurviveShutdown(t *testing.T) {
 						txt.Insert(txn, txt.Len(), mark, nil)
 					})
 				}))
-				want += mark
+				marks = append(marks, mark)
 			}
 			apply("a")
 			<-a.entered
@@ -131,7 +136,37 @@ func TestPersistence_UpdatesQueuedBeyondTheBufferSurviveShutdown(t *testing.T) {
 			case <-time.After(20 * time.Second):
 				t.Fatal("Shutdown did not return")
 			}
-			require.Equal(t, want, a.text(t, "t"), "updates queued beyond the buffer at Shutdown were lost or reordered")
+			require.Equal(t, strings.Join(marks, ""), a.text(t, "t"), "updates queued beyond the buffer at Shutdown were lost")
+			if tc.coalesce < 0 {
+				requireStoredInCommitOrder(t, a.snapshot(), "t", marks)
+			}
 		})
+	}
+}
+
+// snapshot returns the updates a has stored, in the order it stored them.
+func (a *ctxAdapter) snapshot() [][]byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([][]byte(nil), a.updates...)
+}
+
+// requireStoredInCommitOrder requires one stored update per commit, each
+// commit having appended its mark to the text under key, and for every k that
+// a replay of the first k stored updates holds exactly the first k marks. A
+// replay of all of them cannot see order: a CRDT replay converges whatever
+// order its updates come in. Here an update stored ahead of an earlier one
+// waits in the replay for the update it was inserted after, so any swap shows
+// as a short text.
+func requireStoredInCommitOrder(t *testing.T, stored [][]byte, key string, marks []string) {
+	t.Helper()
+	require.Len(t, stored, len(marks), "expected one stored update per commit")
+	d := crdt.New()
+	want := ""
+	for k, u := range stored {
+		require.NoError(t, crdt.ApplyUpdateV1(d, u, nil))
+		want += marks[k]
+		require.Equal(t, want, d.GetText(key).ToString(),
+			"after stored update %d of %d the replay does not hold exactly the first %d commits: updates were stored out of commit order", k+1, len(stored), k+1)
 	}
 }

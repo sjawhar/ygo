@@ -666,9 +666,11 @@ count. Since v1.49.0 (#229) that separation is enforced:
   when its connection closed, and a slow hook or apply can stretch that across
   the whole close-connections-and-join window, so the room's persistence worker
   publishes its retirement before its final drain; a commit that arrives too
-  late for that drain is written by the committing goroutine itself. Messages
-  the read loop had not started to handle when the connection closed are
-  dropped, not applied.
+  late for that drain is written by the committing goroutine itself or, when
+  the commit queued behind the room's feeder (the goroutine that hands the
+  worker the updates queued beyond its buffer), by that feeder. Messages the
+  read loop had not started to handle when the connection closed are dropped,
+  not applied.
 - **`Shutdown` joins those writes** (bounded by the caller's context) before
   returning, so `srv.Shutdown(ctx)` followed by exiting the process does not
   kill a write in flight.
@@ -716,11 +718,11 @@ below for the independent things that can produce that deadline error.
 
 **Why "handed to the adapter," not "the adapter accepted it."** The observer
 that performs a commit's write — whether the room's normal persistence worker
-or, for a straggler, the committing goroutine itself via `persistStranded` —
-has no caller to report a failure to: an adapter error or a recovered panic is
-logged and the write is abandoned right there, never surfaced through
-`Shutdown`'s return value (see `persistStranded`'s own doc: "Errors are
-logged, not returned"). That is exactly why the guarantee cannot say
+or, for a straggler, the committing goroutine itself or the room's feeder via
+`persistStranded` — has no caller to report a failure to: an adapter error or
+a recovered panic is logged and the write is abandoned right there, never
+surfaced through `Shutdown`'s return value (see `persistStranded`'s own doc:
+"Errors are logged, not returned"). That is exactly why the guarantee cannot say
 "succeeded" — a `nil` `Shutdown` return tells you every in-scope commit's
 write attempt completed without being abandoned mid-flight, and nothing about
 whether the adapter itself accepted it. A caller who needs that stronger
@@ -745,12 +747,16 @@ before `ctx` expires, no peer commits after it.
   your data. The honest error replaces a silent lie, but it is a behaviour
   change if you have a `Shutdown` deadline.
 - **A second, unrelated cause of that same `DeadlineExceeded`:** a *sustained*
-  producer. `Shutdown` waits for the in-flight commit count to reach zero, and
-  that count covers every committing goroutine, not only the ones performing a
-  write themselves. Code that holds a retained `*crdt.Doc` and commits in a
-  tight loop can keep it above zero for as long as it runs, so `Shutdown` burns
-  its whole deadline with no wedged adapter anywhere. Stop your writers, not
-  just your connections, if you want `Shutdown` to return early.
+  producer. `Shutdown` waits for the in-flight count to reach zero, and that
+  count covers every committing goroutine, not only the ones performing a
+  write themselves, and every room's feeder (the goroutine that hands the
+  room's worker the updates queued beyond its buffer, and stores them itself
+  once the worker has retired) for as long as it runs. Code that holds a
+  retained `*crdt.Doc` and commits in a tight loop can keep it above zero for
+  as long as it runs, so `Shutdown` burns its whole deadline with no wedged
+  adapter anywhere; a feeder with a long queue keeps it above zero until it
+  has stored that queue. Stop your writers, not just your connections, if you
+  want `Shutdown` to return early.
 - **A third cause of that `DeadlineExceeded`:** a connection that does not
   finish. `Shutdown` waits for every `ServeHTTP` call in progress, and so for
   every hook it calls (`Authorize` or `AuthFunc`, `OnLoadDocument`,
@@ -763,8 +769,18 @@ before `ctx` expires, no peer commits after it.
 - **Writes for a room the server already considers gone.** Nothing calls
   `doc.Destroy` on teardown, so a caller that retains the `*crdt.Doc` (from
   `GetDoc`, or from an `OnLoadDocument` hook) keeps its persistence observer
-  alive and its later commits are written directly — indefinitely. Before
-  v1.49.0 those commits were silently dropped.
+  alive and its later commits are written directly, or by the room's feeder
+  when they queue behind it — indefinitely. Before
+  v1.49.0 those commits were silently dropped. Since v1.55.1-sami.2.2 ordinary
+  commits can land late too. Teardown (last peer leaving, idle eviction,
+  `CloseRoom`) flushes the updates committed before its flush began and waits
+  for the room's worker, but not for the room's feeder: updates committed
+  after the flush began that the feeder still holds are stored once the
+  worker has gone, possibly after teardown returned and after a reload of the
+  same name bootstrapped from a store that did not hold them yet. The store
+  ends up with every update, and a CRDT log converges whatever order its
+  updates land in; a room reloaded meanwhile does not hold them until its
+  name is loaded again.
 - **`Compact` overlapping a `StoreUpdate` for the same room NAME.** The
   provider serialises `Compact` with `StoreUpdate` per room *instance*, not per
   name, and the point above widens that window. If your `Compact` mutates state

@@ -654,7 +654,7 @@ func (s *Server) closeRoom(ctx context.Context, name string, force bool, within 
 	// joined meanwhile keeps the room open below, and its worker keeps running.
 	if rm.flushReq != nil {
 		ack := make(chan bool, 1)
-		rm.awaitOverflow(rm.persistDone)
+		rm.awaitOverflow()
 		select {
 		case rm.flushReq <- ack:
 			if !<-ack {

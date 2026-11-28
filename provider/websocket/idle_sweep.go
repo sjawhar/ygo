@@ -172,7 +172,7 @@ func (s *Server) evictIdleRoom(name string, rm *room, expectIdle time.Time) bool
 	flushOK := true
 	if rm.flushReq != nil {
 		ack := make(chan bool, 1)
-		rm.awaitOverflow(rm.persistDone)
+		rm.awaitOverflow()
 		select {
 		case rm.flushReq <- ack:
 			flushOK = <-ack
